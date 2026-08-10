@@ -1,0 +1,13 @@
+backend: huggingface_qwen
+model_name: Qwen3-VL-32B-Instruct-CogTrack-SFT
+# 基座由 env.local.yaml 的 model_root 解析；LoRA checkpoint 通过环境变量注入。
+model_path: Qwen3-VL-32B-Instruct
+adapter_path: ${COGTRACK_QWEN3_ADAPTER}
+torch_dtype: bfloat16
+device_map: auto
+attn_implementation: flash_attention_2
+processor_use_fast: false
+max_new_tokens: 128
+temperature: 0.0
+do_sample: false
+max_image_side: 648

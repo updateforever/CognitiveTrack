@@ -1,0 +1,14 @@
+tracker_name: cognitive_vlm
+experiment_name: qwen3vl_32b_pair_v4_memory
+context_mode: pair
+# Qwen3-VL 官方 grounding 使用 0-to-1000 相对坐标，与 Qwen2.5-VL 不同。
+bbox_protocol: norm1000
+observation_policy:
+  type: dense
+memory:
+  enabled: false
+  semantic_enabled: true
+  max_semantic_records: 4
+  min_semantic_frame_gap: 30
+model_config: ../models/qwen3vl_32b.yaml
+save_raw_response: true

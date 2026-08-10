@@ -1,0 +1,29 @@
+# checkpoint 通过环境变量注入，不把开发机路径写入可提交配置。
+tracker_name: sutrack_adapter
+experiment_name: sutrack_b384_builtin_v1
+
+implementation:
+  module: cogtrack.models.sutrack.runtime
+  factory: build_sutrack_runtime
+  kwargs:
+    model_config: ../models/sutrack_b384.yaml
+    checkpoint: ${COGTRACK_SUTRACK_CHECKPOINT}
+    device: auto
+    amp: false
+    # auto 与原版一致：USE_NLP 数据集对 init_nlp 做 CLIP tokenize，其余送全零 token。
+    language_mode: auto
+    # 对应原版 TEST.MULTI_MODAL_VISION.DEFAULT / MULTI_MODAL_LANGUAGE.DEFAULT。
+    # multi_modal_language 必须为 true：原版在 USE_NLP=False 时仍会把全零 token
+    # 送进 CLIP 文本塔，text_src 是编码结果而不是 None。置 false 会走完全不同的
+    # encoder 分支，逐帧预测必然漂移。
+    multi_modal_vision: true
+    multi_modal_language: true
+    # 对应原版 TEST.USE_NLP（DEFAULT=False, TNL2K=True）。原版会把 OTB* 映射成
+    # TNL2K，所以 otb99 也归到这里。
+    use_nlp_datasets: ["tnl2k", "otb99", "otb99_lang"]
+
+output:
+  bbox_key: target_bbox
+  bbox_format: xywh
+  execution_key: execution
+  score_key: best_score

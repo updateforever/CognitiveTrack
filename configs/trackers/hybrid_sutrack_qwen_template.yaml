@@ -1,0 +1,40 @@
+# 该文件是接入模板，不代表仓库已经包含 SUTrack 网络或 checkpoint。
+tracker_name: hybrid_cognitive
+experiment_name: hybrid_sutrack_qwen_keyframe_v4_memory
+
+observation_policy:
+  type: keyframe
+
+# 连续定位分支：替换为独立安装的 SUTrack runtime 插件。
+sutrack:
+  implementation:
+    module: research_sutrack.runtime
+    factory: build_sutrack_runtime
+    kwargs:
+      checkpoint: checkpoints/sutrack.pth
+  output:
+    bbox_key: target_bbox
+    bbox_format: xywh
+    execution_key: execution
+    score_key: best_score
+
+# 认知分支沿用 CognitiveVLMTracker 的严格提交、状态与记忆协议。
+vlm:
+  context_mode: mosaic
+  model_config: ../models/qwen25vl_7b.yaml
+  memory:
+    enabled: true
+    semantic_enabled: true
+    max_positive_records: 3
+    max_semantic_records: 4
+    min_semantic_frame_gap: 30
+    confirmations: 2
+  save_raw_response: true
+
+fusion:
+  # presence-only VLM 输出 absent 时不发布运动分支框。
+  semantic_rejection_action: suppress
+  # 不可定位但没有明确否定证据时，继续使用 SUTrack 保持稠密轨迹。
+  uncommitted_action: fallback
+  # 插件实现 correct(image, bbox_xywh, info) 时，用已提交 VLM 框校正其状态。
+  correct_sutrack_on_commit: true

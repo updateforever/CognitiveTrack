@@ -1,0 +1,47 @@
+tracker_name: hybrid_cognitive
+experiment_name: hybrid_sutrack_b384_qwen25vl_keyframe_v4_memory
+
+observation_policy:
+  type: keyframe
+
+sutrack:
+  implementation:
+    module: cogtrack.models.sutrack.runtime
+    factory: build_sutrack_runtime
+    kwargs:
+      model_config: ../models/sutrack_b384.yaml
+      checkpoint: ${COGTRACK_SUTRACK_CHECKPOINT}
+      device: auto
+      # SUTrack 推理不使用 amp：原版全程 fp32（CLIP 文本塔内部自带 fp16 混合
+      # 布局是另一回事）。开 amp 会让定位结果偏离已发表数字。
+      amp: false
+      # 与 sutrack_b384.yaml 保持一致：auto 在非 USE_NLP 数据集上等价于全零
+      # token，在 tnl2k 之类数据集上才对 caption 做 CLIP tokenize。
+      language_mode: auto
+      # 原版 USE_NLP=False 时仍会把全零 token 送进 CLIP 文本塔，
+      # 所以 multi_modal_language 必须为 true，否则走错 encoder 分支。
+      multi_modal_vision: true
+      multi_modal_language: true
+      use_nlp_datasets: ["tnl2k", "otb99", "otb99_lang"]
+  output:
+    bbox_key: target_bbox
+    bbox_format: xywh
+    execution_key: execution
+    score_key: best_score
+
+vlm:
+  context_mode: mosaic
+  model_config: ../models/qwen25vl_7b.yaml
+  memory:
+    enabled: true
+    semantic_enabled: true
+    max_positive_records: 3
+    max_semantic_records: 4
+    min_semantic_frame_gap: 30
+    confirmations: 2
+  save_raw_response: true
+
+fusion:
+  semantic_rejection_action: suppress
+  uncommitted_action: fallback
+  correct_sutrack_on_commit: true

@@ -1,0 +1,37 @@
+# 该文件与 scripts/train_grpo.sh 的默认值一一对应。真正启动时使用必填环境
+# 变量 MODEL_PATH、GRPO_DATA；model/dataset 只是项目内的可移植示例。
+stage: grpo
+rlhf_type: grpo
+model: outputs/sft_qwen_vl
+dataset: outputs/training/grpo_train.jsonl
+output_dir: outputs/grpo_qwen_vl
+external_plugins: cogtrack/training/grpo_rewards.py
+reward_funcs:
+  - cogtrack_format
+  - cogtrack_presence
+  - cogtrack_bbox
+  - cogtrack_consistency
+reward_weights: [0.5, 1.5, 2.0, 0.5]
+tuner_type: lora
+target_modules: all-linear
+torch_dtype: bfloat16
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 0.000005
+lora_rank: 16
+lora_alpha: 32
+freeze_vit: true
+max_length: 4096
+num_generations: 4
+max_completion_length: 256
+temperature: 0.7
+top_p: 0.9
+beta: 0.04
+num_train_epochs: 1
+gradient_checkpointing: true
+logging_steps: 1
+save_steps: 100
+save_total_limit: 2
+dataset_num_proc: 4
+dataloader_num_workers: 4
+report_to: none

@@ -1,0 +1,13 @@
+tracker_name: cognitive_vlm
+experiment_name: qwen25vl_7b_pair_sft_presence_v1
+context_mode: pair
+# Qwen2.5-VL 微调数据通过官方 <bbox> 模板生成 processor-resize 后绝对像素坐标。
+bbox_protocol: qwen_abs_pixel
+observation_policy:
+  type: dense
+memory:
+  enabled: false
+  model_output_enabled: false
+  semantic_enabled: false
+model_config: ../models/qwen25vl_7b_sft.yaml
+save_raw_response: true

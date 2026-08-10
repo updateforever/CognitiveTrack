@@ -1,0 +1,13 @@
+tracker_name: cognitive_vlm
+experiment_name: qwen3vl_4b_pair_presence_baseline
+context_mode: pair
+# Qwen3-VL 官方 grounding 使用 0-to-1000 相对坐标。
+bbox_protocol: norm1000
+observation_policy:
+  type: dense
+memory:
+  enabled: false
+  model_output_enabled: false
+  semantic_enabled: false
+model_config: ../models/qwen3vl_4b.yaml
+save_raw_response: true

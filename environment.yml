@@ -1,0 +1,20 @@
+name: cogtrack
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - torch>=2.1
+      - torchvision>=0.16
+      - timm>=0.9
+      - transformers>=4.57.0
+      - qwen-vl-utils>=0.0.14
+      - ms-swift>=4.3,<5
+      - numpy>=1.24
+      - opencv-python>=4.8
+      - Pillow>=10.0
+      - PyYAML>=6.0
+      - tqdm>=4.66
+      - pytest>=8.0
+      - ruff>=0.8

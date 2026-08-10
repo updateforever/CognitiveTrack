@@ -1,0 +1,15 @@
+tracker_name: cognitive_vlm
+experiment_name: qwen25vl_7b_pair_v4_memory
+context_mode: pair
+# 见 qwen25vl_7b_mosaic.yaml：零样本必须用 Qwen 原生绝对像素约定。
+bbox_protocol: qwen_abs_pixel
+observation_policy:
+  type: dense
+memory:
+  # pair 不维护视觉历史，但允许模型按需写入短语义变化记忆。
+  enabled: false
+  semantic_enabled: true
+  max_semantic_records: 4
+  min_semantic_frame_gap: 30
+model_config: ../models/qwen25vl_7b.yaml
+save_raw_response: true

@@ -1,0 +1,22 @@
+# 用于与官方 SUTrack 做数值对齐：禁用 autocast，其他设置与官方 B384 一致。
+tracker_name: sutrack_adapter
+experiment_name: sutrack_b384_reference_fp32_v1
+
+implementation:
+  module: cogtrack.models.sutrack.runtime
+  factory: build_sutrack_runtime
+  kwargs:
+    model_config: ../models/sutrack_b384.yaml
+    checkpoint: ${COGTRACK_SUTRACK_CHECKPOINT}
+    device: cuda
+    amp: false
+    language_mode: auto
+    multi_modal_vision: true
+    multi_modal_language: true
+    use_nlp_datasets: ["tnl2k", "otb99", "otb99_lang"]
+
+output:
+  bbox_key: target_bbox
+  bbox_format: xywh
+  execution_key: execution
+  score_key: best_score

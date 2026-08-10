@@ -1,0 +1,13 @@
+tracker_name: cognitive_vlm
+experiment_name: qwen3vl_32b_pair_sft_presence_v1
+context_mode: pair
+# Qwen3-VL 的官方训练视图与推理均使用 0-to-1000 相对坐标。
+bbox_protocol: norm1000
+observation_policy:
+  type: dense
+memory:
+  enabled: false
+  model_output_enabled: false
+  semantic_enabled: false
+model_config: ../models/qwen3vl_32b_sft.yaml
+save_raw_response: true
