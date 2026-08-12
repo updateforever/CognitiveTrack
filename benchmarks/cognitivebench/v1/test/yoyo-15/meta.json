@@ -1,0 +1,14 @@
+{
+  "sequence": "yoyo-15",
+  "split": "test",
+  "num_frames": 1000,
+  "bbox_format": "xywh",
+  "frame_index_base": 0,
+  "target_status_format": {
+    "1": "present",
+    "0": "absent"
+  },
+  "target_status_source": "lasot_full_occlusion_or_out_of_view",
+  "source_dataset": "lasot",
+  "source_split": "test"
+}

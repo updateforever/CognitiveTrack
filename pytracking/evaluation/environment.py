@@ -147,6 +147,13 @@ def load_environment(
         raw_value = raw_datasets.get(name, payload.get(f"{name}_path"))
         env_value = os.environ.get(f"COGTRACK_{name.upper()}_ROOT")
         raw_value = env_value or raw_value
+        # CognitiveBench v1 只包含约 35MB 的冻结标注，不包含原始视频帧。标注随
+        # 仓库发布后可以安全地作为默认路径；LaSOT/TNL2K/MGIT 图像根仍必须由
+        # 每台机器显式配置，loader 会按 meta.json 的来源映射解析。
+        if raw_value is None and name == "cognitivebench":
+            bundled_benchmark = project_root / "benchmarks/cognitivebench/v1"
+            if bundled_benchmark.is_dir():
+                raw_value = bundled_benchmark
         if raw_value is None and data_root is not None:
             conventional_name = {
                 "cognitivebench": "CognitiveBench",

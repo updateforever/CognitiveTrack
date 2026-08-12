@@ -27,10 +27,27 @@ CognitiveTrack 是一个建立在 **pytracking 标准推理范式**之上的大�
 
 ## 首批数据集
 
-- CognitiveBench
+- CognitiveBench v1（995 序列的冻结标注已随仓库发布，原始图像仍从下面数据集解析）
 - LaSOT
 - TNL2K
 - MGIT
+
+CognitiveBench 的格式、规模、原始图像依赖和评测约束见
+[benchmarks/cognitivebench/v1/README.md](benchmarks/cognitivebench/v1/README.md)。clone 后
+可先运行 `python tools/verify_cognitivebench.py` 离线检查标注完整性。
+
+使用 Qwen3-VL 4B 运行稀疏关键帧快速验证：
+
+```bash
+python tracking/test.py \
+  --config configs/env.local.yaml \
+  --tracker-config configs/trackers/qwen3vl_4b_pair_cognitivebench_sparse.yaml \
+  --dataset-config configs/datasets/cognitivebench.yaml \
+  --sequence 005 --debug-frames 5
+```
+
+该配置只在 `keyframes.txt` 指定帧执行纯 VLM，未融合 SUTrack；非关键帧的
+`skipped/NaN` 是稀疏执行协议的一部分，debug 截断结果不能作为正式稠密 SOT 指标。
 
 ## 环境
 

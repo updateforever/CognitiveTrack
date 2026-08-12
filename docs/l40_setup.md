@@ -9,6 +9,7 @@ LaSOT/TNL2K 原始训练集复现 Qwen3-VL-4B Stage-1 数据和训练环境。
 | 内容 | 首选方式 | 说明 |
 | --- | --- | --- |
 | CognitiveTrack 代码与配方 | Git | 固定 commit，不复制上层 VLMTrack 的其他文件 |
+| CognitiveBench v1 标注 | Git | 约 35MB，不含图片；随代码 clone |
 | Qwen3-VL-4B 权重 | L40 从 ModelScope 官方仓库重新下载 | 约 8.89GB，不进入 Git |
 | Stage-1 数据 | 用 L40 已有 LaSOT/TNL2K 重建 | 解包后约 3.63GB |
 | 固定 sampling plan | 随 ModelScope 数据发布包同步 | 约 1.1MB，重建时传给 `--sampling-plan` |
@@ -120,12 +121,20 @@ output_root: /outputs/cogtrack
 datasets:
   lasot: /datasets/raw/LaSOT
   tnl2k: /datasets/raw/TNL2K
-  cognitivebench: /datasets/raw/CognitiveBench
+  cognitivebench: /workspace/CognitiveTrack/benchmarks/cognitivebench/v1
   mgit: /datasets/raw/MGIT
 ```
 
 `env.local.yaml` 已被 Git 忽略，禁止提交。TNL2K 也可直接指向
 `TNL2K_train_subset`，但推荐指向其父目录，由 loader 按 `split=train` 解析。
+
+CognitiveBench 标注已经随 Git clone，无需另行下载。评测它时还需要 LaSOT-test、
+TNL2K-test 和 MGIT-val 原始图像；只进行 Stage-1 SFT 时可暂不准备这些测试图像。clone
+后先运行：
+
+```bash
+python tools/verify_cognitivebench.py
+```
 
 ## 6. 原始数据验收
 

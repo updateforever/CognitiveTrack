@@ -1,0 +1,45 @@
+{
+  "name": "CognitiveBench",
+  "version": "v1",
+  "split": "test",
+  "bbox_format": "xywh",
+  "frame_index_base": 0,
+  "target_status_format": {
+    "1": "present",
+    "0": "absent"
+  },
+  "source_datasets": [
+    "mgit",
+    "lasot",
+    "tnl2k"
+  ],
+  "source_splits": {
+    "mgit": "val",
+    "lasot": "test",
+    "tnl2k": "test"
+  },
+  "sequence_counts": {
+    "mgit": 15,
+    "lasot": 280,
+    "tnl2k": 700
+  },
+  "statistics": {
+    "num_sequences": 995,
+    "num_frames": 1408438,
+    "num_keyframes": 343616,
+    "present_frames": 1274185,
+    "absent_frames": 134253,
+    "absent_ratio": 0.09532048979081792,
+    "absent_keyframes": 33205,
+    "absent_keyframe_ratio": 0.09663403333954182,
+    "invalid_present_bbox_count": 2
+  },
+  "annotation_sha256": "fc10d30be2042b9e227c608c19b77772de375b14eddc1134a50e5acfb7fa5a0e",
+  "annotation_layout": "test/<sequence>/{groundtruth.txt,target_status.txt,keyframes.txt,meta.json}",
+  "images_included": false,
+  "notes": [
+    "Images are not copied.",
+    "Frame paths are resolved from original dataset roots by source_dataset and sequence.",
+    "MGIT uses val because test ground truth is not public."
+  ]
+}

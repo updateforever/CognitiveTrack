@@ -96,6 +96,9 @@ Qwen2.5-VL 与 Qwen3-VL 不是同一套官方 grounding 坐标：
   `[669.0,422.0,40.0,100.0]`，GT 为 `[668,422,38,100]`。
 - 真实 Qwen processor 回放已经证明：Qwen2.5 使用 resize 后绝对像素，Qwen3 使用
   norm1000，且多图 assistant bbox 正确绑定当前帧。
+- CognitiveBench v1 的 995 序列冻结标注已纳入
+  `benchmarks/cognitivebench/v1/`，共 1,408,438 帧和 343,616 个 0-based 关键帧；
+  benchmark 不含图像，运行时仍依赖 LaSOT-test、TNL2K-test 和 MGIT-val。
 
 ### Stage-1 正式数据
 
@@ -269,7 +272,7 @@ Git commit、数据/模型 revision 与 checksum、GPU 拓扑和 NCCL 环境。
 1. 阅读本文件、`README.md`、`docs/l40_setup.md`、`docs/training.md`。
 2. 运行 `git status -sb`，保护用户已有修改，不使用破坏性 reset/checkout。
 3. 确认当前 Git commit、GPU 型号/数量、数据根、模型根和输出根。
-4. 运行 `pytest -q` 和与任务相关的最小验证。
+4. 运行 `python tools/verify_cognitivebench.py`、`pytest -q` 和与任务相关的最小验证。
 5. 恢复任务时先检查现有 `logging.jsonl`、checkpoint 完整性和 GPU 残留进程，禁止
    重复启动同一训练。
 6. 先完成两步 smoke，再开始昂贵实验；先纯 VLM，再讨论 hybrid。

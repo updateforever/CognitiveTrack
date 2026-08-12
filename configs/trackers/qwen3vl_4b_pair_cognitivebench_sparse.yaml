@@ -1,0 +1,18 @@
+tracker_name: cognitive_vlm
+experiment_name: qwen3vl_4b_pair_cognitivebench_sparse
+
+# 与 dense baseline 使用完全相同的两图输入和坐标协议，仅改变 VLM 观察时刻。
+context_mode: pair
+bbox_protocol: norm1000
+observation_policy:
+  # 直接读取 CognitiveBench 每条序列的 keyframes.txt；非关键帧不会调用大模型。
+  type: keyframe
+
+# 该配置用于先测纯 VLM 的稀疏跟踪潜力，暂不引入记忆或传统跟踪器融合。
+memory:
+  enabled: false
+  model_output_enabled: false
+  semantic_enabled: false
+
+model_config: ../models/qwen3vl_4b.yaml
+save_raw_response: true

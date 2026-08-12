@@ -39,6 +39,17 @@ class CognitiveBenchDataset(BaseDataset):
         super().__init__(environment)
         self.split = split
         self.base_path = self.environment.dataset_root("cognitivebench")
+        benchmark_meta_path = self.base_path / "benchmark_meta.json"
+        self.benchmark_meta = self._read_json(benchmark_meta_path)
+        if str(self.benchmark_meta.get("version")) != "v1":
+            raise ValueError(
+                f"CognitiveBench 仅支持冻结的 v1 标注，收到："
+                f"{self.benchmark_meta.get('version')!r}"
+            )
+        if str(self.benchmark_meta.get("bbox_format", "")).lower() != "xywh":
+            raise ValueError("CognitiveBench benchmark_meta bbox_format 必须为 xywh")
+        if int(self.benchmark_meta.get("frame_index_base", -1)) != 0:
+            raise ValueError("CognitiveBench benchmark_meta frame_index_base 必须为 0")
         self.annotation_root = self.base_path / split
         if not self.annotation_root.is_dir():
             raise FileNotFoundError(f"CognitiveBench split 目录不存在: {self.annotation_root}")
@@ -47,6 +58,13 @@ class CognitiveBenchDataset(BaseDataset):
         )
         if not self.sequence_names:
             raise FileNotFoundError(f"CognitiveBench 中未发现序列: {self.annotation_root}")
+        expected_counts = self.benchmark_meta.get("sequence_counts") or {}
+        expected_total = sum(int(value) for value in expected_counts.values())
+        if expected_total and expected_total != len(self.sequence_names):
+            raise ValueError(
+                f"CognitiveBench 序列数与 benchmark_meta 不一致："
+                f"expected={expected_total} actual={len(self.sequence_names)}"
+            )
         self.sequence_list = self.sequence_names
 
     def __len__(self) -> int:

@@ -1,3 +1,4 @@
 name: cognitivebench
 split: test
-# 数据路径统一放在不提交的 env.local.yaml 或 COGTRACK_*_ROOT 环境变量中。
+# v1 冻结标注随仓库同步；LaSOT/TNL2K/MGIT 原始图像仍由 env.local.yaml 配置。
+root: benchmarks/cognitivebench/v1

@@ -1,0 +1,14 @@
+{
+  "sequence": "test_048_CartoonJerryTom_video_09_done",
+  "split": "test",
+  "num_frames": 1271,
+  "bbox_format": "xywh",
+  "frame_index_base": 0,
+  "target_status_format": {
+    "1": "present",
+    "0": "absent"
+  },
+  "target_status_source": "derived_from_gt_bbox",
+  "source_dataset": "tnl2k",
+  "source_split": "test"
+}

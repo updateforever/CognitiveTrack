@@ -1,0 +1,14 @@
+{
+  "sequence": "Man_video_01-Done",
+  "split": "test",
+  "num_frames": 860,
+  "bbox_format": "xywh",
+  "frame_index_base": 0,
+  "target_status_format": {
+    "1": "present",
+    "0": "absent"
+  },
+  "target_status_source": "derived_from_gt_bbox",
+  "source_dataset": "tnl2k",
+  "source_split": "test"
+}

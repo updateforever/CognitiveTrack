@@ -1,0 +1,14 @@
+{
+  "sequence": "159",
+  "split": "test",
+  "num_frames": 25284,
+  "bbox_format": "xywh",
+  "frame_index_base": 0,
+  "target_status_format": {
+    "1": "present",
+    "0": "absent"
+  },
+  "target_status_source": "mgit_absent",
+  "source_dataset": "mgit",
+  "source_split": "val"
+}

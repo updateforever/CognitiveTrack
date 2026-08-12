@@ -1,0 +1,3 @@
+# CognitiveBench 是冻结评测标注。GitHub 不应把数千个数值 TXT 当作项目源码语言，
+# review 时也不需要渲染巨型逐帧 diff。
+benchmarks/cognitivebench/v1/test/** linguist-generated=true
