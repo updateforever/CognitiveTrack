@@ -6,8 +6,8 @@ Success / Precision / Normalized Precision 三条曲线。
 核心约定：
 - IoU 使用离散像素几何（``-1`` 偏移），与 pytracking 一致
 - 第 0 帧强制替换为 GT（``pred_bb[0, :] = anno_bb[0, :]``）
-- ``target_visible`` 用于掩盖不可见帧，absent 帧不参与分母
-- 稀疏跟踪的 NaN 帧不参与评估
+- ``target_visible`` 用于把不可见帧标为未命中；默认全序列分母下 absent 帧贡献零分
+- 稀疏跟踪的 NaN 帧不产生命中；是否进入分母由显式 sparse convention 决定
 - 按序列宏平均，不是帧级微平均
 """
 
@@ -134,8 +134,14 @@ def calc_seq_err_robust(
     err_center_normalized[~valid] = -1.0
     err_overlap[~valid] = -1.0
 
+    # 原版用 -1 标记 normalized center 的无效项，但后续命中条件是
+    # ``error <= threshold``，因此 NaN 预测会被所有非负阈值误判为命中。稠密
+    # tracker 没有该问题；稀疏执行必须把真正缺预测的帧标为 Inf，使 dense-zero
+    # 和观测帧执行失败都贡献零分。
+    err_center_normalized[sparse_tracking_mask] = float("inf")
+
     # LaSOT 特殊处理：不可见帧中心误差标记为 inf
-    if dataset == "lasot":
+    if dataset in {"lasot", "cognitivebench"}:
         err_center_normalized[~target_visible] = float("inf")
         err_center[~target_visible] = float("inf")
 
@@ -195,7 +201,10 @@ def _forward_fill_missing(pred_bb: torch.Tensor, missing: torch.Tensor) -> torch
         if bool(missing[i]):
             if last is not None:
                 filled[i, :] = last
-        else:
+        elif not torch.isnan(filled[i, :]).any():
+            # 观测帧执行失败或明确输出 absent 时没有 bbox，当前帧仍记为失败；
+            # 但不能用 NaN 覆盖此前最后一次合法定位，否则后续非观测帧无法表达
+            # tracker 的 hold-last 信念。
             last = filled[i, :].clone()
     return filled
 
@@ -205,18 +214,18 @@ def _prepare_sequence_tensors(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """把一条序列的帧记录转成评测张量。
 
-    返回 ``(anno_bb, pred_bb, missing, unobserved, target_visible)``：
+    返回 ``(anno_bb, pred_bb, missing, non_observation, target_visible)``：
 
     - ``missing``：该帧没有预测框（跳过的帧与执行失败的帧都算）
-    - ``unobserved``：该帧被跟踪器主动跳过，即 ``is_observation_frame is False``。
-      "看了但失败" 不属于 unobserved，必须留在分母里记为失败，否则报错的帧反而
-      会被当成没看过而免于计分。
+    - ``non_observation``：该帧没有执行昂贵 VLM，即
+      ``is_observation_frame is False``。Hybrid 即使在该帧有传统 tracker bbox，
+      observation-only 仍必须排除它，不能冒充 VLM 已看图。
     """
     anno_bb_list: list[list[float]] = []
     pred_bb_list: list[list[float]] = []
     target_visible_list: list[bool] = []
     missing_list: list[bool] = []
-    unobserved_list: list[bool] = []
+    non_observation_list: list[bool] = []
     has_observation_label = False
 
     for frame in seq_frames:
@@ -234,7 +243,7 @@ def _prepare_sequence_tensors(
 
         if frame.is_observation_frame is not None:
             has_observation_label = True
-        unobserved_list.append(frame.is_observation_frame is False)
+        non_observation_list.append(frame.is_observation_frame is False)
 
         if frame.gt_presence == "present":
             target_visible_list.append(True)
@@ -245,17 +254,16 @@ def _prepare_sequence_tensors(
 
     missing = torch.tensor(missing_list, dtype=torch.bool)
     if has_observation_label:
-        # 只有既没预测、又明确标了非观测帧的，才算跟踪器没看过。
-        unobserved = torch.tensor(unobserved_list, dtype=torch.bool) & missing
+        non_observation = torch.tensor(non_observation_list, dtype=torch.bool)
     else:
         # 旧结果没有 is_observation_frame 字段：沿用 "NaN 即稀疏跳过" 的原语义。
-        unobserved = missing.clone()
+        non_observation = missing.clone()
 
     return (
         _to_torch_float64(anno_bb_list),
         _to_torch_float64(pred_bb_list),
         missing,
-        unobserved,
+        non_observation,
         torch.tensor(target_visible_list, dtype=torch.uint8),
     )
 
@@ -320,37 +328,27 @@ def extract_results_from_canonical_frames(
     )
     valid_sequence = torch.ones(num_sequences, dtype=torch.uint8)
     sequence_names = []
+    total_frames = observation_frames = prediction_frames = scored_frames = 0
 
     for seq_id, (seq_name, seq_frames) in enumerate(sorted(sequences.items())):
         sequence_names.append(seq_name)
 
-        # 提取 GT 与预测
-        anno_bb_list = []
-        pred_bb_list = []
-        target_visible_list = []
+        anno_bb, pred_bb, missing, non_observation, target_visible = (
+            _prepare_sequence_tensors(seq_frames)
+        )
+        total_frames += len(seq_frames)
+        observation_frames += int((~non_observation).sum().item())
+        prediction_frames += int((~missing).sum().item())
 
-        for frame in seq_frames:
-            if frame.gt_bbox is None:
-                anno_bb_list.append([0.0, 0.0, 0.0, 0.0])
-            else:
-                anno_bb_list.append(frame.gt_bbox)
-
-            if frame.pred_bbox is None:
-                # NaN 表示稀疏跟踪跳过的帧
-                pred_bb_list.append([float("nan")] * 4)
-            else:
-                pred_bb_list.append(frame.pred_bbox)
-
-            if frame.gt_presence == "present":
-                target_visible_list.append(True)
-            elif frame.gt_presence == "absent":
-                target_visible_list.append(False)
-            else:
-                target_visible_list.append(True)  # 未标注时默认可见
-
-        anno_bb = _to_torch_float64(anno_bb_list)
-        pred_bb = _to_torch_float64(pred_bb_list)
-        target_visible = torch.tensor(target_visible_list, dtype=torch.uint8)
+        if sparse_convention == SPARSE_CONVENTION_HOLD_LAST:
+            # 只填充明确未观测的帧。看过但解析/模型失败的帧必须保留 NaN 并计为失败，
+            # 否则工程错误会被错误地伪装成稳定跟踪结果。
+            evaluated_pred_bb = _forward_fill_missing(
+                pred_bb,
+                non_observation & missing,
+            )
+        else:
+            evaluated_pred_bb = pred_bb
 
         # dataset 名直接取 runner 写进 JSONL 的值，对应原版的 ``seq.dataset``。
         # 这里绝不能从序列名去猜：lasot 的序列叫 ``airplane-1``，猜出来会是
@@ -362,32 +360,55 @@ def extract_results_from_canonical_frames(
 
         try:
             err_overlap, err_center, err_center_normalized, valid_frame = calc_seq_err_robust(
-                pred_bb, anno_bb, dataset, target_visible
+                evaluated_pred_bb, anno_bb, dataset, target_visible
             )
         except Exception:
             valid_sequence[seq_id] = 0
             continue
 
-        avg_overlap_all[seq_id, 0] = err_overlap[valid_frame].mean()
+        score_mask = torch.ones(anno_bb.shape[0], dtype=torch.bool)
+        if sparse_convention == SPARSE_CONVENTION_OBSERVATION_ONLY:
+            # observation-only 只改变稀疏执行的计分分母；观测帧上输出 absent、
+            # parse_error 或 model_error 仍保留在分母中记为失败。
+            score_mask = ~_align_mask(non_observation, anno_bb.shape[0])
+
+        valid_scored = valid_frame & score_mask
+        if bool(valid_scored.any()):
+            avg_overlap_all[seq_id, 0] = err_overlap[valid_scored].mean()
 
         if exclude_invalid_frames:
-            seq_length = valid_frame.long().sum()
+            seq_length = valid_scored.long().sum()
         else:
-            seq_length = anno_bb.shape[0]
+            seq_length = score_mask.long().sum()
 
         if seq_length <= 0:
-            raise ValueError(f"序列 {seq_name} 有效长度为 0")
+            valid_sequence[seq_id] = 0
+            continue
+        scored_frames += int(seq_length.item())
 
         ave_success_rate_plot_overlap[seq_id, 0, :] = (
-            (err_overlap.view(-1, 1) > threshold_set_overlap.view(1, -1)).sum(0).float()
+            (
+                (err_overlap.view(-1, 1) > threshold_set_overlap.view(1, -1))
+                & score_mask.view(-1, 1)
+            )
+            .sum(0)
+            .float()
             / seq_length
         )
         ave_success_rate_plot_center[seq_id, 0, :] = (
-            (err_center.view(-1, 1) <= threshold_set_center.view(1, -1)).sum(0).float()
+            (
+                (err_center.view(-1, 1) <= threshold_set_center.view(1, -1))
+                & score_mask.view(-1, 1)
+            )
+            .sum(0)
+            .float()
             / seq_length
         )
         ave_success_rate_plot_center_norm[seq_id, 0, :] = (
-            (err_center_normalized.view(-1, 1) <= threshold_set_center_norm.view(1, -1))
+            (
+                (err_center_normalized.view(-1, 1) <= threshold_set_center_norm.view(1, -1))
+                & score_mask.view(-1, 1)
+            )
             .sum(0)
             .float()
             / seq_length
@@ -408,4 +429,14 @@ def extract_results_from_canonical_frames(
         "threshold_set_center_norm": threshold_set_center_norm.tolist(),
         "num_valid_sequences": num_valid,
         "num_sequences": num_sequences,
+        "sparse_convention": sparse_convention,
+        "sparsity": {
+            "total_frames": total_frames,
+            "observation_frames": observation_frames,
+            "unobserved_frames": total_frames - observation_frames,
+            "observation_rate": observation_frames / total_frames if total_frames else None,
+            "prediction_frames": prediction_frames,
+            "prediction_rate": prediction_frames / total_frames if total_frames else None,
+            "scored_frames": scored_frames,
+        },
     }

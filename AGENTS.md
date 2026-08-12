@@ -81,7 +81,7 @@ Qwen2.5-VL 与 Qwen3-VL 不是同一套官方 grounding 坐标：
 新增 tracker 时至少同步检查 tracker、parameter/config、prompt 三层。路径只放在
 `configs/env.local.yaml` 或环境变量中，禁止把本机绝对路径写入可提交配置。
 
-## 5. 截至 2026-08-10 的真实进度
+## 5. 截至 2026-08-12 的真实进度
 
 ### 工程与基线
 
@@ -90,8 +90,8 @@ Qwen2.5-VL 与 Qwen3-VL 不是同一套官方 grounding 坐标：
   两条语言分支逐帧 bit 级一致。
 - 相同预测经原版和本项目指标聚合，15 条序列五项指标最大绝对差为 `0.00e+00`。
 - Qwen2.5/Qwen3 本地多图推理、pair/mosaic、二分类严格解析均已接通。
-- Qwen3-VL-4B 在 CognitiveBench `005` 的真实双图零样本样例执行成功：预测约
-  `[669.0,422.0,40.0,100.0]`，GT 为 `[668,422,38,100]`。
+- Qwen3-VL-4B 的零样本与 Stage-1 LoRA 双图推理均已真实跑通。单帧结果只能用于
+  工程和错误分析；是否提升必须以固定 CognitiveBench 协议的完整聚合指标判断。
 - 真实 Qwen processor 回放已经证明：Qwen2.5 使用 resize 后绝对像素，Qwen3 使用
   norm1000，且多图 assistant bbox 正确绑定当前帧。
 - CognitiveBench v1 的 995 序列冻结标注已纳入
@@ -112,10 +112,11 @@ Qwen2.5-VL 与 Qwen3-VL 不是同一套官方 grounding 坐标：
   reference/current gap 中位数 161 帧、90% 分位 1,170 帧、最大 23,738 帧。
 - `sampling_plan.json` SHA-256：
   `158372c68e82918d9460826d89f601d1278a3f97e6980e2069718755689c03a7`。
-- 新版本目录为
-  `data/releases/cogtrack_stage1_lasot_tnl2k_mgit_tiny_pair64_v1`。截至 2026-08-11，
-  sampling plan 已冻结，图片与 ms-swift JSONL 正在当前服务器导出；完成前不得声称
-  正式数据包已验收完毕。
+- 正式数据目录为
+  `data/releases/cogtrack_stage1_lasot_tnl2k_mgit_tiny_pair64_v1`。数据已经完成导出并
+  用于 Stage-1 LoRA 一轮训练；train/val 分别为 152,039/8,010 条。完整数据发布包的
+  ModelScope ID 与 checksum 尚未写入仓库，换服务器时仍需从训练服务器取得固定 plan
+  与成品包，禁止重新随机抽样后沿用同一版本名。
 - 旧 LaSOT+TNL2K 48,400-case v1 从未用于实际训练，其统计和 sampling plan 不再作为
   当前正式数据输入，只保留为历史记录。
 - 构造 CLI 已支持 `--sampling-plan` 严格重放，源数据验收工具为
@@ -125,17 +126,24 @@ Qwen2.5-VL 与 Qwen3-VL 不是同一套官方 grounding 坐标：
 私有 ModelScope 数据仓库或原服务器取得；如果文档中仍是 `<OWNER/...>` 占位符，先向
 用户询问一次实际 ModelScope dataset ID/revision，不要静默重新抽样。
 
-### Qwen3-VL-4B SFT 冒烟
+### Qwen3-VL-4B Stage-1 LoRA
 
-- 环境：8×RTX 4090 24GB、PyTorch 2.8.0+cu128、transformers 4.57.1、ms-swift
-  4.3.1、flash-attn 2.8.3.post1。
+- 环境兼容基线：PyTorch 2.8.0+cu128、transformers 4.57.1、ms-swift 4.3.1、
+  flash-attn 2.8.3.post1、PEFT 0.19.1。
 - 训练默认改为 `tuner_type=lora`，冻结视觉主干与对齐层，在语言模型线性层注入
   LoRA；Stage-1/2/3 SFT 和后续 GRPO 统一沿用同一 adapter。全参方案仅作显式对照。
-- 总参数 4.438B，可训练 4.132B（93.10%）。
-- LoRA smoke 使用 BF16、单卡 batch 1；正式全局 batch 根据 4/8 卡资源设置。
-- 两步峰值 16.29GiB/卡，吞吐约 4.64 samples/s；首步 loss 1.536，两步平均 1.366。
-- 已完成单卡 L40S 上 Stage-1/Stage-2 各两步 LoRA smoke；尚未宣称完成正式一轮训练
-  或获得训练后 benchmark 提升。
+- 总参数约 4.471B，LoRA 可训练参数 33.0301M（0.7388%）；rank 16、alpha 32、
+  dropout 0.05，target modules 为语言模型 `all-linear`，视觉塔与 aligner 冻结。
+- 正式 Stage-1 已完成 1 epoch、19,005/19,005 steps；global world size 2、单卡 batch 4、
+  global batch 8、学习率 5e-5、cosine、warmup 0.05。训练耗时约 4h45m41s，最终
+  train loss 0.29283377、token accuracy 0.882494，峰值记录 38.66GiB/卡。
+- 该次运行 `eval_strategy=no`，虽然保留 8,010 条按序列隔离的 val，但没有 validation
+  loss；不得用 train loss 推断泛化提升。
+- adapter 已发布为 ModelScope
+  `updateforever/CognitiveTrack-Qwen3VL-4B-Stage1-LoRA`；核心权重 SHA-256 为
+  `732ff15f4791f75c1ca16b2a72163fe59ff8a8059e87e765caf22382ddd07131`。
+- 本机已完成 SHA256 校验、PEFT 挂载和真实 GPU 推理。正式 CognitiveBench 指标尚未
+  产生；当前唯一有效结论是工程链路通过，不能声称性能提升。
 
 ## 6. 新服务器最快恢复流程
 
@@ -169,8 +177,7 @@ python scripts/verify_env.py --verbose
 python -m pytest -q
 ```
 
-当前完整测试基线是 119 个通过。若测试数量随后续 commit 变化，以该 commit 的测试
-集合为准，但不能忽略失败项。
+测试数量随 commit 增长，以当前 commit 的完整测试集合为准，不能忽略失败项。
 
 ### 6.3 配置机器路径
 
@@ -222,7 +229,7 @@ modelscope download Qwen/Qwen3-VL-4B-Instruct \
 ### 6.6 训练前验证
 
 ```bash
-export DATASET_ROOT=/datasets/derived/cogtrack_stage1_lasot_tnl2k_v1
+export DATASET_ROOT=/datasets/derived/cogtrack_stage1_lasot_tnl2k_mgit_tiny_pair64_v1
 
 python tracking/validate_qwen_training_view.py \
   --model /models/Qwen3-VL-4B-Instruct \
@@ -292,15 +299,19 @@ Git commit、数据/模型 revision 与 checksum、GPU 拓扑和 NCCL 环境。
 当前安全的推进顺序是：
 
 1. 在 L40 恢复固定 commit、环境、正式数据和 Qwen3-VL-4B。
-2. 复现两步 smoke，记录 L40 显存/吞吐，不改变 global batch 16。
-3. 完成一轮 Stage-1 SFT，并保存可恢复 checkpoint。
-4. 先跑纯 VLM 稀疏评测，比较零样本、SFT 后和 Qwen2.5 对照。
-5. 分析 present/absent、定位、消失/重现和长间隔 case，而不只看单一 AUC。
+2. 下载并校验已发布的 Stage-1 LoRA，先完成配置一致性与真实推理 smoke。
+3. 在冻结的 CognitiveBench 全集运行零样本与 LoRA 的相同稀疏观察协议。
+4. 并列报告 hold-last、observation-only、observation rate，以及 presence F1、absent
+   FPR、present miss rate；禁止用人工挑选 case 代替聚合指标。
+5. 指标完成后再按数据源、消失/重现和时间间隔分层做错误分析。
 6. Stage-1 确认有效后再构建 Stage-2 mosaic/时序上下文。
 7. 只有取得可靠更新时机和语义增量标签后才进入 Stage-3 memory SFT/GRPO。
 
 ## 9. 开发与提交约束
 
+- 根目录 `README.md` 是公开项目主页，只保留项目定位、安装、数据、模型、标准推理、
+  评测和训练入口。AI 接手提示、内部服务器路径、未整理的实验流水账和 prompt 探针
+  结论放在本文件或 `docs/`，不要重新写回公开 README。
 - Python 使用 4 空格、`snake_case` 函数/模块、`PascalCase` 类；中文注释说明研究
   约束和易错逻辑，不为显然代码堆注释。
 - Prompt 集中在 `cogtrack/prompts/`；关键帧策略放 evaluation/observation policy，

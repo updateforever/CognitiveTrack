@@ -20,7 +20,11 @@ from .metrics import (
     evaluate_reappearance,
     safe_div,
 )
-from .pytracking_metrics import extract_results_from_canonical_frames
+from .pytracking_metrics import (
+    REPORTED_SPARSE_CONVENTIONS,
+    SPARSE_CONVENTION_DENSE_ZERO,
+    extract_results_from_canonical_frames,
+)
 from .report import build_markdown_report
 
 
@@ -168,8 +172,24 @@ def evaluate_frames(
     all_frames = frames
 
     # 主指标：移植的 pytracking extract_results，可直接与 SUTrack MODEL_ZOO 比较。
-    pytracking_results = extract_results_from_canonical_frames(all_frames)
+    pytracking_results = extract_results_from_canonical_frames(
+        all_frames,
+        sparse_convention=SPARSE_CONVENTION_DENSE_ZERO,
+    )
     pytracking_summary = summarize_pytracking_curves(pytracking_results)
+    pytracking_summary.update(
+        sparse_convention=SPARSE_CONVENTION_DENSE_ZERO,
+        sparsity=pytracking_results["sparsity"],
+    )
+    sparse_summaries: dict[str, dict[str, Any]] = {}
+    for convention in REPORTED_SPARSE_CONVENTIONS:
+        raw = extract_results_from_canonical_frames(
+            all_frames,
+            sparse_convention=convention,
+        )
+        current = summarize_pytracking_curves(raw)
+        current.update(sparse_convention=convention, sparsity=raw["sparsity"])
+        sparse_summaries[convention] = current
 
     benchmark_standard = aggregate_benchmark_standard(
         metrics["benchmark_standard"] for metrics in sequence_metrics.values()
@@ -186,6 +206,10 @@ def evaluate_frames(
         # === 主指标：pytracking 口径 ===
         "pytracking": pytracking_summary,
         "pytracking_raw": pytracking_results,
+        # 稀疏纯 VLM 必须并列报告两种互补口径：hold-last 衡量全时刻状态，
+        # observation-only 衡量模型真正看图时的能力。dense_zero 只作为兼容别名
+        # 保留在顶层 pytracking，不能单独拿它比较不同关键帧率的实验。
+        "pytracking_sparse": sparse_summaries,
         # === 以下为认知能力诊断，不是 benchmark 主指标，不参与对外比较 ===
         "cognitive_diagnostics": {
             "_note": (

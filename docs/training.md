@@ -162,6 +162,22 @@ bash scripts/train_sft.sh
 从 Stage-1 SFT 传递到 Stage-2/Stage-3 和 GRPO，避免切换全参/adapter 权重造成对比
 混乱。需要全参对照时必须显式设置 `TUNER_TYPE=full`。
 
+正式 Stage-1 LoRA 已完成一轮训练：152,039 条 train、8,010 条按序列隔离的 val，
+19,005 steps，global world size 2、单卡 batch 4、global batch 8、学习率 5e-5。模型共
+约 4.471B 参数，其中 33.0301M（0.7388%）可训练；最终 train loss 为 0.29283377，
+token accuracy 为 0.882494。该次运行设置了 `eval_strategy=no`，因此没有 validation
+loss，不能仅根据训练曲线宣称泛化提升。
+
+发布的 adapter 为 ModelScope
+`updateforever/CognitiveTrack-Qwen3VL-4B-Stage1-LoRA`，核心权重 SHA-256：
+
+```text
+732ff15f4791f75c1ca16b2a72163fe59ff8a8059e87e765caf22382ddd07131
+```
+
+训练效果必须在冻结 CognitiveBench 全集上比较零样本与 LoRA 的相同观察策略，并列
+报告 hold-last、observation-only 和 presence 指标。单帧 case 只用于定位错误原因。
+
 此前的全参参考结果为：8×4090、单卡
 batch=2、全局 batch=16 的两步实测中，模型共 4.438B 参数、可训练 4.132B
 （93.10%），峰值 16.29GiB/卡，吞吐约 4.64 samples/s。视觉主干保持冻结，Qwen3

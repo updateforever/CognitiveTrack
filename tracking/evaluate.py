@@ -97,29 +97,53 @@ def main() -> None:
     paths = write_evaluation_outputs(summary, output_dir)
 
     main_metrics = summary["pytracking"]
+    sparse_metrics = summary.get("pytracking_sparse", {})
     diagnostics = summary["cognitive_diagnostics"]
     presence = diagnostics["presence"]
     recovery = diagnostics["reappearance"]
+    observation_rate = main_metrics.get("sparsity", {}).get("observation_rate")
+    is_sparse = observation_rate is not None and observation_rate < 1.0
 
     def _fmt(value: float | None) -> str:
         return "n/a" if value is None else f"{value * 100:.2f}"
 
+    heading = (
+        "[CognitiveTrack] 评测完成（稀疏实验并列报告 hold-last 与 observation-only）："
+        if is_sparse
+        else "[CognitiveTrack] 评测完成（主指标为 pytracking 口径）："
+    )
     print(
-        "[CognitiveTrack] 评测完成（主指标为 pytracking 口径）："
+        heading
+        + " "
         f"sequences={summary['num_sequences']} "
         f"valid={main_metrics['num_valid_sequences']} "
         f"frames={summary['num_frames']}"
     )
     print(
-        f"  AUC={_fmt(main_metrics['success_auc'])} "
+        f"  [{'dense_zero/兼容' if is_sparse else 'dense'}] "
+        f"AUC={_fmt(main_metrics['success_auc'])} "
         f"OP50={_fmt(main_metrics['success_op50'])} "
         f"OP75={_fmt(main_metrics['success_op75'])} "
         f"P={_fmt(main_metrics['precision_p20'])} "
         f"Pnorm={_fmt(main_metrics['norm_precision_np20'])}"
     )
+    for convention in ("hold_last", "observation_only"):
+        values = sparse_metrics.get(convention)
+        if not values:
+            continue
+        print(
+            f"  [{convention}] AUC={_fmt(values['success_auc'])} "
+            f"OP50={_fmt(values['success_op50'])} "
+            f"OP75={_fmt(values['success_op75'])} "
+            f"P={_fmt(values['precision_p20'])} "
+            f"Pnorm={_fmt(values['norm_precision_np20'])}"
+        )
     print(
-        f"  [诊断，不可对外比较] presence_f1={presence['f1']} "
-        f"recovery_rate={recovery['recovery_rate']}"
+        f"  [presence] F1={_fmt(presence['f1'])} "
+        f"absent_FPR={_fmt(presence['false_positive_rate'])} "
+        f"present_miss={_fmt(presence['miss_rate'])} "
+        f"decision_coverage={_fmt(presence['decision_coverage'])} "
+        f"recovery_rate={_fmt(recovery['recovery_rate'])}"
     )
     for name, path in paths.items():
         print(f"[CognitiveTrack] {name}: {path.resolve()}")

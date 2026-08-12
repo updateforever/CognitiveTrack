@@ -16,6 +16,7 @@ def _frame(
     pred_presence: str = "present",
     gt_bbox: tuple[float, float, float, float] | None = (0.0, 0.0, 10.0, 10.0),
     pred_bbox: tuple[float, float, float, float] | None = (0.0, 0.0, 10.0, 10.0),
+    is_observation_frame: bool = True,
 ) -> CanonicalFrame:
     return CanonicalFrame(
         sequence=sequence,
@@ -28,8 +29,58 @@ def _frame(
         gt_identity=None,
         pred_identity=None,
         execution_status="ok",
-        is_observation_frame=True,
+        is_observation_frame=is_observation_frame,
     )
+
+
+def test_sparse_metrics_report_hold_last_and_observation_only_separately():
+    frames = [
+        _frame("sparse", 0),
+        _frame(
+            "sparse",
+            1,
+            pred_bbox=None,
+            pred_presence=None,
+            is_observation_frame=False,
+        ),
+        _frame("sparse", 2, pred_bbox=(100.0, 100.0, 10.0, 10.0)),
+    ]
+
+    summary = evaluate_frames(frames)
+
+    # dense-zero 把未观测帧放在全序列分母中记零；hold-last 用第 0 帧合法框
+    # 填充第 1 帧；observation-only 则只计算第 0、2 两个实际观测帧。
+    assert summary["pytracking"]["precision_p20"] == pytest.approx(1.0 / 3.0)
+    assert summary["pytracking"]["norm_precision_np20"] == pytest.approx(1.0 / 3.0)
+    sparse = summary["pytracking_sparse"]
+    assert sparse["hold_last"]["precision_p20"] == pytest.approx(2.0 / 3.0)
+    assert sparse["hold_last"]["norm_precision_np20"] == pytest.approx(2.0 / 3.0)
+    assert sparse["observation_only"]["precision_p20"] == pytest.approx(1.0 / 2.0)
+    assert sparse["observation_only"]["norm_precision_np20"] == pytest.approx(1.0 / 2.0)
+    for values in sparse.values():
+        assert values["sparsity"]["total_frames"] == 3
+        assert values["sparsity"]["observation_frames"] == 2
+        assert values["sparsity"]["observation_rate"] == pytest.approx(2.0 / 3.0)
+
+
+def test_observation_only_excludes_non_vlm_hybrid_predictions():
+    frames = [
+        _frame("hybrid", 0),
+        _frame(
+            "hybrid",
+            1,
+            pred_bbox=(0.0, 0.0, 10.0, 10.0),
+            is_observation_frame=False,
+        ),
+        _frame("hybrid", 2, pred_bbox=(100.0, 100.0, 10.0, 10.0)),
+    ]
+
+    summary = evaluate_frames(frames)
+
+    # 非观察帧虽然有 SUTrack/Hybrid 发布框，也不能进入 VLM observation-only 分母。
+    observation_only = summary["pytracking_sparse"]["observation_only"]
+    assert observation_only["precision_p20"] == pytest.approx(1.0 / 2.0)
+    assert observation_only["sparsity"]["observation_frames"] == 2
 
 
 def test_benchmark_uses_sequence_macro_average_not_frame_micro_average():
@@ -102,6 +153,10 @@ def test_absent_frames_fail_localization_but_are_scored_by_presence():
     assert visible_only["precision_at_20"] == pytest.approx(1.0)
     assert diagnostics["presence"]["selective_accuracy"] == pytest.approx(1.0)
     assert diagnostics["presence"]["tn"] == 1
+    # CognitiveBench absent 帧必须在默认全序列分母中贡献零分，不能让 pytracking
+    # 的 normalized-error=-1 哨兵被 ``<= threshold`` 错当成命中。
+    assert summary["pytracking"]["precision_p20"] == pytest.approx(0.5)
+    assert summary["pytracking"]["norm_precision_np20"] == pytest.approx(0.5)
 
 
 def test_benchmark_uses_published_bbox_while_cognitive_metric_requires_commit():

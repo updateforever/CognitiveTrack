@@ -1,0 +1,17 @@
+tracker_name: cognitive_vlm
+experiment_name: qwen3vl_4b_pair_sft_cognitivebench_sparse
+context_mode: pair
+bbox_protocol: norm1000
+
+# CognitiveBench 的冻结关键帧决定昂贵 VLM 的观察时刻；非关键帧不调用模型。
+observation_policy:
+  type: keyframe
+
+# Stage-1 仅训练 presence + bbox，不启用尚无可靠监督的语义记忆字段。
+memory:
+  enabled: false
+  model_output_enabled: false
+  semantic_enabled: false
+
+model_config: ../models/qwen3vl_4b_sft.yaml
+save_raw_response: true

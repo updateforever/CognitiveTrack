@@ -22,6 +22,7 @@ def build_markdown_report(summary: Mapping[str, Any]) -> str:
 
     # 主指标：pytracking 口径
     pytracking = summary.get("pytracking", {})
+    sparse_metrics = summary.get("pytracking_sparse", {})
 
     # 认知诊断（v3 起收进 cognitive_diagnostics；兼容 v2 扁平结构）
     diagnostics = summary.get("cognitive_diagnostics", summary)
@@ -33,6 +34,8 @@ def build_markdown_report(summary: Mapping[str, Any]) -> str:
     execution = diagnostics.get("execution", {})
     recovery = diagnostics.get("reappearance", {})
     source = summary.get("source", {})
+    observation_rate = pytracking.get("sparsity", {}).get("observation_rate")
+    is_sparse = observation_rate is not None and float(observation_rate) < 1.0
 
     lines = [
         "# CognitiveTrack 评测报告",
@@ -44,9 +47,18 @@ def build_markdown_report(summary: Mapping[str, Any]) -> str:
         f"- 输入 JSONL：{source.get('num_files', 0)} 个",
         f"- 恢复判定 IoU 阈值：{recovery.get('iou_threshold', 'N/A')}",
         "",
-        "## 主指标：pytracking 口径",
+        (
+            "## 兼容指标：pytracking dense-zero 口径"
+            if is_sparse
+            else "## 主指标：pytracking 口径"
+        ),
         "",
-        "与 SUTrack / pytracking 官方评测工具链逐值对齐，可直接与 MODEL_ZOO 发表数字比较。",
+        (
+            "稀疏实验中该数值受 observation rate 限制，只保留用于结果兼容；正式比较见"
+            "下一节的 hold-last 与 observation-only。"
+            if is_sparse
+            else "与 SUTrack / pytracking 官方评测工具链逐值对齐，可直接与 MODEL_ZOO 发表数字比较。"
+        ),
         "",
         "| 指标 | 数值 |",
         "| --- | ---: |",
@@ -58,9 +70,29 @@ def build_markdown_report(summary: Mapping[str, Any]) -> str:
         f"| Normalized Precision @ 0.2 | {_number(pytracking.get('norm_precision_np20'))} |",
         "",
         (
-            "口径：IoU 使用离散像素几何；第 0 帧强制替换为 GT；`target_visible=False` "
-            "的帧不参与分母；按序列宏平均。"
+            "口径：IoU 使用离散像素几何；第 0 帧强制替换为 GT；"
+            "`target_visible=False` 的帧标为未命中；按序列宏平均。"
         ),
+        "",
+        "## 稀疏关键帧口径",
+        "",
+        (
+            "纯 VLM 稀疏执行必须同时报告下列两种口径：`hold_last` 衡量任意时刻的"
+            "最近状态，`observation_only` 衡量模型实际看图时的能力。不能单独使用"
+            "受关键帧率限制的 `dense_zero` 比较不同观察策略。"
+        ),
+        "",
+        "| 口径 | AUC | OP50 | OP75 | P@20 | Pnorm@0.2 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+        *[
+            (
+                f"| `{name}` | {_number(values.get('success_auc'))} | "
+                f"{_number(values.get('success_op50'))} | {_number(values.get('success_op75'))} | "
+                f"{_number(values.get('precision_p20'))} | "
+                f"{_number(values.get('norm_precision_np20'))} |"
+            )
+            for name, values in sparse_metrics.items()
+        ],
         "",
         "---",
         "",

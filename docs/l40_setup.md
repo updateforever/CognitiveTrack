@@ -1,8 +1,8 @@
 # L40 训练服务器部署与 Stage-1 复现
 
-本文是交给运维人员或另一位 AI 的可执行部署说明。目标是在不复制现有 Conda
+本文是面向训练服务器部署与实验复现的操作说明。目标是在不复制现有 Conda
 目录、不依赖开发机绝对路径的前提下，用固定 Git commit、官方模型权重以及已有的
-LaSOT/TNL2K 原始训练集复现 Qwen3-VL-4B Stage-1 数据和训练环境。
+LaSOT/TNL2K/MGIT 原始训练集复现 Qwen3-VL-4B Stage-1 数据和训练环境。
 
 ## 1. 同步边界
 
@@ -11,14 +11,14 @@ LaSOT/TNL2K 原始训练集复现 Qwen3-VL-4B Stage-1 数据和训练环境。
 | CognitiveTrack 代码与配方 | Git | 固定 commit，不复制上层 VLMTrack 的其他文件 |
 | CognitiveBench v1 标注 | Git | 约 35MB，不含图片；随代码 clone |
 | Qwen3-VL-4B 权重 | L40 从 ModelScope 官方仓库重新下载 | 约 8.89GB，不进入 Git |
-| Stage-1 数据 | 用 L40 已有 LaSOT/TNL2K 重建 | 解包后约 3.63GB |
-| 固定 sampling plan | 随 ModelScope 数据发布包同步 | 约 1.1MB，重建时传给 `--sampling-plan` |
-| Stage-1 成品包 | 私有 ModelScope 数据仓库兜底 | 约 3.66GB，源数据版本不符时使用 |
+| Stage-1 数据 | 用 L40 已有 LaSOT/TNL2K/MGIT 重建 | 必须重放固定 pair64 plan |
+| 固定 sampling plan | 从训练服务器或后续数据发布包同步 | 重建时传给 `--sampling-plan` |
+| Stage-1 LoRA | ModelScope 模型仓库 | 约 127MB，不进入 Git |
 | Conda 环境 | 在 L40 从零安装 | 禁止复制另一台机器的环境目录 |
 | 旧 outputs/cache | 不同步 | 不属于训练输入 |
 
-至少为本次实验预留 100GB。模型、派生数据本身不足 15GB，但 FSDP checkpoint、
-优化器状态、缓存及两个可恢复 checkpoint 会显著增加占用。
+至少为本次实验预留 100GB。LoRA adapter 很小，但完整图片数据、基座模型、数据缓存和
+可恢复训练 checkpoint 仍会占用较多空间。
 
 ## 2. 推荐目录
 
@@ -26,8 +26,9 @@ LaSOT/TNL2K 原始训练集复现 Qwen3-VL-4B Stage-1 数据和训练环境。
 /workspace/CognitiveTrack/                         # Git clone
 /datasets/raw/LaSOT/                               # 已有官方原始训练集
 /datasets/raw/TNL2K/TNL2K_train_subset/            # 已有官方原始训练集
-/datasets/derived/cogtrack_stage1_lasot_tnl2k_v1/  # 重建结果
+/datasets/derived/cogtrack_stage1_lasot_tnl2k_mgit_tiny_pair64_v1/  # 重建结果
 /models/Qwen3-VL-4B-Instruct/                      # 官方权重
+/models/CognitiveTrack-Qwen3VL-4B-Stage1-LoRA/    # 发布的 Stage-1 adapter
 /outputs/cogtrack/qwen3vl_4b_stage1/               # 训练结果
 /cache/cogtrack/                                   # 可删除缓存
 ```
@@ -220,8 +221,9 @@ python tracking/synthesize_stage1_dataset.py \
 ```
 
 `--sampling-plan` 不会重新抽帧，并会拒绝数据集、seed、正负比例、每序列上限、
-序列数量、case 数或 present/absent 标注发生变化。source JSONL 和训练视图 checksum
-须在当前正式导出完成并验收后写入，禁止沿用旧 48,400-case v1 的摘要。
+序列数量、case 数或 present/absent 标注发生变化。该正式导出已经用于完成 Stage-1
+LoRA 训练；换服务器时必须取得原 plan/成品包并重新核对统计，禁止沿用旧
+48,400-case v1 的摘要。
 
 JPEG 会经过 OpenCV/libjpeg 重新编码。若源图片或底层编解码库不同，图片字节可能
 不一致；此时至少要求 sample ID、状态、bbox、图片尺寸与 train/val 序列划分一致。
@@ -254,6 +256,23 @@ modelscope download Qwen/Qwen3-VL-4B-Instruct \
   --max-workers 4
 ```
 
+只做推理或继续 Stage-2 时，同时下载已完成的 Stage-1 LoRA：
+
+```bash
+modelscope download updateforever/CognitiveTrack-Qwen3VL-4B-Stage1-LoRA \
+  --local-dir /models/CognitiveTrack-Qwen3VL-4B-Stage1-LoRA \
+  --max-workers 4
+
+cd /models/CognitiveTrack-Qwen3VL-4B-Stage1-LoRA
+sha256sum -c SHA256SUMS
+```
+
+`adapter_model.safetensors` 的 SHA-256 应为：
+
+```text
+732ff15f4791f75c1ca16b2a72163fe59ff8a8059e87e765caf22382ddd07131
+```
+
 模型分片 SHA-256：
 
 ```text
@@ -278,13 +297,12 @@ python tracking/validate_qwen_training_view.py \
 
 ## 10. 单机多卡配置与两步 smoke
 
-以下以单机 8 卡为例。若实际卡数不是 8，调整 `CUDA_VISIBLE_DEVICES` 和
-`NPROC_PER_NODE`，并保持有效 global batch 为 16：4 卡时可使用 batch 2、梯度累积
-2；2 卡时使用 batch 2、梯度累积 4。
+以下先用 2 卡复现正式 LoRA 的 global batch 8；扩展卡数时应保持 global batch，避免
+首轮同时改变优化轨迹。
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export NPROC_PER_NODE=8
+export CUDA_VISIBLE_DEVICES=0,1
+export NPROC_PER_NODE=2
 export MASTER_PORT=29501
 export NCCL_DEBUG=WARN
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
@@ -301,6 +319,9 @@ export OUTPUT_DIR=/outputs/cogtrack/qwen3vl_4b_stage1_smoke
 export REPORT_TO=none
 export SAVE_STRATEGY=no
 export EVAL_STRATEGY=no
+export BATCH_SIZE=4
+export GRAD_ACC_STEPS=1
+export LEARNING_RATE=5e-5
 
 bash scripts/train_qwen3vl_4b_stage1.sh \
   --max_steps 2 \
@@ -310,26 +331,27 @@ bash scripts/train_qwen3vl_4b_stage1.sh \
 
 验收标准：
 
-- 所有预期 GPU 均有训练进程；
-- `model_type=qwen3_vl`、`tuner_type=full`；
-- `freeze_vit=true`、`freeze_llm=false`、`freeze_aligner=false`；
-- 可训练参数约 4.132B/4.438B（93.10%）；
+- 两张 GPU 均有训练进程；
+- `model_type=qwen3_vl`、`tuner_type=lora`；
+- `freeze_vit=true`、`freeze_aligner=true`；
+- 可训练参数约 33.0301M/4.471B（0.7388%）；
 - loss、grad norm 有限，无 NaN、图片路径或 bbox family 错误；
 - L40 显存有安全余量。
 
 ## 11. 正式训练、断点与回传
 
-先按 4090 已验证的 global batch 16 复现，不要因为 L40 有 48GB 显存而在首轮同时改变
-batch。显存优化另开实验。
+已发布 Stage-1 的可复现实验参数为：2 卡、单卡 batch 4、梯度累积 1、global batch 8、
+一轮、学习率 5e-5、cosine、warmup 0.05。原运行关闭了在线 evaluation；保留了按序列
+隔离的 8,010 条 val，但没有 validation loss。
 
 ```bash
 export OUTPUT_DIR=/outputs/cogtrack/qwen3vl_4b_stage1
 export SAVE_STRATEGY=steps
-export SAVE_STEPS=250
+export SAVE_STEPS=1000
 export SAVE_TOTAL_LIMIT=2
-export EVAL_STRATEGY=steps
-export EVAL_STEPS=250
-export LOGGING_STEPS=5
+export EVAL_STRATEGY=no
+export LOGGING_STEPS=20
+export BATCH_SIZE=4 GRAD_ACC_STEPS=1 LEARNING_RATE=5e-5 EPOCHS=1
 
 bash scripts/train_qwen3vl_4b_stage1.sh
 ```
@@ -345,6 +367,10 @@ bash scripts/train_qwen3vl_4b_stage1.sh
 checkpoint、`args.json`、`logging.jsonl`、trainer state、Git commit、ModelScope
 revision、数据 checksum、GPU 拓扑和 NCCL 环境。不要在 checkpoint 正在写入时同步。
 
+已完成运行的记录为 19,005/19,005 steps、约 4h45m41s、最终 train loss
+0.29283377、token accuracy 0.882494、峰值记录 38.66GiB/卡。该结果只证明训练完成；
+性能结论必须来自冻结 CognitiveBench 的零样本/LoRA 同协议完整指标。
+
 ## 12. 交付验收清单
 
 另一位 AI 完成部署后必须回报：
@@ -356,5 +382,6 @@ revision、数据 checksum、GPU 拓扑和 NCCL 环境。不要在 checkpoint �
 5. 原始数据序列数及 sampling plan SHA-256；
 6. 重建后的样本数、正负数、train/val 数及 JSONL SHA-256；
 7. 模型权重分片 SHA-256；
-8. 两步 smoke 的 trainable 参数、loss、显存和吞吐；
-9. 正式输出目录及第一个可恢复 checkpoint。
+8. smoke 的 trainable 参数、loss、显存和吞吐；
+9. 正式输出目录、最终 adapter 和 ModelScope revision；
+10. CognitiveBench 的 hold-last、observation-only、observation rate 与 presence 指标。
