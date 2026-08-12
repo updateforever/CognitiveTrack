@@ -91,7 +91,7 @@ def test_pair_samples_handle_present_absent_and_invalid_bbox(tmp_path: Path) -> 
     reference = cv2.imread(str(output / present["images"][0]))
     assert reference is not None
     assert np.max(np.abs(reference.astype(np.int16) - original.astype(np.int16))) <= 1
-    assert "unmodified full initialization frame" in present["user_prompt"]
+    assert "unmodified full earlier reference frame" in present["user_prompt"]
     assert "normalized 0-to-1000 xyxy coordinates" in present["user_prompt"]
     assert present["metadata"]["reference_bbox_norm1000_xyxy"] == pytest.approx(
         [100, 200, 300, 400]
@@ -169,6 +169,34 @@ def test_mosaic_uses_only_past_positive_history_and_falls_back_to_pair(tmp_path:
     assert last["metadata"]["history_frame_ids"] == [1]
     assert len(last["images"]) == 3
     assert (output / last["images"][1]).is_file()
+    history = cv2.imread(str(output / last["images"][1]))
+    assert history is not None
+    # 视觉输入不添加包含绝对 frame_id 的 30px header。
+    assert history.shape[:2] == (240, 480)
+
+
+def test_mosaic_corruption_is_explicit_and_keeps_current_answer(tmp_path: Path) -> None:
+    sequence = _make_sequence(
+        tmp_path / "source",
+        [[10, 10, 20, 10]] * 5,
+        [True] * 5,
+    )
+    output = tmp_path / "corrupt"
+    report = build_tracking_samples(
+        [sequence],
+        output,
+        config=TrackingSampleConfig(
+            mode="mosaic",
+            history_size=3,
+            history_corruption_ratio=1.0,
+        ),
+    )
+    rows = _read_rows(output / "source_samples.jsonl")
+    corrupt = [row for row in rows if row["metadata"].get("history_corruption")]
+    assert report.corrupted_mosaic_count == len(corrupt)
+    assert corrupt
+    assert all(row["assistant"]["target_status"] == "present" for row in corrupt)
+    assert all("::" + row["metadata"]["history_corruption"] in row["id"] for row in corrupt)
 
 
 def test_stage1_both_is_present_only_visual_and_reuses_current_assets(tmp_path: Path) -> None:
@@ -242,3 +270,29 @@ def test_planned_late_initialization_anchor_is_recorded_and_used(tmp_path: Path)
     assert [row["metadata"]["reference_frame_id"] for row in rows] == [2, 2]
     assert rows[0]["images"][0].endswith("reference_00000002.jpg")
     assert [row["target_status"] for row in rows] == ["present", "absent"]
+
+
+def test_same_current_with_distinct_references_builds_unique_pairs(tmp_path: Path) -> None:
+    sequence = _make_sequence(
+        tmp_path / "source",
+        [[10, 10, 20, 10], [11, 10, 20, 10], [12, 10, 20, 10], [13, 10, 20, 10]],
+        [True, True, True, True],
+        name="multi-reference",
+    )
+    key = "synthetic::multi-reference"
+    output = tmp_path / "multi-reference"
+    report = build_tracking_samples(
+        [sequence],
+        output,
+        config=TrackingSampleConfig(use_language_description=False),
+        frame_ids_by_sequence={key: (3, 3)},
+        anchor_frame_ids_by_sequence={key: 0},
+        reference_frame_ids_by_sequence={key: (0, 1)},
+    )
+    rows = _read_rows(output / "source_samples.jsonl")
+
+    assert report.sample_count == 2
+    assert len({row["id"] for row in rows}) == 2
+    assert [row["metadata"]["frame_id"] for row in rows] == [3, 3]
+    assert [row["metadata"]["reference_frame_id"] for row in rows] == [0, 1]
+    assert len(list((output / "images/synthetic/multi-reference").glob("current_*.jpg"))) == 1

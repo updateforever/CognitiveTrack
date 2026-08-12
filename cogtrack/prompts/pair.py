@@ -1,4 +1,4 @@
-"""完整初始帧 + 初始坐标 + 当前全图的无时序 pair Prompt。"""
+"""完整过去参考帧 + 参考坐标 + 当前全图的无时序 pair Prompt。"""
 
 from typing import Sequence
 
@@ -17,7 +17,7 @@ from .common import (
 )
 
 PAIR_PROMPT_NAME = "cognitive_pair"
-PAIR_PROMPT_VERSION = "4.3.0"
+PAIR_PROMPT_VERSION = "4.4.0"
 
 
 def _reference_note(
@@ -27,7 +27,7 @@ def _reference_note(
     reference_bbox: Sequence[float] | str | None = None,
     bbox_protocol: str = BBOX_PROTOCOL_NORM1000,
 ) -> str:
-    """渲染初始化框说明。
+    """渲染过去 reference 框说明。
 
     ``reference_bbox='<bbox>'`` 专供 ms-swift 官方 grounding 占位符：具体数值由
     模型模板在图像 resize 后填入。数值路径保留给在线推理和历史样本兼容。
@@ -51,15 +51,15 @@ def _reference_note(
             else "absolute pixel xyxy coordinates in Image 1's processor-resized pixel grid"
         )
         return (
-            "Image 1 is the unmodified full initialization frame. "
-            f"The initialized target bbox in Image 1 is {rendered} in {coordinate_text}."
+            "Image 1 is an unmodified full earlier reference frame. "
+            f"The target bbox in Image 1 is {rendered} in {coordinate_text}."
         )
     if reference_bbox_norm1000_xyxy is not None:
         bbox = validate_norm1000_xyxy(reference_bbox_norm1000_xyxy)
         numbers = [round(value, 2) for value in bbox]
         return (
-            "Image 1 is the unmodified full initialization frame. "
-            "The initialized target bbox in Image 1 is "
+            "Image 1 is an unmodified full earlier reference frame. "
+            "The target bbox in Image 1 is "
             f"{numbers} in normalized 0-to-1000 xyxy coordinates."
         )
     if reference_has_box:
@@ -78,7 +78,8 @@ def build_pair_prompt(
 ) -> PromptSpec:
     """构造两图认知跟踪 Prompt。
 
-    图像顺序固定：Image 1 为初始化身份锚点，Image 2 为当前完整视频帧。
+    图像顺序固定：Image 1 为更早的身份参考，Image 2 为当前完整视频帧。在线推理
+    的 Image 1 恰好是初始化帧，训练 pair 则可使用任意严格更早的 present 帧。
     新训练导出传入 ``reference_bbox='<bbox>'``，由 ms-swift 根据具体模型族填入
     官方坐标：Qwen2.5-VL 为 resize 后绝对像素，Qwen3-VL 为 norm1000。
     ``reference_bbox_norm1000_xyxy`` 与 ``reference_has_box`` 仅保留兼容路径。
@@ -90,13 +91,13 @@ def build_pair_prompt(
         reference_bbox=reference_bbox,
         bbox_protocol=bbox_protocol,
     )
-    user_prompt = f"""Task: verify and localize the initialized target in the current frame.
+    user_prompt = f"""Task: verify and localize the referenced target in the current frame.
 
-Image 1: initialization identity reference. {reference_note}
+Image 1: earlier identity reference. {reference_note}
 Image 2: current full frame to search globally.
 
 Decision order:
-1. Compare the current frame with the initialized instance in Image 1.
+1. Compare the current frame with the referenced instance in Image 1.
 2. Reject same-category distractors using instance-specific appearance.
 3. Output present and a box only when that exact target is visible and localizable.
 4. Otherwise output absent and null. Do not invent finer-grained semantic states.

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+from bisect import bisect_left
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Mapping
 from typing import Sequence as TypingSequence
@@ -31,6 +32,7 @@ class SequenceCasePlan:
     sequence: str
     anchor_frame_id: int
     frame_ids: tuple[int, ...]
+    reference_frame_ids: tuple[int, ...]
     present_count: int
     absent_count: int
     absent_run_count: int
@@ -38,6 +40,7 @@ class SequenceCasePlan:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["frame_ids"] = list(self.frame_ids)
+        payload["reference_frame_ids"] = list(self.reference_frame_ids)
         return payload
 
     @classmethod
@@ -47,8 +50,23 @@ class SequenceCasePlan:
         frame_ids = tuple(int(value) for value in payload["frame_ids"])
         if not frame_ids or any(value < 0 for value in frame_ids):
             raise ValueError("sampling plan 的 frame_ids 必须是非空非负整数列表")
-        if len(set(frame_ids)) != len(frame_ids) or tuple(sorted(frame_ids)) != frame_ids:
-            raise ValueError("sampling plan 的 frame_ids 必须严格递增且不能重复")
+        if tuple(sorted(frame_ids)) != frame_ids:
+            raise ValueError("sampling plan 的 frame_ids 必须按时间非递减排列")
+        raw_references = payload.get("reference_frame_ids")
+        if raw_references is None:
+            # 兼容旧版每序列单 anchor 计划；新计划始终写逐 case reference。
+            reference_frame_ids = (int(payload["anchor_frame_id"]),) * len(frame_ids)
+        else:
+            reference_frame_ids = tuple(int(value) for value in raw_references)
+        if len(reference_frame_ids) != len(frame_ids):
+            raise ValueError("sampling plan 的 reference_frame_ids 必须与 frame_ids 等长")
+        if any(
+            reference < 0 or reference >= current
+            for reference, current in zip(reference_frame_ids, frame_ids, strict=True)
+        ):
+            raise ValueError("sampling plan 的每个 reference_frame_id 必须严格早于 current frame")
+        if len(set(zip(reference_frame_ids, frame_ids, strict=True))) != len(frame_ids):
+            raise ValueError("sampling plan 不能包含重复的 reference/current pair")
         present_count = int(payload["present_count"])
         absent_count = int(payload["absent_count"])
         if present_count < 0 or absent_count < 0 or present_count + absent_count != len(frame_ids):
@@ -65,6 +83,7 @@ class SequenceCasePlan:
             sequence=sequence,
             anchor_frame_id=anchor_frame_id,
             frame_ids=frame_ids,
+            reference_frame_ids=reference_frame_ids,
             present_count=present_count,
             absent_count=absent_count,
             absent_run_count=int(payload["absent_run_count"]),
@@ -97,6 +116,13 @@ class TemporalCaseSamplingPlan:
     def anchor_frame_ids_by_sequence(self) -> Mapping[str, int]:
         return {
             f"{item.dataset}::{item.sequence}": item.anchor_frame_id
+            for item in self.sequences
+        }
+
+    @property
+    def reference_frame_ids_by_sequence(self) -> Mapping[str, tuple[int, ...]]:
+        return {
+            f"{item.dataset}::{item.sequence}": item.reference_frame_ids
             for item in self.sequences
         }
 
@@ -164,6 +190,7 @@ class TemporalCaseSamplingPlan:
 class _StatePool:
     sequence: Sequence
     anchor_frame_id: int
+    reference_ids: tuple[int, ...]
     present_ids: tuple[int, ...]
     absent_runs: tuple[tuple[int, ...], ...]
     target_count: int
@@ -253,6 +280,36 @@ def _select_absent(absent_runs: TypingSequence[TypingSequence[int]], count: int)
     return sorted(selected[:count])
 
 
+def _select_absent_pair_currents(
+    sequence_name: str,
+    absent_runs: TypingSequence[TypingSequence[int]],
+    count: int,
+    *,
+    reference_frame_ids: TypingSequence[int],
+) -> list[int]:
+    """选择 absent current；不足时以不同历史 reference 复用真实 absent 帧。"""
+
+    absent_ids = [frame_id for run in absent_runs for frame_id in run]
+    selected = _select_absent(absent_runs, min(count, len(absent_ids)))
+    used = {frame_id: selected.count(frame_id) for frame_id in selected}
+    remaining = count - len(selected)
+    while remaining > 0:
+        progressed = False
+        for frame_id in absent_ids:
+            reference_capacity = bisect_left(reference_frame_ids, frame_id)
+            if used.get(frame_id, 0) >= reference_capacity:
+                continue
+            selected.append(frame_id)
+            used[frame_id] = used.get(frame_id, 0) + 1
+            remaining -= 1
+            progressed = True
+            if remaining == 0:
+                break
+        if not progressed:
+            raise RuntimeError(f"序列 {sequence_name} 的 absent pair 容量不足")
+    return sorted(selected)
+
+
 def _select_present(
     present_ids: TypingSequence[int],
     absent_runs: TypingSequence[TypingSequence[int]],
@@ -277,6 +334,36 @@ def _select_present(
     return sorted(selected)
 
 
+def _select_present_pair_currents(
+    sequence_name: str,
+    present_ids: TypingSequence[int],
+    absent_runs: TypingSequence[TypingSequence[int]],
+    count: int,
+    *,
+    reference_frame_ids: TypingSequence[int],
+) -> list[int]:
+    """选择 present current；不足时用不同过去 reference 组成不重复 pair。"""
+
+    selected = _select_present(present_ids, absent_runs, min(count, len(present_ids)))
+    used = {frame_id: selected.count(frame_id) for frame_id in selected}
+    remaining = count - len(selected)
+    while remaining > 0:
+        progressed = False
+        for frame_id in present_ids:
+            reference_capacity = bisect_left(reference_frame_ids, frame_id)
+            if used.get(frame_id, 0) >= reference_capacity:
+                continue
+            selected.append(frame_id)
+            used[frame_id] = used.get(frame_id, 0) + 1
+            remaining -= 1
+            progressed = True
+            if remaining == 0:
+                break
+        if not progressed:
+            raise RuntimeError(f"序列 {sequence_name} 的 present pair 容量不足")
+    return sorted(selected)
+
+
 def _build_pool(
     sequence: Sequence,
     *,
@@ -293,14 +380,17 @@ def _build_pool(
         raise ValueError(f"序列 {sequence.name} 不包含任何有效 present 初始化帧")
 
     full_absent_ids: list[int] = []
+    reference_ids: list[int] = []
     present_ids: list[int] = []
     # 锚点出现前模型尚未获得目标身份，不能把这些帧当作可监督的 absent case。
     for frame_id in range(anchor_frame_id + 1, len(sequence)):
         state = _presence(sequence, frame_id)
         if state == "absent":
             full_absent_ids.append(frame_id)
-        elif state == "present" and (frame_id - anchor_frame_id - 1) % frame_stride == 0:
-            present_ids.append(frame_id)
+        elif state == "present":
+            reference_ids.append(frame_id)
+            if (frame_id - anchor_frame_id - 1) % frame_stride == 0:
+                present_ids.append(frame_id)
 
     absent_runs = _contiguous_runs(full_absent_ids)
     sampled_runs = tuple(
@@ -318,16 +408,64 @@ def _build_pool(
         return None
     target_count = min(max_cases_per_sequence, eligible_count)
     min_absent = max(0, target_count - len(present_ids))
-    max_absent = min(target_count, absent_count)
+    present_seen = 1
+    present_pair_capacity = 0
+    absent_pair_capacity = 0
+    sampled_absent_set = {frame_id for run in sampled_runs for frame_id in run}
+    for frame_id in range(anchor_frame_id + 1, len(sequence)):
+        state = _presence(sequence, frame_id)
+        if state == "present":
+            if frame_id in present_ids:
+                present_pair_capacity += present_seen
+            present_seen += 1
+        elif frame_id in sampled_absent_set:
+            absent_pair_capacity += present_seen
+    min_absent = max(0, target_count - present_pair_capacity)
+    max_absent = min(target_count, absent_pair_capacity)
     return _StatePool(
         sequence=sequence,
         anchor_frame_id=anchor_frame_id,
+        reference_ids=tuple(reference_ids),
         present_ids=tuple(present_ids),
         absent_runs=sampled_runs,
         target_count=target_count,
         min_absent_count=min_absent,
         max_absent_count=max_absent,
     )
+
+
+def _reference_frames(
+    sequence: Sequence,
+    frame_ids: TypingSequence[int],
+    *,
+    prior_present_ids: TypingSequence[int],
+    seed: int,
+) -> tuple[int, ...]:
+    """为每个 current frame 选择同序列更早的真实 present reference。
+
+    参考帧在所有更早的有效 present 帧中做确定性选择，因而既覆盖短间隔，也覆盖
+    长间隔外观变化；绝不读取 current 或未来帧的 GT。
+    """
+
+    references: list[int] = []
+    sequence_key = sequence_sampling_key(sequence)
+    prior_present_ids = tuple(prior_present_ids)
+    current_occurrences: dict[int, int] = {}
+    for current_frame_id in frame_ids:
+        candidate_count = bisect_left(prior_present_ids, current_frame_id)
+        if candidate_count == 0:
+            raise ValueError(f"序列 {sequence.name} 的 current {current_frame_id} 之前没有 present reference")
+        occurrence = current_occurrences.get(current_frame_id, 0)
+        current_occurrences[current_frame_id] = occurrence + 1
+        start = _stable_rank(seed, f"{sequence_key}::{current_frame_id}::reference") % candidate_count
+        index = (start + occurrence) % candidate_count
+        reference = prior_present_ids[index]
+        if reference >= current_frame_id:
+            raise ValueError(
+                f"序列 {sequence.name} 的 reference frame {reference} 不早于 current {current_frame_id}"
+            )
+        references.append(reference)
+    return tuple(references)
 
 
 def plan_temporal_presence_cases(
@@ -372,29 +510,53 @@ def plan_temporal_presence_cases(
         )
 
     absent_counts = [pool.min_absent_count for pool in pools]
-    remaining = target_absent - sum(absent_counts)
-    order = sorted(
-        range(len(pools)),
-        key=lambda index: _stable_rank(seed, sequence_sampling_key(pools[index].sequence)),
-    )
-    while remaining > 0:
-        progressed = False
-        for index in order:
-            if absent_counts[index] >= pools[index].max_absent_count:
-                continue
-            absent_counts[index] += 1
-            remaining -= 1
-            progressed = True
-            if remaining == 0:
-                break
-        if not progressed:
-            raise RuntimeError("absent 配额分配未收敛")
+    source_indices: dict[str, list[int]] = {}
+    for index, pool in enumerate(pools):
+        source_indices.setdefault(pool.sequence.dataset, []).append(index)
+    for source, indices in sorted(source_indices.items()):
+        source_cases = sum(pools[index].target_count for index in indices)
+        source_min = sum(pools[index].min_absent_count for index in indices)
+        source_max = sum(pools[index].max_absent_count for index in indices)
+        source_target = int(round(source_cases * absent_ratio))
+        if not source_min <= source_target <= source_max:
+            raise ValueError(
+                f"数据源 {source} 无法达到 absent_ratio={absent_ratio:.3f}："
+                f"请求 {source_target}/{source_cases}，可行范围为 [{source_min},{source_max}]"
+            )
+        remaining = source_target - source_min
+        order = sorted(
+            indices,
+            key=lambda index: _stable_rank(seed, sequence_sampling_key(pools[index].sequence)),
+        )
+        while remaining > 0:
+            progressed = False
+            for index in order:
+                if absent_counts[index] >= pools[index].max_absent_count:
+                    continue
+                absent_counts[index] += 1
+                remaining -= 1
+                progressed = True
+                if remaining == 0:
+                    break
+            if not progressed:
+                raise RuntimeError(f"数据源 {source} 的 absent 配额分配未收敛")
 
     sequence_plans: list[SequenceCasePlan] = []
     for pool, absent_count in zip(pools, absent_counts, strict=True):
         present_count = pool.target_count - absent_count
-        selected_absent = _select_absent(pool.absent_runs, absent_count)
-        selected_present = _select_present(pool.present_ids, pool.absent_runs, present_count)
+        selected_absent = _select_absent_pair_currents(
+            pool.sequence.name,
+            pool.absent_runs,
+            absent_count,
+            reference_frame_ids=(pool.anchor_frame_id, *pool.reference_ids),
+        )
+        selected_present = _select_present_pair_currents(
+            pool.sequence.name,
+            pool.present_ids,
+            pool.absent_runs,
+            present_count,
+            reference_frame_ids=(pool.anchor_frame_id, *pool.reference_ids),
+        )
         frame_ids = tuple(sorted((*selected_present, *selected_absent)))
         if len(frame_ids) != pool.target_count:
             raise RuntimeError(f"序列 {pool.sequence.name} 的采样数量与计划不一致")
@@ -404,6 +566,12 @@ def plan_temporal_presence_cases(
                 sequence=pool.sequence.name,
                 anchor_frame_id=pool.anchor_frame_id,
                 frame_ids=frame_ids,
+                reference_frame_ids=_reference_frames(
+                    pool.sequence,
+                    frame_ids,
+                    prior_present_ids=(pool.anchor_frame_id, *pool.reference_ids),
+                    seed=seed,
+                ),
                 present_count=present_count,
                 absent_count=absent_count,
                 absent_run_count=len(pool.absent_runs),

@@ -56,6 +56,7 @@ from cogtrack.training import (  # noqa: E402
     write_jsonl,
 )
 from pytracking.datasets import iter_dataset  # noqa: E402
+from pytracking.datasets.mgit import load_split_definition  # noqa: E402
 from pytracking.evaluation.data import Sequence  # noqa: E402
 from pytracking.evaluation.environment import EnvironmentSettings, load_environment  # noqa: E402
 
@@ -110,14 +111,36 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--history-size", type=int, default=4, help="mosaic 最多包含的过去可信帧数。")
     parser.add_argument("--mosaic-panel-height", type=int, default=240)
     parser.add_argument(
+        "--history-corruption-ratio",
+        type=float,
+        default=0.0,
+        help="额外生成带单个错误历史框的 mosaic 比例；默认 0，建议鲁棒性版使用 0.15。",
+    )
+    parser.add_argument(
         "--max-image-side",
         type=int,
         default=648,
         help="导出图片长边上限；默认与当前本地 Qwen 推理配置一致。",
     )
     parser.add_argument("--jpeg-quality", type=int, default=95)
+    parser.add_argument(
+        "--reuse-existing-assets",
+        action="store_true",
+        help="允许复用输出目录中已有的同名图片资产；适合通过硬链接共享 Stage-1 图片。",
+    )
     parser.add_argument("--val-ratio", type=float, default=0.05, help="从各训练来源中按序列划分验证集。")
     parser.add_argument("--seed", type=int, default=20260809)
+    parser.add_argument(
+        "--mgit-version",
+        choices=("tiny", "full"),
+        default="tiny",
+        help="MGIT 训练 split 版本；当前公共镜像完整提供 tiny/train。",
+    )
+    parser.add_argument(
+        "--allow-missing-mgit-sequences",
+        action="store_true",
+        help="显式跳过本地 MGIT split 中无帧文件的序列，并在报告中记录实际序列数。",
+    )
     parser.add_argument(
         "--sampling-plan",
         help=(
@@ -133,6 +156,11 @@ def _parser() -> argparse.ArgumentParser:
         help="生成模型专属训练视图；默认同时导出 Qwen2.5-VL 与 Qwen3-VL。",
     )
     parser.add_argument("--force", action="store_true", help="覆盖同名构建产物；不会删除其他目录。")
+    parser.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="只生成并审计 sampling_plan.json，不读取或编码图片。",
+    )
     return parser
 
 
@@ -166,6 +194,8 @@ def _prepare_train_sequences(
     *,
     environment: EnvironmentSettings,
     limit_per_dataset: int | None,
+    mgit_version: str,
+    allow_missing_mgit_sequences: bool,
 ) -> Iterator[Sequence]:
     """先探测每个来源的首个序列，再开始写文件，尽早暴露未解压数据。"""
 
@@ -173,7 +203,19 @@ def _prepare_train_sequences(
     for dataset_name in dataset_names:
         kwargs: dict[str, Any] = {"split": "train"}
         if dataset_name == "mgit":
-            kwargs["version"] = "full"
+            kwargs["version"] = mgit_version
+            if allow_missing_mgit_sequences:
+                root = environment.dataset_root("mgit") / "data" / "train"
+                names = load_split_definition(mgit_version, "train")
+                names = [
+                    name
+                    for name in names
+                    if (root / name / f"frame_{name}").is_dir()
+                    and any((root / name / f"frame_{name}").iterdir())
+                ]
+                if not names:
+                    raise ValueError("MGIT train 没有包含帧文件的可用序列")
+                kwargs["sequence_names"] = names
         iterator = iter_dataset(
             dataset_name,
             environment=environment,
@@ -307,14 +349,16 @@ def _export_ms_swift(
         if record.get("target_status") not in {"present", "absent"}:
             raise ValueError(f"样本 {index} 缺少合法 present/absent 标签")
 
-    # pair/mosaic 可能是同一帧 case 的两种表示；比例必须按唯一视频帧统计，
-    # 不能让上下文模式数量改变正负样本定义。
-    unique_cases: dict[tuple[str, str, int], str] = {}
+    # 同一 current 可与不同 earlier reference 构成独立 case；鲁棒性变体则与其 clean
+    # case 共享 reference/current。比例按唯一 (reference, current) 统计，避免 corruption
+    # 数量改变原 sampling plan 的正负样本定义。
+    unique_cases: dict[tuple[str, str, int, int], str] = {}
     for record in canonical_records:
         metadata = record["metadata"]
         key = (
             str(metadata["source_dataset"]),
             str(metadata["source_sequence"]),
+            int(metadata["reference_frame_id"]),
             int(metadata["frame_id"]),
         )
         state = str(record["target_status"])
@@ -326,7 +370,7 @@ def _export_ms_swift(
     ratio_tolerance = 1.0 / len(unique_cases)
     if abs(actual_absent_ratio - requested_absent_ratio) > ratio_tolerance:
         raise ValueError(
-            f"唯一帧 case 的 absent 比例不符合计划："
+            f"唯一 reference/current case 的 absent 比例不符合计划："
             f"actual={actual_absent_ratio:.6f} requested={requested_absent_ratio:.6f}"
         )
 
@@ -426,6 +470,7 @@ def main() -> int:
         sampling_plan = None
         frame_ids_by_sequence = None
         anchor_frame_ids_by_sequence = None
+        reference_frame_ids_by_sequence = None
         if args.sampling_plan:
             if args.absent_ratio <= 0:
                 raise ValueError("--sampling-plan 只适用于包含 presence/absence 规划的数据")
@@ -439,12 +484,15 @@ def main() -> int:
             )
             frame_ids_by_sequence = sampling_plan.frame_ids_by_sequence
             anchor_frame_ids_by_sequence = sampling_plan.anchor_frame_ids_by_sequence
+            reference_frame_ids_by_sequence = sampling_plan.reference_frame_ids_by_sequence
         elif args.absent_ratio > 0:
             sampling_plan = plan_temporal_presence_cases(
                 _prepare_train_sequences(
                     dataset_names,
                     environment=environment,
                     limit_per_dataset=args.limit_sequences_per_dataset,
+                    mgit_version=args.mgit_version,
+                    allow_missing_mgit_sequences=args.allow_missing_mgit_sequences,
                 ),
                 max_cases_per_sequence=args.max_samples_per_sequence,
                 absent_ratio=args.absent_ratio,
@@ -453,11 +501,28 @@ def main() -> int:
             )
             frame_ids_by_sequence = sampling_plan.frame_ids_by_sequence
             anchor_frame_ids_by_sequence = sampling_plan.anchor_frame_ids_by_sequence
+            reference_frame_ids_by_sequence = sampling_plan.reference_frame_ids_by_sequence
         sequences = _prepare_train_sequences(
             dataset_names,
             environment=environment,
             limit_per_dataset=args.limit_sequences_per_dataset,
+            mgit_version=args.mgit_version,
+            allow_missing_mgit_sequences=args.allow_missing_mgit_sequences,
         )
+        if args.plan_only:
+            if sampling_plan is None:
+                raise ValueError("--plan-only 需要 presence sampling plan；请保持 --absent-ratio > 0")
+            output_root.mkdir(parents=True, exist_ok=True)
+            plan_path = output_root / "sampling_plan.json"
+            if plan_path.exists() and not args.force:
+                raise FileExistsError(f"sampling plan 已存在；如需覆盖请启用 --force: {plan_path}")
+            plan_path.write_text(
+                json.dumps(sampling_plan.to_dict(), ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            print(json.dumps(sampling_plan.to_dict(include_frame_ids=False), ensure_ascii=False, indent=2))
+            print(f"[CognitiveTrack] sampling plan 已生成: {plan_path}")
+            return 0
         config = TrackingSampleConfig(
             mode=args.context_mode,
             frame_stride=args.frame_stride,
@@ -468,10 +533,12 @@ def main() -> int:
             seed=args.seed,
             history_size=args.history_size,
             mosaic_panel_height=args.mosaic_panel_height,
+            history_corruption_ratio=args.history_corruption_ratio,
             present_only=args.absent_ratio == 0,
             use_language_description=False,
             max_image_side=args.max_image_side,
             jpeg_quality=args.jpeg_quality,
+            reuse_existing_assets=args.reuse_existing_assets,
         )
         build_report = build_tracking_samples(
             sequences,
@@ -480,6 +547,7 @@ def main() -> int:
             overwrite=args.force,
             frame_ids_by_sequence=frame_ids_by_sequence,
             anchor_frame_ids_by_sequence=anchor_frame_ids_by_sequence,
+            reference_frame_ids_by_sequence=reference_frame_ids_by_sequence,
         )
         if args.sampling_plan:
             if build_report.sequence_count != sampling_plan.sequence_count:
@@ -487,20 +555,49 @@ def main() -> int:
                     "原始数据缺少 sampling plan 中的序列："
                     f"expected={sampling_plan.sequence_count} actual={build_report.sequence_count}"
                 )
-            if build_report.sample_count != sampling_plan.case_count:
-                raise ValueError(
-                    "重建 case 数与 sampling plan 不一致："
-                    f"expected={sampling_plan.case_count} actual={build_report.sample_count}"
-                )
-            if (
-                build_report.present_count != sampling_plan.present_count
-                or build_report.absent_count != sampling_plan.absent_count
-            ):
-                raise ValueError(
-                    "原始数据的 present/absent 标注已与 sampling plan 发生变化："
-                    f"expected={sampling_plan.present_count}/{sampling_plan.absent_count} "
-                    f"actual={build_report.present_count}/{build_report.absent_count}"
-                )
+            if args.history_corruption_ratio == 0:
+                if build_report.sample_count != sampling_plan.case_count:
+                    raise ValueError(
+                        "重建 case 数与 sampling plan 不一致："
+                        f"expected={sampling_plan.case_count} actual={build_report.sample_count}"
+                    )
+                if (
+                    build_report.present_count != sampling_plan.present_count
+                    or build_report.absent_count != sampling_plan.absent_count
+                ):
+                    raise ValueError(
+                        "原始数据的 present/absent 标注已与 sampling plan 发生变化："
+                        f"expected={sampling_plan.present_count}/{sampling_plan.absent_count} "
+                        f"actual={build_report.present_count}/{build_report.absent_count}"
+                    )
+            else:
+                unique_cases: dict[tuple[str, str, int, int], str] = {}
+                for record in read_jsonl(output_root / build_report.source_jsonl):
+                    metadata = record["metadata"]
+                    key = (
+                        str(metadata["source_dataset"]),
+                        str(metadata["source_sequence"]),
+                        int(metadata["reference_frame_id"]),
+                        int(metadata["frame_id"]),
+                    )
+                    state = str(record["target_status"])
+                    if key in unique_cases and unique_cases[key] != state:
+                        raise ValueError(f"corrupted 版本出现 case 标签冲突: {key}")
+                    unique_cases[key] = state
+                unique_present = sum(value == "present" for value in unique_cases.values())
+                unique_absent = sum(value == "absent" for value in unique_cases.values())
+                if (
+                    len(unique_cases) != sampling_plan.case_count
+                    or unique_present != sampling_plan.present_count
+                    or unique_absent != sampling_plan.absent_count
+                ):
+                    raise ValueError(
+                        "corrupted 版本去重后的 case/状态与 sampling plan 不一致："
+                        "expected="
+                        f"{sampling_plan.case_count}/{sampling_plan.present_count}/"
+                        f"{sampling_plan.absent_count} "
+                        f"actual={len(unique_cases)}/{unique_present}/{unique_absent}"
+                    )
         if sampling_plan is not None:
             (output_root / "sampling_plan.json").write_text(
                 json.dumps(sampling_plan.to_dict(), ensure_ascii=False, indent=2) + "\n",
@@ -519,6 +616,8 @@ def main() -> int:
             "task": "stage1_tracking_presence",
             "source_datasets": dataset_names,
             "source_split": "train",
+            "mgit_version": args.mgit_version if "mgit" in dataset_names else None,
+            "allow_missing_mgit_sequences": args.allow_missing_mgit_sequences,
             "target_status": ["present", "absent"] if args.absent_ratio > 0 else ["present"],
             "canonical_bbox_format": "norm1000_xyxy",
             "reference_mode": "full_frame_bbox_text",

@@ -32,8 +32,7 @@ Sequence -> Tracker.initialize -> Tracker.track -> ResultWriter -> Evaluator
 - Stage-1/2 只监督 `present/absent` 与存在时的 bbox，不监督旧六分类、身份文字标签、
   解释文本、细粒度状态或数值置信度。
 - 负样本只能来自同一视频中真实的目标消失帧，禁止使用跨序列错配或人工抹除目标。
-- 输入图片保持完整，不做目标局部裁剪，不在图片上画 GT 框。Image 1 是完整初始化帧，
-  初始框通过文本/官方 grounding 对象传入；Image 2 是未标注的完整当前帧。
+- 输入图片保持完整，不做目标局部裁剪，不在图片上画 GT 框。在线 benchmark 的第一帧仍只用 GT 初始化；Stage-1 训练 pair 可使用同一序列中严格早于当前帧的任意真实 present reference，初始框通过文本/官方 grounding 对象传入，Image 2 是未标注的完整当前帧。
 - Stage-1 输出严格是两个字段。Qwen3 示例：
 
 ```json
@@ -47,8 +46,7 @@ Sequence -> Tracker.initialize -> Tracker.track -> ResultWriter -> Evaluator
   伪造记忆文本。
 - `parse_error`、`model_error`、`skipped` 和模型预测的 `absent` 必须严格分离；工程
   失败不得伪装成目标消失。
-- 第一帧只用 GT 初始化，后续帧禁止把当前或未来 GT 传入 tracker。GT 只能在推理
-  结束后用于评测。
+- 在线推理第一帧只用 GT 初始化，后续帧禁止把当前或未来 GT 传入 tracker。训练 pair 的 reference 只能来自同序列更早的 present 帧；GT 只能在推理结束后用于评测。
 - 训练、验证、测试按完整序列划分，禁止帧级泄漏。
 
 ## 3. Qwen 坐标协议：不可混用
@@ -102,16 +100,24 @@ Qwen2.5-VL 与 Qwen3-VL 不是同一套官方 grounding 坐标：
 
 ### Stage-1 正式数据
 
-- 来源：LaSOT train + TNL2K train；MGIT 尚未纳入正式 v1。
-- 2420 个序列，48,400 cases；present 33,880、absent 14,520，严格 70:30。
-- train 45,980、val 2,420，按完整序列、按数据来源分层划分。
-- 图片 50,820 张；解包数据约 3.63GB，Hub/ModelScope 发布包约 3.66GB。
-- 正式本地构建目录曾为：
-  `data/releases/cogtrack_stage1_lasot_tnl2k_fullref_v1`。
-- 可迁移发布包曾为：
-  `data/releases/cogtrack_stage1_lasot_tnl2k_fullref_v1_hub`。
+- 来源：LaSOT train + TNL2K train + MGIT tiny/train。
+- 当前服务器可用来源为 LaSOT 1120、TNL2K 1300、MGIT tiny/train 95 条；MGIT
+  另有 10 条空帧目录被显式排除，不能声称使用完整 105 条 tiny/train。
+- 正式首版采用最多 64 个 `(reference,current)` pairs/序列；reference 是同序列中
+  严格更早的真实 present 帧，同一真实 current 可与不同 reference 组成不重复 pair。
+  present/absent 在每个数据来源内部均约为严格 70:30。
+- 固定 sampling plan 包含 2,511 条有效序列、160,049 pairs：present 112,034、
+  absent 48,015；LaSOT/TNL2K/MGIT 分别为 71,680/82,545/5,824 cases。
+- plan 中 16,213 个 case 复用 current 但使用不同 reference，精确重复 pair 为 0；
+  reference/current gap 中位数 161 帧、90% 分位 1,170 帧、最大 23,738 帧。
 - `sampling_plan.json` SHA-256：
-  `08c7a271fed2562b8692dfe6a198c8ac6199b4022e45e392ff4dd04c9f13dd31`。
+  `158372c68e82918d9460826d89f601d1278a3f97e6980e2069718755689c03a7`。
+- 新版本目录为
+  `data/releases/cogtrack_stage1_lasot_tnl2k_mgit_tiny_pair64_v1`。截至 2026-08-11，
+  sampling plan 已冻结，图片与 ms-swift JSONL 正在当前服务器导出；完成前不得声称
+  正式数据包已验收完毕。
+- 旧 LaSOT+TNL2K 48,400-case v1 从未用于实际训练，其统计和 sampling plan 不再作为
+  当前正式数据输入，只保留为历史记录。
 - 构造 CLI 已支持 `--sampling-plan` 严格重放，源数据验收工具为
   `tools/verify_stage1_sources.py`。
 
@@ -123,13 +129,13 @@ Qwen2.5-VL 与 Qwen3-VL 不是同一套官方 grounding 坐标：
 
 - 环境：8×RTX 4090 24GB、PyTorch 2.8.0+cu128、transformers 4.57.1、ms-swift
   4.3.1、flash-attn 2.8.3.post1。
-- 训练定义：`tuner_type=full`，冻结视觉主干，全参训练 LLM、主 merger 和三个
-  deepstack merger；这就是本项目所说的“常规全量微调”。
+- 训练默认改为 `tuner_type=lora`，冻结视觉主干与对齐层，在语言模型线性层注入
+  LoRA；Stage-1/2/3 SFT 和后续 GRPO 统一沿用同一 adapter。全参方案仅作显式对照。
 - 总参数 4.438B，可训练 4.132B（93.10%）。
-- FSDP2 full shard，BF16，单卡 batch 2，全局 batch 16。
+- LoRA smoke 使用 BF16、单卡 batch 1；正式全局 batch 根据 4/8 卡资源设置。
 - 两步峰值 16.29GiB/卡，吞吐约 4.64 samples/s；首步 loss 1.536，两步平均 1.366。
-- 只完成了两步 smoke，尚未宣称完成正式一轮 Stage-1 训练或获得训练后 benchmark
-  提升。
+- 已完成单卡 L40S 上 Stage-1/Stage-2 各两步 LoRA smoke；尚未宣称完成正式一轮训练
+  或获得训练后 benchmark 提升。
 
 ## 6. 新服务器最快恢复流程
 
@@ -172,12 +178,12 @@ python -m pytest -q
 cp configs/env.example.yaml configs/env.local.yaml
 ```
 
-编辑 `env.local.yaml`，至少设置 `project_root`、`model_root`、`output_root`、LaSOT 和
-TNL2K 路径。该文件禁止提交。
+编辑 `env.local.yaml`，至少设置 `project_root`、`model_root`、`output_root`、LaSOT、
+TNL2K 和 MGIT 路径。该文件禁止提交。
 
 ### 6.4 准备数据
 
-首选使用服务器已有的 LaSOT/TNL2K 和固定 plan 重建：
+首选使用服务器已有的 LaSOT/TNL2K/MGIT tiny 和固定 plan 重建：
 
 ```bash
 python tools/verify_stage1_sources.py \
@@ -185,11 +191,13 @@ python tools/verify_stage1_sources.py \
   --tnl2k-root /datasets/raw/TNL2K
 
 python tracking/synthesize_stage1_dataset.py \
-  --datasets lasot tnl2k \
+  --datasets lasot tnl2k mgit \
+  --mgit-version tiny \
+  --allow-missing-mgit-sequences \
   --env-config configs/env.local.yaml \
   --context-mode pair \
   --frame-stride 1 \
-  --max-samples-per-sequence 20 \
+  --max-samples-per-sequence 64 \
   --absent-ratio 0.3 \
   --max-image-side 648 \
   --jpeg-quality 95 \
@@ -197,7 +205,7 @@ python tracking/synthesize_stage1_dataset.py \
   --seed 20260809 \
   --sampling-plan /path/to/sampling_plan.json \
   --qwen-model-families qwen2_5_vl qwen3_vl \
-  --output-dir /datasets/derived/cogtrack_stage1_lasot_tnl2k_v1
+  --output-dir /datasets/derived/cogtrack_stage1_lasot_tnl2k_mgit_tiny_pair64_v1
 ```
 
 如果原始数据摘要不匹配，禁止继续沿用 v1 名称；改为下载 ModelScope 成品包并运行

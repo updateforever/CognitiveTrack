@@ -1,4 +1,4 @@
-"""初始锚点 + 可信历史拼图 + 当前帧的时序 Prompt。"""
+"""过去身份参考 + 可信历史拼图 + 当前帧的时序 Prompt。"""
 
 from typing import Sequence
 
@@ -17,7 +17,7 @@ from .common import (
 )
 
 MOSAIC_PROMPT_NAME = "cognitive_mosaic"
-MOSAIC_PROMPT_VERSION = "4.3.0"
+MOSAIC_PROMPT_VERSION = "4.6.0"
 
 
 def build_mosaic_prompt(
@@ -31,9 +31,8 @@ def build_mosaic_prompt(
 ) -> PromptSpec:
     """构造三图时序跟踪 Prompt。
 
-    Image 2 必须由 ``ContextBuilder`` 预先拼为历史 mosaic；其中只允许出现经
-    门控验证的历史观测。历史图用于适应外观变化，但不能覆盖 Image 1 的永久
-    身份锚点。
+    Image 2 由 ``ContextBuilder`` 预先拼为历史 mosaic；历史观测是辅助证据，可能
+    含有轻微定位噪声，不能覆盖 Image 1 的永久身份锚点。
     """
 
     if isinstance(history_count, bool) or not isinstance(history_count, int) or history_count <= 0:
@@ -57,29 +56,29 @@ def build_mosaic_prompt(
             else "absolute pixel xyxy coordinates in Image 1's processor-resized pixel grid"
         )
         reference_note = (
-            "this is the unmodified full initialization frame; "
+            "this is an unmodified full earlier reference frame; "
             f"the target bbox is {rendered} in {coordinate_text}"
         )
     elif reference_bbox_norm1000_xyxy is not None:
         bbox = validate_norm1000_xyxy(reference_bbox_norm1000_xyxy)
         numbers = [round(value, 2) for value in bbox]
         reference_note = (
-            "this is the unmodified full initialization frame; the target bbox is "
+            "this is an unmodified full earlier reference frame; the target bbox is "
             f"{numbers} in normalized 0-to-1000 xyxy coordinates"
         )
     user_prompt = f"""Task: perform long-term identity-aware tracking with trusted temporal history.
 
-Image 1: immutable initialization identity reference; {reference_note}.
-Image 2: a chronological mosaic of {history_count} trusted target observations. Mosaic panels
-may show legitimate pose, scale, illumination, or viewpoint changes. They are supporting evidence
-and must never override identity conflicts with Image 1.
+Image 1: earlier identity reference; {reference_note}.
+Image 2: a chronological mosaic of {history_count} past tracker observations. Mosaic panels
+may show legitimate pose, scale, illumination, or viewpoint changes, and may contain imperfect
+box localization. Treat them as supporting evidence only; Image 1 remains the authoritative identity anchor.
 Image 3: current full frame to search globally.
 
 Decision order:
 1. Anchor identity to Image 1.
 2. Use Image 2 only to explain plausible temporal appearance changes.
 3. Search Image 3 globally and reject same-category distractors.
-4. Output present and a box only when the initialized instance is visible and localizable.
+4. Output present and a box only when the referenced instance is visible and localizable.
 5. Otherwise output absent and null. Do not invent finer-grained semantic states.
 
 {target_text_section(target_text)}

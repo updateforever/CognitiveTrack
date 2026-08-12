@@ -97,6 +97,11 @@ if [[ "$TUNER_TYPE" == "lora" ]]; then
         --lora_dropout "${LORA_DROPOUT:-0.05}"
         --freeze_vit "${FREEZE_VIT:-true}"
     )
+    # 继续训练已有 adapter（例如 Stage-1 -> Stage-2/Stage-3）时保持基座不变，
+    # 由 ms-swift 加载同一 LoRA 权重而不是重新初始化。
+    if [[ -n "${ADAPTERS:-}" ]]; then
+        ARGS+=(--adapters "$ADAPTERS")
+    fi
 elif [[ "$TUNER_TYPE" == "full" ]]; then
     # VLM 常规全参 SFT：语言模型与对齐层全参训练，默认冻结视觉编码器，保护其
     # 既有视觉/grounding 能力。若要连视觉塔一起训练，再显式设 FREEZE_VIT=false。

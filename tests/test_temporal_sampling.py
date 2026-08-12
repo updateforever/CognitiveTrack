@@ -61,6 +61,12 @@ def test_global_plan_keeps_seven_to_three_using_same_sequence_absent_frames(tmp_
         selected_absent = [frame_id for frame_id in item.frame_ids if not sequence.target_visible[frame_id]]
         assert len(selected_absent) == item.absent_count
         assert all(frame_id > 0 for frame_id in item.frame_ids)
+        assert len(item.reference_frame_ids) == len(item.frame_ids)
+        assert all(
+            reference < current
+            for reference, current in zip(item.reference_frame_ids, item.frame_ids, strict=True)
+        )
+        assert all(sequence.target_visible[reference] for reference in item.reference_frame_ids)
 
 
 def test_plan_rejects_unreachable_absent_ratio(tmp_path: Path) -> None:
@@ -71,6 +77,22 @@ def test_plan_rejects_unreachable_absent_ratio(tmp_path: Path) -> None:
             max_cases_per_sequence=5,
             absent_ratio=0.3,
         )
+
+
+def test_plan_reuses_real_absent_current_with_distinct_earlier_references(tmp_path: Path) -> None:
+    sequence = _sequence(tmp_path, "one-absent", [True, True, True, False])
+    plan = plan_temporal_presence_cases(
+        [sequence],
+        max_cases_per_sequence=3,
+        absent_ratio=2 / 3,
+        seed=23,
+    )
+
+    item = plan.sequences[0]
+    pairs = list(zip(item.reference_frame_ids, item.frame_ids, strict=True))
+    assert item.frame_ids.count(3) == 2
+    assert len(set(pairs)) == len(pairs)
+    assert all(reference < current for reference, current in pairs)
 
 
 def test_plan_uses_first_present_as_anchor_and_ignores_leading_absence(tmp_path: Path) -> None:

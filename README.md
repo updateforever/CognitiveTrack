@@ -175,9 +175,10 @@ bash scripts/train_sft.sh
 只换模型路径。两套 JSONL 共享同一批图像和样本划分，不会增加图片存储。
 
 Stage-1 只使用同序列真实状态，按约 70% `present+bbox`、30% `absent+null`
-构造 pair。初始化输入为“未修改完整首帧 + 官方模型族坐标表示的初始框”，当前帧
-同样保持完整且不画 GT；框通过 `<bbox>` 在 processor 阶段注入，mosaic 和记忆分别
-在后续阶段加入。数据标签边界见
+构造 pair。在线评测仍使用首帧初始化；训练 pair 使用同序列中严格早于 current 的
+完整 present reference，并通过官方模型族坐标表示传入 reference bbox。current 同样
+保持完整且不画 GT；框通过 `<bbox>` 在 processor 阶段注入，mosaic 和记忆分别在
+后续阶段加入。数据标签边界见
 [docs/training.md](docs/training.md)。
 本地 7B 模型的 v4.1 三字段零样本探针及由此得到的数据优先级见
 [docs/qwen_v4_probe.md](docs/qwen_v4_probe.md)。

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Qwen3-VL-4B Stage-1 SFT：冻结视觉塔，全参训练 LLM 与视觉 merger。
+# Qwen3-VL-4B Stage-1 SFT：默认采用 LoRA，冻结视觉塔；如需复现实验性全参方案，
+# 显式设置 TUNER_TYPE=full 并提供 FSDP2/ZeRO-3 分片。
 #
 # 必填：MODEL_PATH、TRAIN_DATA、VAL_DATA、DATASET_ROOT。
 
@@ -7,7 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-export TUNER_TYPE=${TUNER_TYPE:-full}
+export TUNER_TYPE=${TUNER_TYPE:-lora}
 export FSDP_MODE=${FSDP_MODE:-fsdp2}
 export FREEZE_LLM=${FREEZE_LLM:-false}
 export FREEZE_VIT=${FREEZE_VIT:-true}
@@ -21,7 +22,8 @@ export EPOCHS=${EPOCHS:-1}
 export BATCH_SIZE=${BATCH_SIZE:-2}
 export EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-1}
 export GRAD_ACC_STEPS=${GRAD_ACC_STEPS:-1}
-export LEARNING_RATE=${LEARNING_RATE:-1e-5}
+# LoRA 比全参更新可使用更高学习率；5e-5 在一轮 16 万样本上保持保守。
+export LEARNING_RATE=${LEARNING_RATE:-5e-5}
 export WARMUP_RATIO=${WARMUP_RATIO:-0.05}
 export GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
 export LOGGING_STEPS=${LOGGING_STEPS:-5}

@@ -142,8 +142,10 @@ python tools/verify_cognitivebench.py
 
 - LaSOT train：1120 序列；
 - TNL2K train：1300 序列；
-- 合计 2420 序列，每序列 20 cases；
-- 总计 48,400 cases，其中 present 33,880、absent 14,520。
+- MGIT tiny/train：当前镜像 95 条有帧序列，10 条空目录显式排除；
+- 固定 plan 最终包含 2511 条有合法 case 的序列、160,049 个不重复
+  `(reference,current)` pairs；
+- present 112,034、absent 48,015，各来源内部均约为 70:30。
 
 先做 loader 级检查和正式源摘要检查：
 
@@ -152,6 +154,8 @@ python tracking/inspect_dataset.py \
   --dataset lasot --config configs/env.local.yaml --split train --limit 1
 python tracking/inspect_dataset.py \
   --dataset tnl2k --config configs/env.local.yaml --split train --limit 1
+python tracking/inspect_dataset.py \
+  --dataset mgit --config configs/env.local.yaml --split train --limit 1
 python tools/verify_stage1_sources.py \
   --lasot-root /datasets/raw/LaSOT \
   --tnl2k-root /datasets/raw/TNL2K \
@@ -182,25 +186,27 @@ hash；任一摘要或序列数不符都会以非零状态退出。这里不直�
 
 ## 7. 使用固定计划重建数据
 
-从私有 ModelScope 数据仓库取得 `sampling_plan.json`。正式 v1 的 plan SHA-256：
+取得当前三来源 `sampling_plan.json`。正式 pair64 v1 的 plan SHA-256：
 
 ```text
-08c7a271fed2562b8692dfe6a198c8ac6199b4022e45e392ff4dd04c9f13dd31
+158372c68e82918d9460826d89f601d1278a3f97e6980e2069718755689c03a7
 ```
 
 执行确定性重建：
 
 ```bash
-export STAGE1_ROOT=/datasets/derived/cogtrack_stage1_lasot_tnl2k_v1
-export STAGE1_PLAN=/datasets/manifests/cogtrack_stage1_lasot_tnl2k_v1/sampling_plan.json
+export STAGE1_ROOT=/datasets/derived/cogtrack_stage1_lasot_tnl2k_mgit_tiny_pair64_v1
+export STAGE1_PLAN=/datasets/manifests/cogtrack_stage1_lasot_tnl2k_mgit_tiny_pair64_v1/sampling_plan.json
 
 sha256sum "$STAGE1_PLAN"
 python tracking/synthesize_stage1_dataset.py \
-  --datasets lasot tnl2k \
+  --datasets lasot tnl2k mgit \
+  --mgit-version tiny \
+  --allow-missing-mgit-sequences \
   --env-config configs/env.local.yaml \
   --context-mode pair \
   --frame-stride 1 \
-  --max-samples-per-sequence 20 \
+  --max-samples-per-sequence 64 \
   --absent-ratio 0.3 \
   --history-size 4 \
   --mosaic-panel-height 240 \
@@ -214,38 +220,27 @@ python tracking/synthesize_stage1_dataset.py \
 ```
 
 `--sampling-plan` 不会重新抽帧，并会拒绝数据集、seed、正负比例、每序列上限、
-序列数量、case 数或 present/absent 标注发生变化。固定 Python/OpenCV 版本后，正式
-产物应满足：
-
-```text
-source_samples.jsonl:
-6159216d5c7a06aac4d856802a0fdc9c5e4118026349d331de19c74dce8667da
-
-ms_swift/qwen3_vl/train.jsonl:
-fc57c949d41b1db151c3dfff279aa8177cde5475d7e88cc3fc2de5f9a5da9529
-
-ms_swift/qwen3_vl/val.jsonl:
-a674cbf575cc95b81f011970dd5f66901f89c177f41ba4fafac6a4d3f0ff3a24
-```
+序列数量、case 数或 present/absent 标注发生变化。source JSONL 和训练视图 checksum
+须在当前正式导出完成并验收后写入，禁止沿用旧 48,400-case v1 的摘要。
 
 JPEG 会经过 OpenCV/libjpeg 重新编码。若源图片或底层编解码库不同，图片字节可能
 不一致；此时至少要求 sample ID、状态、bbox、图片尺寸与 train/val 序列划分一致。
 
 ## 8. ModelScope 成品包兜底
 
-若原始数据摘要不匹配，直接从私有数据仓库下载已经打包的 3.66GB 发布包：
+新三来源 pair64 v1 尚未发布 ModelScope 成品包。发布后必须填入真实 dataset ID、固定
+revision 和 SHA256SUMS；在此之前禁止使用下面的旧占位命令冒充正式来源。
 
 ```bash
-modelscope download <OWNER/cogtrack-stage1-lasot-tnl2k-v1> \
+modelscope download <OWNER/cogtrack-stage1-lasot-tnl2k-mgit-tiny-pair64-v1> \
   --repo-type dataset \
   --revision <固定 revision> \
-  --local-dir /datasets/derived/cogtrack_stage1_lasot_tnl2k_v1 \
+  --local-dir /datasets/derived/cogtrack_stage1_lasot_tnl2k_mgit_tiny_pair64_v1 \
   --max-workers 4
 
-cd /datasets/derived/cogtrack_stage1_lasot_tnl2k_v1
+cd /datasets/derived/cogtrack_stage1_lasot_tnl2k_mgit_tiny_pair64_v1
 sha256sum -c SHA256SUMS
 for shard in image_shards/images-*.tar; do tar -xf "$shard"; done
-test "$(find images -type f | wc -l)" -eq 50820
 ```
 
 ModelScope 仓库 ID 和 revision 必须写入实验记录。私有仓库不自动消除 LaSOT/TNL2K

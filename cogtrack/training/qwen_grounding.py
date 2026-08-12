@@ -72,10 +72,27 @@ def qwen_bbox_protocol(model_family: str) -> str:
 
 @lru_cache(maxsize=131072)
 def _image_size(path: Path) -> tuple[int, int]:
+    # canonical pair/mosaic assets keep reference/current in one sequence directory and
+    # resize every full frame with the same long-side rule.  Reading the JPEG header once
+    # per sequence avoids reopening the same NAS files for thousands of repeated cases.
+    if path.name.startswith(("reference_", "current_")):
+        return _sequence_asset_size(path.parent)
     with Image.open(path) as image:
         width, height = image.size
     if width <= 0 or height <= 0:
         raise ValueError(f"图片尺寸非法：{path} -> {(width, height)}")
+    return width, height
+
+
+@lru_cache(maxsize=4096)
+def _sequence_asset_size(directory: Path) -> tuple[int, int]:
+    candidates = sorted(directory.glob("reference_*.jpg")) or sorted(directory.glob("current_*.jpg"))
+    if not candidates:
+        raise FileNotFoundError(f"序列图片目录没有 reference/current 资产：{directory}")
+    with Image.open(candidates[0]) as image:
+        width, height = image.size
+    if width <= 0 or height <= 0:
+        raise ValueError(f"图片尺寸非法：{candidates[0]} -> {(width, height)}")
     return width, height
 
 

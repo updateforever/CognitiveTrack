@@ -16,6 +16,9 @@
 三个阶段都不监督旧六分类、解释文本或数值置信度。Stage-1/2 使用不含
 `memory_update` 的二字段 Prompt，保证输入输出一致。
 
+Stage-2/3 的具体数据单位、事件审核和泄漏边界见
+[stage2_stage3_data.md](stage2_stage3_data.md)。
+
 后续只有在获得人工确认或可靠规则生成的记忆标签后，才使用 v4 三字段样本：
 
 ```json
@@ -37,10 +40,11 @@
 ```bash
 python tracking/synthesize_stage1_dataset.py \
   --datasets lasot tnl2k mgit \
+  --mgit-version tiny --allow-missing-mgit-sequences \
   --env-config configs/env.local.yaml \
-  --context-mode pair --max-samples-per-sequence 20 \
+  --context-mode pair --max-samples-per-sequence 64 \
   --absent-ratio 0.3 \
-  --output-dir data/stage1_tracking_presence_v1
+  --output-dir data/releases/cogtrack_stage1_lasot_tnl2k_mgit_tiny_pair64_v1
 ```
 
 构造器先扫描同序列连续状态区间，再在全数据集层面分配 absent 配额。负样本只来自
@@ -48,11 +52,13 @@ LaSOT 的 `full_occlusion/out_of_view`、TNL2K 的零框帧和 MGIT 的 `absent`
 不会跨序列配对或人工抹除目标。absent 区间优先覆盖首尾，present 则优先覆盖消失前
 和重现后的边界帧，再做时间均匀采样。默认将图片长边限制为 648。
 
-初始化遵循 pytracking 的 ``initialize(full_image, init_bbox)`` 接口。传给 VLM 的
-Image 1 是未画框、未裁剪的完整初始化帧；Image 2 始终是未画 GT 的当前完整帧。
-初始化框通过 Prompt 中的 `<bbox>` 和 `objects.image_id=0` 绑定 Image 1，当前 GT 仅
-在 assistant 答案中通过另一枚 `<bbox>` 绑定最后一张图。这样保留场景级身份线索，
-同时避免绿色框遮挡、局部模板裁剪和多图 bbox 错绑。
+初始化遵循 pytracking 的 ``initialize(full_image, init_bbox)`` 接口。在线 benchmark
+仍只用第一帧 GT 初始化；Stage-1 训练 pair 则从同序列选择严格早于当前帧的真实
+present reference。传给 VLM 的 Image 1 是未画框、未裁剪的完整 reference 帧，Image 2
+始终是未画 GT 的当前完整帧。reference 框通过 Prompt 中的 `<bbox>` 和
+`objects.image_id=0` 绑定 Image 1，当前 GT 仅在 assistant 答案中通过另一枚 `<bbox>`
+绑定最后一张图。reference/current 的时间顺序写入 sampling plan，并严格禁止
+reference 使用 current 或未来帧。
 
 ## 3. Qwen 官方坐标训练视图
 
@@ -150,7 +156,13 @@ DATASET_ROOT=/path/to/dataset \
 bash scripts/train_sft.sh
 ```
 
-当前主 baseline 快捷入口为 `scripts/train_qwen3vl_4b_stage1.sh`。8×4090、单卡
+当前主 baseline 快捷入口为 `scripts/train_qwen3vl_4b_stage1.sh`，默认采用 LoRA。
+单卡 L40S smoke 已验证 Qwen3-VL-4B 的 LoRA SFT 可运行；Stage-1 两步峰值
+16.29GiB，Stage-2 mosaic 两步峰值 18.44GiB。正式实验统一沿用同一 LoRA adapter
+从 Stage-1 SFT 传递到 Stage-2/Stage-3 和 GRPO，避免切换全参/adapter 权重造成对比
+混乱。需要全参对照时必须显式设置 `TUNER_TYPE=full`。
+
+此前的全参参考结果为：8×4090、单卡
 batch=2、全局 batch=16 的两步实测中，模型共 4.438B 参数、可训练 4.132B
 （93.10%），峰值 16.29GiB/卡，吞吐约 4.64 samples/s。视觉主干保持冻结，Qwen3
 新增的主 merger 与三个 deepstack merger 均参与训练。

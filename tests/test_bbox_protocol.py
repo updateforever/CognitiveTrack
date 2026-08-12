@@ -80,7 +80,7 @@ def test_full_reference_prompt_uses_coordinates_without_visual_box() -> None:
         reference_has_box=False,
         reference_bbox_norm1000_xyxy=[100, 200, 300, 400],
     )
-    assert "unmodified full initialization frame" in prompt.user_prompt
+    assert "unmodified full earlier reference frame" in prompt.user_prompt
     assert "[100.0, 200.0, 300.0, 400.0]" in prompt.user_prompt
     assert "tight crop" not in prompt.user_prompt
 

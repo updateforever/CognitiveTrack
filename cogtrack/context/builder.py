@@ -95,28 +95,26 @@ class TrackingContextBuilder:
             height, width = panel.shape[:2]
             new_width = max(1, int(round(width * self.mosaic_panel_height / float(height))))
             panel = cv2.resize(panel, (new_width, self.mosaic_panel_height), interpolation=cv2.INTER_AREA)
-            header = np.full((30, new_width, 3), 245, dtype=np.uint8)
-            cv2.putText(
-                header,
-                f"trusted frame {record.frame_id}",
-                (6, 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (20, 20, 20),
-                1,
-                cv2.LINE_AA,
-            )
-            panels.append(np.vstack((header, panel)))
+            # 不把绝对帧号写进视觉输入；frame_id 仍由运行时 metadata 审计，避免模型
+            # 学习数据集位置偏置。
+            panels.append(panel)
 
         if not panels:
             raise ValueError("构造 mosaic 至少需要一条带图像和 bbox 的可信正记忆")
-        separator = np.full((self.mosaic_panel_height + 30, 5, 3), 220, dtype=np.uint8)
-        pieces: list[np.ndarray] = []
+        columns = 1 if len(panels) <= 2 else 2
+        rows = (len(panels) + columns - 1) // columns
+        cell_width = max(panel.shape[1] for panel in panels)
+        canvas = np.full(
+            (rows * self.mosaic_panel_height, columns * cell_width, 3),
+            220,
+            dtype=np.uint8,
+        )
         for index, panel in enumerate(panels):
-            if index:
-                pieces.append(separator)
-            pieces.append(panel)
-        return np.hstack(pieces)
+            row, column = divmod(index, columns)
+            x = column * cell_width + (cell_width - panel.shape[1]) // 2
+            y = row * self.mosaic_panel_height
+            canvas[y : y + panel.shape[0], x : x + panel.shape[1]] = panel
+        return canvas
 
     def build_pair(
         self,
