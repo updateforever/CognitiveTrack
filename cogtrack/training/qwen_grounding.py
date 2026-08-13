@@ -20,7 +20,8 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from PIL import Image
 
-from cogtrack.prompts import build_mosaic_prompt, build_pair_prompt
+from cogtrack.context import REFERENCE_MODE_BBOX_TEXT, REFERENCE_MODE_VISUAL_BOX
+from cogtrack.prompts import build_mosaic_prompt, build_pair_prompt, build_visual_tracking_prompt
 from cogtrack.protocol import (
     BBOX_PROTOCOL_NORM1000,
     BBOX_PROTOCOL_QWEN_ABS_PIXEL,
@@ -113,13 +114,39 @@ def _build_prompt(row: Mapping[str, Any], *, model_family: str):
     if not isinstance(metadata, Mapping):
         raise ValueError("canonical 样本缺少 metadata")
     effective_mode = str(metadata.get("effective_mode", "pair"))
+    reference_mode = str(metadata.get("reference_mode", REFERENCE_MODE_BBOX_TEXT))
+    if reference_mode == "full_frame_bbox_text":
+        # 兼容已经发布的 v4 canonical 数据。
+        reference_mode = REFERENCE_MODE_BBOX_TEXT
     protocol = qwen_bbox_protocol(model_family)
+    assistant = row.get("assistant")
+    include_memory_update = isinstance(assistant, Mapping) and "memory_update" in assistant
+    if reference_mode == REFERENCE_MODE_VISUAL_BOX:
+        if not include_memory_update:
+            raise ValueError("visual_box v5 样本必须使用三字段 memory_update 协议")
+        history_ids = metadata.get("history_frame_ids")
+        history_count = 0
+        if effective_mode == "mosaic":
+            if not isinstance(history_ids, list) or not history_ids:
+                raise ValueError("mosaic 样本缺少非空 history_frame_ids")
+            history_count = len(history_ids)
+        elif effective_mode != "pair":
+            raise ValueError(f"不支持的 effective_mode：{effective_mode!r}")
+        return build_visual_tracking_prompt(
+            history_count=history_count,
+            target_text="",
+            semantic_memory="",
+            bbox_protocol=protocol,
+            include_memory_update=True,
+        )
+    if reference_mode != REFERENCE_MODE_BBOX_TEXT:
+        raise ValueError(f"不支持的 reference_mode：{reference_mode!r}")
     common = {
         "target_text": "",
         "semantic_memory": "",
         "reference_bbox": "<bbox>",
         "bbox_protocol": protocol,
-        "include_memory_update": False,
+        "include_memory_update": include_memory_update,
     }
     if effective_mode == "pair":
         return build_pair_prompt(reference_has_box=False, **common)
@@ -131,14 +158,23 @@ def _build_prompt(row: Mapping[str, Any], *, model_family: str):
     raise ValueError(f"不支持的 effective_mode：{effective_mode!r}")
 
 
-def _answer_text(*, status: str, bbox_protocol: str) -> str:
+def _answer_text(
+    *,
+    status: str,
+    bbox_protocol: str,
+    include_memory_update: bool,
+    memory_update: str | None,
+) -> str:
     bbox_key = (
         "bbox_norm1000_xyxy"
         if bbox_protocol == BBOX_PROTOCOL_NORM1000
         else "bbox_pixel_xyxy"
     )
     bbox_value = "<bbox>" if status == "present" else "null"
-    return f'{{"target_status":"{status}","{bbox_key}":{bbox_value}}}'
+    payload = f'{{"target_status":"{status}","{bbox_key}":{bbox_value}'
+    if include_memory_update:
+        payload += f',"memory_update":{json.dumps(memory_update, ensure_ascii=False)}'
+    return payload + "}"
 
 
 def to_qwen_grounding_record(
@@ -147,7 +183,7 @@ def to_qwen_grounding_record(
     image_root: str | Path,
     model_family: str,
 ) -> dict[str, Any]:
-    """将一条 v4 canonical 样本转换为模型族专属 ms-swift Grounding 样本。
+    """将一条版本化 canonical 样本转换为模型族专属 ms-swift Grounding 样本。
 
     ``objects.bbox`` 始终保存导出 JPEG 上的真实绝对坐标。不要在这里预先执行
     Qwen smart-resize；这是 ms-swift 模型模板的职责，也是避免训练/推理漂移的
@@ -170,16 +206,23 @@ def to_qwen_grounding_record(
     if not isinstance(metadata_value, Mapping):
         raise ValueError("canonical 样本缺少 metadata")
     metadata = dict(metadata_value)
-    reference_norm = metadata.get("reference_bbox_norm1000_xyxy")
-    if not isinstance(reference_norm, list):
-        raise ValueError("canonical 样本缺少 reference_bbox_norm1000_xyxy")
-    reference_real = _real_xyxy_from_norm1000(reference_norm, image_path=image_paths[0])
+    reference_mode = str(metadata.get("reference_mode", REFERENCE_MODE_BBOX_TEXT))
+    if reference_mode == "full_frame_bbox_text":
+        reference_mode = REFERENCE_MODE_BBOX_TEXT
+    if reference_mode not in {REFERENCE_MODE_BBOX_TEXT, REFERENCE_MODE_VISUAL_BOX}:
+        raise ValueError(f"canonical 样本 reference_mode 非法：{reference_mode!r}")
 
     status = str(row.get("target_status", ""))
     if status not in {"present", "absent"}:
         raise ValueError(f"target_status 非法：{status!r}")
-    boxes = [reference_real]
-    image_ids = [0]
+    boxes: list[list[float]] = []
+    image_ids: list[int] = []
+    if reference_mode == REFERENCE_MODE_BBOX_TEXT:
+        reference_norm = metadata.get("reference_bbox_norm1000_xyxy")
+        if not isinstance(reference_norm, list):
+            raise ValueError("bbox_text canonical 样本缺少 reference_bbox_norm1000_xyxy")
+        boxes.append(_real_xyxy_from_norm1000(reference_norm, image_path=image_paths[0]))
+        image_ids.append(0)
     current_norm = row.get("bbox_norm1000_xyxy")
     if status == "present":
         if not isinstance(current_norm, list):
@@ -189,12 +232,32 @@ def to_qwen_grounding_record(
     elif current_norm is not None:
         raise ValueError("absent 样本的 bbox_norm1000_xyxy 必须为 null")
 
+    assistant_value = row.get("assistant")
+    if assistant_value is None and reference_mode == REFERENCE_MODE_BBOX_TEXT:
+        # 兼容早期只保存顶层监督列的 canonical 工具输入。
+        assistant_value = {}
+    if not isinstance(assistant_value, Mapping):
+        raise ValueError("canonical 样本缺少 assistant mapping")
+    include_memory_update = "memory_update" in assistant_value
+    memory_update = assistant_value.get("memory_update")
+    if include_memory_update and memory_update is not None and not isinstance(memory_update, str):
+        raise ValueError("memory_update 必须是字符串或 null")
+    if reference_mode == REFERENCE_MODE_VISUAL_BOX and not include_memory_update:
+        raise ValueError("visual_box v5 样本必须包含 memory_update")
+    if status == "absent" and memory_update is not None:
+        raise ValueError("absent 样本的 memory_update 必须为 null")
+
     prompt = _build_prompt(row, model_family=family)
     if prompt.expected_image_count != len(images):
         raise ValueError(
             f"Prompt {prompt.name} 期望 {prompt.expected_image_count} 张图，实际为 {len(images)}"
         )
-    assistant = _answer_text(status=status, bbox_protocol=protocol)
+    assistant = _answer_text(
+        status=status,
+        bbox_protocol=protocol,
+        include_memory_update=include_memory_update,
+        memory_update=memory_update,
+    )
     metadata.update(
         qwen_model_family=family,
         bbox_protocol=protocol,
@@ -203,6 +266,7 @@ def to_qwen_grounding_record(
         prompt_version=prompt.version,
         ms_swift_bbox_format="new",
         canonical_bbox_format="norm1000_xyxy",
+        reference_mode=reference_mode,
     )
     record = {
         "messages": [
@@ -211,17 +275,22 @@ def to_qwen_grounding_record(
             {"role": "assistant", "content": assistant},
         ],
         "images": images,
-        "objects": {
-            "bbox": boxes,
-            "bbox_type": "real",
-            "image_id": image_ids,
-        },
         "metadata": metadata,
         "target_status": status,
         # canonical 框只给审计和 GRPO reward 使用，不会进入模型消息。
         "bbox_norm1000_xyxy": current_norm,
         "bbox_format": "norm1000_xyxy",
     }
+    if boxes:
+        # visual_box absent 样本没有任何 <bbox> token，因此不写空 objects；present
+        # 样本只把 assistant 输出框绑定到最后一张 current 图。
+        record["objects"] = {
+            "bbox": boxes,
+            "bbox_type": "real",
+            "image_id": image_ids,
+        }
+    if include_memory_update:
+        record["memory_update"] = memory_update
     if "id" in row:
         record["id"] = row["id"]
     return record

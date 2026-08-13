@@ -1,9 +1,10 @@
-# 与零样本基线完全相同的 CognitiveTrack v1 正式推理协议，只替换 Stage-1 权重。
-# Stage-1 只学过 pair/二字段；在最终协议下测试可直接反映其跨阶段兼容性。
+# 训练服务器产出的统一 v5 adapter 合并/挂载后使用本配置评测。
 tracker_name: cognitive_vlm
-experiment_name: qwen3vl_4b_cognitive_v1_stage1
+experiment_name: qwen3vl_4b_visual_v5_sft
 context_mode: mosaic
-reference_mode: bbox_text
+reference_mode: visual_box
+use_init_language: false
+mosaic_panel_height: 240
 bbox_protocol: norm1000
 
 observation_policy:
@@ -19,7 +20,9 @@ memory:
   max_confirmation_gap: 30
   min_positive_frame_gap: 5
   min_semantic_frame_gap: 30
-  semantic_confirmations: 1
+  semantic_confirmations: 2
+  max_semantic_confirmation_gap: 300
+  min_semantic_text_similarity: 0.35
 
-model_config: ../models/qwen3vl_4b_vllm_sft.yaml
+model_config: ../models/qwen3vl_4b_vllm_unified_v5.yaml
 save_raw_response: true

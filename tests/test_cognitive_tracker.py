@@ -72,12 +72,21 @@ def _response(
     return json.dumps(payload)
 
 
-def _tracker(context_mode="mosaic", *, responses=None, memory_output_enabled=True):
+def _tracker(
+    context_mode="mosaic",
+    *,
+    responses=None,
+    memory_output_enabled=True,
+    reference_mode="bbox_text",
+    use_init_language=True,
+):
     model_config = Path(__file__).resolve().parents[1] / "configs/models/qwen25vl_7b.yaml"
     tracker = CognitiveVLMTracker(
         TrackerParams(
             {
                 "context_mode": context_mode,
+                "reference_mode": reference_mode,
+                "use_init_language": use_init_language,
                 "model_config": str(model_config),
                 "_config_path": str(Path(__file__).resolve()),
                 "memory": {
@@ -87,6 +96,8 @@ def _tracker(context_mode="mosaic", *, responses=None, memory_output_enabled=Tru
                     "max_positive_records": 3,
                     "max_negative_records": 3,
                     "confirmations": 2,
+                    "semantic_confirmations": 2,
+                    "max_semantic_confirmation_gap": 300,
                     "min_positive_frame_gap": 0,
                 },
             }
@@ -94,6 +105,39 @@ def _tracker(context_mode="mosaic", *, responses=None, memory_output_enabled=Tru
     )
     tracker.backend = FakeBackend(responses or [_response(), _response(), _response()])
     return tracker
+
+
+def test_visual_box_runtime_is_explicit_and_marks_only_anchor():
+    tracker = _tracker(
+        context_mode="pair",
+        reference_mode="visual_box",
+        use_init_language=False,
+    )
+    anchor = np.zeros((100, 200, 3), dtype=np.uint8)
+    current = np.full((100, 200, 3), 19, dtype=np.uint8)
+    tracker.initialize(
+        anchor,
+        {
+            "init_bbox": [20, 10, 40, 30],
+            "init_nlp": "a description that must not enter visual-v5",
+            "sequence_name": "visual-v5",
+            "frame_path": "0000.jpg",
+        },
+    )
+
+    context = tracker._build_context(current)
+    runtime = tracker.describe_runtime()
+
+    assert context.prompt.name == "cognitive_visual_pair"
+    assert context.reference_mode == "visual_box"
+    assert np.any(context.images[0] != anchor)
+    assert np.array_equal(context.images[-1], current)
+    assert "a description that must not enter" not in context.prompt.user_prompt
+    assert runtime["reference_mode"] == "visual_box"
+    assert runtime["use_init_language"] is False
+    assert runtime["mosaic_panel_height"] == 240
+    assert runtime["memory_policy"]["semantic_confirmations"] == 2
+    assert runtime["memory_policy"]["max_semantic_confirmation_gap"] == 300
 
 
 def test_presence_only_sft_runtime_uses_the_matching_two_field_protocol():
@@ -221,11 +265,12 @@ def test_absent_prediction_does_not_enter_positive_memory():
     assert output["memory"]["records"]["positive"] == []
 
 
-def test_model_controlled_semantic_memory_is_written_and_reused_in_next_prompt():
+def test_model_controlled_semantic_memory_requires_two_proposals_then_is_reused():
     tracker = _tracker(
         context_mode="pair",
         responses=[
             _response(memory_update="Rear view reveals two stable white stripes."),
+            _response(memory_update="Rear view now reveals two stable white stripes."),
             _response(),
         ],
     )
@@ -245,17 +290,19 @@ def test_model_controlled_semantic_memory_is_written_and_reused_in_next_prompt()
 
     first = tracker.track(image, {"frame_num": 1, "frame_path": "0001.jpg"})
     second = tracker.track(image, {"frame_num": 2, "frame_path": "0002.jpg"})
+    third = tracker.track(image, {"frame_num": 3, "frame_path": "0003.jpg"})
 
     assert first["cognition"]["memory_update_proposal"] == (
         "Rear view reveals two stable white stripes."
     )
-    assert first["cognition"]["memory_updated"] is True
-    assert first["memory_decision"]["semantic"]["accepted"] is True
-    assert first["memory"]["records"]["semantic"][0]["text"] == (
-        "Rear view reveals two stable white stripes."
+    assert first["cognition"]["memory_updated"] is False
+    assert first["memory_decision"]["semantic"]["accepted"] is False
+    assert second["memory_decision"]["semantic"]["accepted"] is True
+    assert second["memory"]["records"]["semantic"][0]["text"] == (
+        "Rear view now reveals two stable white stripes."
     )
-    assert "Rear view reveals two stable white stripes." in prompts[1]
-    assert second["cognition"]["memory_updated"] is False
+    assert "Rear view now reveals two stable white stripes." in prompts[2]
+    assert third["cognition"]["memory_updated"] is False
 
 
 def test_absent_output_rejects_only_memory_proposal():

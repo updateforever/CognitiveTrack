@@ -5,8 +5,16 @@ import cv2
 import numpy as np
 import pytest
 
+from cogtrack.context import REFERENCE_MODE_VISUAL_BOX, VISUAL_MARKER_VERSION
 from cogtrack.training.swift_dataset import to_ms_swift_record, validate_ms_swift_record
-from cogtrack.training.tracking_samples import TrackingSampleConfig, build_tracking_samples
+from cogtrack.training.tracking_samples import (
+    MEMORY_SUPERVISION_EXPLICIT,
+    MEMORY_SUPERVISION_FEASIBILITY_NULL,
+    MemoryUpdateLabel,
+    TrackingSampleConfig,
+    build_tracking_samples,
+    load_memory_labels_jsonl,
+)
 from cogtrack.vlm import parse_tracking_output
 from pytracking.evaluation.data import Sequence
 
@@ -296,3 +304,124 @@ def test_same_current_with_distinct_references_builds_unique_pairs(tmp_path: Pat
     assert [row["metadata"]["frame_id"] for row in rows] == [3, 3]
     assert [row["metadata"]["reference_frame_id"] for row in rows] == [0, 1]
     assert len(list((output / "images/synthetic/multi-reference").glob("current_*.jpg"))) == 1
+
+
+def test_v5_visual_reference_and_three_field_feasibility_data(tmp_path: Path) -> None:
+    sequence = _make_sequence(
+        tmp_path / "source",
+        [[10, 10, 20, 10], [20, 10, 20, 10], [0, 0, 0, 0]],
+        [True, True, False],
+    )
+    output = tmp_path / "visual-v5"
+    report = build_tracking_samples(
+        [sequence],
+        output,
+        config=TrackingSampleConfig(
+            mode="pair",
+            use_language_description=False,
+            reference_mode=REFERENCE_MODE_VISUAL_BOX,
+            memory_supervision=MEMORY_SUPERVISION_FEASIBILITY_NULL,
+        ),
+    )
+    rows = _read_rows(output / "source_samples.jsonl")
+
+    assert report.reference_mode == REFERENCE_MODE_VISUAL_BOX
+    assert report.visual_marker_version == VISUAL_MARKER_VERSION
+    assert report.memory_null_count == 2
+    assert report.memory_non_null_count == 0
+    assert all(set(row["assistant"]) == {"target_status", "bbox_norm1000_xyxy", "memory_update"} for row in rows)
+    assert all(row["assistant"]["memory_update"] is None for row in rows)
+    assert all("normalized 0-to-1000 xyxy coordinates" not in row["user_prompt"] for row in rows)
+    assert all(row["metadata"]["reference_mode"] == REFERENCE_MODE_VISUAL_BOX for row in rows)
+    assert all("not_for_formal_training" in row["metadata"]["memory_label_source"] for row in rows)
+
+    reference = cv2.imread(str(output / rows[0]["images"][0]))
+    current = cv2.imread(str(output / rows[0]["images"][-1]))
+    assert reference is not None and current is not None
+    # cv2 读取为 BGR：视觉指代红框应使 R 通道显著高于 B/G；current 仍是灰度图。
+    assert int(reference[:, :, 2].max()) > int(reference[:, :, :2].max()) + 80
+    assert int(np.max(np.ptp(current.astype(np.int16), axis=2))) <= 2
+
+
+def test_visual_reference_rejects_two_field_training_protocol() -> None:
+    with pytest.raises(ValueError, match="必须启用三字段"):
+        TrackingSampleConfig(reference_mode=REFERENCE_MODE_VISUAL_BOX)
+
+
+def test_explicit_memory_labels_are_required_and_audited(tmp_path: Path) -> None:
+    sequence = _make_sequence(
+        tmp_path / "source",
+        [[10, 10, 20, 10], [20, 10, 20, 10]],
+        [True, True],
+    )
+    config = TrackingSampleConfig(
+        reference_mode=REFERENCE_MODE_VISUAL_BOX,
+        memory_supervision=MEMORY_SUPERVISION_EXPLICIT,
+    )
+    with pytest.raises(ValueError, match="必须提供 memory_labels_by_sequence"):
+        build_tracking_samples([sequence], tmp_path / "missing", config=config)
+
+    labels = {
+        "synthetic::sequence-1": {
+            1: MemoryUpdateLabel(
+                "Rear view reveals two stable white stripes.",
+                source="manual_double_review_v1",
+                reviewed=True,
+            )
+        }
+    }
+    output = tmp_path / "explicit"
+    report = build_tracking_samples(
+        [sequence],
+        output,
+        config=config,
+        memory_labels_by_sequence=labels,
+    )
+    row = _read_rows(output / "source_samples.jsonl")[0]
+
+    assert report.memory_non_null_count == 1
+    assert row["assistant"]["memory_update"] == "Rear view reveals two stable white stripes."
+    assert row["metadata"]["memory_label_source"] == "manual_double_review_v1"
+    assert row["metadata"]["memory_label_reviewed"] is True
+
+
+def test_memory_label_jsonl_loader_rejects_duplicates_and_preserves_provenance(
+    tmp_path: Path,
+) -> None:
+    label_path = tmp_path / "memory.jsonl"
+    label_path.write_text(
+        json.dumps(
+            {
+                "dataset": "synthetic",
+                "sequence": "sequence-1",
+                "frame_id": 7,
+                "memory_update": "A stable white stripe is now visible.",
+                "source": "manual_review_v1",
+                "reviewed": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    labels = load_memory_labels_jsonl(label_path)
+
+    label = labels["synthetic::sequence-1"][7]
+    assert label.value == "A stable white stripe is now visible."
+    assert label.source == "manual_review_v1"
+    assert label.reviewed is True
+
+    with label_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "dataset": "synthetic",
+                    "sequence": "sequence-1",
+                    "frame_id": 7,
+                    "memory_update": None,
+                    "source": "hard_null_v1",
+                }
+            )
+            + "\n"
+        )
+    with pytest.raises(ValueError, match="重复 memory label"):
+        load_memory_labels_jsonl(label_path)

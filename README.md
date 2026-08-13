@@ -9,9 +9,10 @@ CognitiveTrack 是一个建立在 [pytracking](https://github.com/visionml/pytra
 GRPO。所有实验遵循：第一帧仅用 GT 初始化，后续推理不读取当前或未来 GT；训练、
 验证和测试按完整序列划分。
 
-2026-08-13 的统一视觉画框与混合训练讨论摘要见
-[docs/project_status_20260813.md](docs/project_status_20260813.md)，完整设计草案见
-[docs/stage2_stage3_data.md](docs/stage2_stage3_data.md)。
+当前 visual-v5 基线使用“带框首帧身份锚点 + 可选带框历史 mosaic + 无框当前全图”的
+统一输入，输出目标存在性、当前框与可空语义记忆更新。设计与复现实验说明见
+[docs/stage2_stage3_data.md](docs/stage2_stage3_data.md) 和
+[docs/visual_v5_iteration.md](docs/visual_v5_iteration.md)。
 
 ## 主要特性
 
@@ -123,8 +124,8 @@ export COGTRACK_QWEN3_4B_ADAPTER="$PWD/checkpoints/modelscope/CognitiveTrack-Qwe
 
 ```bash
 python tracking/smoke_test_qwen.py \
-  --tracker-config configs/trackers/qwen3vl_4b_pair_sft_presence.yaml \
-  --dataset-config configs/datasets/cognitivebench.yaml \
+  --tracker-config configs/trackers/qwen3vl_4b_visual_v5_base.yaml \
+  --dataset-config configs/datasets/cognitivebench_tiny.yaml \
   --env-config configs/env.local.yaml
 ```
 
@@ -134,14 +135,14 @@ python tracking/smoke_test_qwen.py \
 ```bash
 python tracking/test.py \
   --config configs/env.local.yaml \
-  --tracker-config configs/trackers/qwen3vl_4b_cognitive_stage1_vllm.yaml \
+  --tracker-config configs/trackers/qwen3vl_4b_visual_v5_base_vllm.yaml \
   --dataset-config configs/datasets/cognitivebench_tiny.yaml
 ```
 
 确认协议和性能趋势后，仅将数据配置换成 `configs/datasets/cognitivebench.yaml` 即可
-运行 Full。零样本基座使用 `configs/trackers/qwen3vl_4b_cognitive_vllm.yaml`。pair、
-无历史和无语义记忆配置只用于消融，不作为不同训练阶段的主推理模式。SUTrack 与
-Hybrid 配置位于 `configs/trackers/`；SUTrack checkpoint 通过
+运行 Full。新 SFT adapter 使用 `qwen3vl_4b_visual_v5_sft_vllm.yaml`；旧坐标文本、pair、
+无历史和无语义记忆配置只用于历史复现或消融。SUTrack 与 Hybrid 配置位于
+`configs/trackers/`；SUTrack checkpoint 通过
 `COGTRACK_SUTRACK_CHECKPOINT` 注入，不在 YAML 中写绝对路径。
 
 ## 评测
@@ -168,41 +169,42 @@ rate、present miss rate 和 decision coverage。
 `--debug-frames` 生成的截断结果默认不进入正式聚合。评测会输出 `summary.json`、
 `sequence_metrics.csv` 和 `report.md`。
 
-## Stage-1 数据与训练
+## 数据与训练
 
-Stage-1 使用 LaSOT train、TNL2K train 和 MGIT tiny/train 中同一序列的真实
-present/absent 帧，约 70% `present+bbox`、30% `absent+null`。reference 必须是
-current 之前的真实 present 帧，图像保持完整且不绘制 GT 框。
+visual-v5 使用 LaSOT train、TNL2K train 和 MGIT train 中同一序列的真实
+present/absent 帧。所有 reference/history 严格早于 current；负样本只来自原视频的
+真实目标消失帧。下面命令先生成可重放的采样计划：
 
 ```bash
-python tracking/synthesize_stage1_dataset.py \
+python tracking/synthesize_visual_v5_dataset.py \
   --datasets lasot tnl2k mgit \
   --mgit-version tiny --allow-missing-mgit-sequences \
   --env-config configs/env.local.yaml \
-  --context-mode pair --max-samples-per-sequence 64 \
+  --max-samples-per-sequence 20 \
   --absent-ratio 0.3 \
-  --output-dir data/cogtrack_stage1_pair64_v1
+  --output-dir data/plans/cogtrack_visual_v5_probe \
+  --plan-only
 ```
 
-Qwen3-VL 使用 `[0,1000]` 相对 `xyxy`；Qwen2.5-VL 使用 processor resize 后的绝对
-像素 `xyxy`。构造器分别输出 `ms_swift/qwen3_vl/` 和
-`ms_swift/qwen2_5_vl/`，两代 JSONL 不能交叉使用。
+正式三字段数据必须提供带来源的逐帧 memory label manifest；完整渲染、校验与训练命令
+见 [docs/training.md](docs/training.md)。Qwen3-VL 使用 `[0,1000]` 相对 `xyxy`；
+Qwen2.5-VL 使用 processor resize 后绝对像素 `xyxy`，两代 JSONL 不能交叉使用。
 
 ```bash
 export MODEL_PATH=/models/Qwen3-VL-4B-Instruct
-export DATASET_ROOT=/datasets/cogtrack_stage1_pair64_v1
+export DATASET_ROOT=/datasets/cogtrack_visual_v5_probe
 export TRAIN_DATA="$DATASET_ROOT/ms_swift/qwen3_vl/train.jsonl"
 export VAL_DATA="$DATASET_ROOT/ms_swift/qwen3_vl/val.jsonl"
-export OUTPUT_DIR=/outputs/cogtrack/qwen3vl_4b_stage1
+export OUTPUT_DIR=/outputs/cogtrack/qwen3vl_4b_visual_v5_probe
+export QWEN_MODEL_FAMILY=qwen3_vl
 
-bash scripts/train_qwen3vl_4b_stage1.sh
+bash scripts/train_sft.sh
 ```
 
 详细监督边界、数据格式、全参训练和 GRPO 说明见
 [docs/training.md](docs/training.md)。
 
-旧 Stage-1/Stage-2 分阶段训练结果仅作为历史对照；下一版将统一视觉画框输入与三字段
-混合训练。方案状态和已完成实验分别见
+旧 Stage-1/Stage-2 分阶段训练结果仅作为历史对照。当前状态和已完成实验分别见
 [docs/project_status_20260813.md](docs/project_status_20260813.md) 与
 [旧分阶段 Tiny 结果](docs/legacy_staged_tiny_results_20260813.md)。
 

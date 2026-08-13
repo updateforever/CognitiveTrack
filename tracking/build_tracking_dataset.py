@@ -35,9 +35,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from cogtrack.context import REFERENCE_MODE_BBOX_TEXT, REFERENCE_MODE_VISUAL_BOX  # noqa: E402
 from cogtrack.training.tracking_samples import (  # noqa: E402
+    MEMORY_SUPERVISION_DISABLED,
+    MEMORY_SUPERVISION_EXPLICIT,
+    MEMORY_SUPERVISION_FEASIBILITY_NULL,
     TrackingSampleConfig,
     build_tracking_samples,
+    load_memory_labels_jsonl,
 )
 from pytracking.datasets.registry import list_datasets, load_dataset  # noqa: E402
 from pytracking.evaluation.data import SequenceList  # noqa: E402
@@ -66,6 +71,29 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=20260805, help="稳定抽样随机种子。")
     parser.add_argument("--history-size", type=int, default=4, help="mosaic 最多使用的过去正历史帧数。")
     parser.add_argument("--mosaic-panel-height", type=int, default=240)
+    parser.add_argument(
+        "--reference-mode",
+        choices=(REFERENCE_MODE_BBOX_TEXT, REFERENCE_MODE_VISUAL_BOX),
+        default=REFERENCE_MODE_BBOX_TEXT,
+        help="过去 reference 的指代方式；新 v5 使用 visual_box，旧实验复现使用 bbox_text。",
+    )
+    parser.add_argument(
+        "--memory-supervision",
+        choices=(
+            MEMORY_SUPERVISION_DISABLED,
+            MEMORY_SUPERVISION_FEASIBILITY_NULL,
+            MEMORY_SUPERVISION_EXPLICIT,
+        ),
+        default=MEMORY_SUPERVISION_DISABLED,
+        help=(
+            "disabled=旧二字段；feasibility_null=只验证三字段链路且禁止正式训练；"
+            "explicit=从 --memory-labels 读取逐帧标签。"
+        ),
+    )
+    parser.add_argument(
+        "--memory-labels",
+        help="explicit 模式的 JSONL；每行需包含 dataset、sequence、frame_id、memory_update、source。",
+    )
     parser.add_argument(
         "--max-image-side",
         type=int,
@@ -101,6 +129,13 @@ def main() -> int:
     try:
         if args.limit_sequences is not None and args.limit_sequences <= 0:
             raise ValueError("--limit-sequences 必须为正整数")
+        if args.memory_supervision == MEMORY_SUPERVISION_EXPLICIT and not args.memory_labels:
+            raise ValueError("--memory-supervision explicit 必须同时提供 --memory-labels")
+        if args.memory_supervision != MEMORY_SUPERVISION_EXPLICIT and args.memory_labels:
+            raise ValueError("--memory-labels 只能与 --memory-supervision explicit 同时使用")
+        memory_labels = (
+            load_memory_labels_jsonl(args.memory_labels) if args.memory_labels else None
+        )
         environment = load_environment(args.env_config)
         dataset_kwargs = {"split": args.split} if args.split else {}
         sequences = load_dataset(
@@ -126,12 +161,15 @@ def main() -> int:
             use_language_description=not args.no_language_description,
             max_image_side=args.max_image_side,
             jpeg_quality=args.jpeg_quality,
+            reference_mode=args.reference_mode,
+            memory_supervision=args.memory_supervision,
         )
         report = build_tracking_samples(
             sequences,
             args.output_dir,
             config=config,
             overwrite=args.force,
+            memory_labels_by_sequence=memory_labels,
         )
     except (OSError, KeyError, TypeError, ValueError) as exc:
         print(f"[错误] {exc}", file=sys.stderr)

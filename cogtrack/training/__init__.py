@@ -28,25 +28,43 @@ from .swift_dataset import (
     write_jsonl,
 )
 from .temporal_sampling import (
+    REFERENCE_POLICIES,
+    REFERENCE_POLICY_FIXED_ANCHOR,
+    REFERENCE_POLICY_SAMPLED_PRIOR,
     SequenceCasePlan,
     TemporalCaseSamplingPlan,
     plan_temporal_presence_cases,
     sequence_sampling_key,
 )
 from .tracking_samples import (
+    MEMORY_SUPERVISION_DISABLED,
+    MEMORY_SUPERVISION_EXPLICIT,
+    MEMORY_SUPERVISION_FEASIBILITY_NULL,
+    MEMORY_SUPERVISION_MODES,
     SOURCE_SCHEMA_VERSION,
+    MemoryUpdateLabel,
     TrackingSampleBuildReport,
     TrackingSampleConfig,
     build_tracking_samples,
+    load_memory_labels_jsonl,
 )
 
 __all__ = [
     "ValidationIssue",
     "ValidationReport",
     "SOURCE_SCHEMA_VERSION",
+    "MEMORY_SUPERVISION_DISABLED",
+    "MEMORY_SUPERVISION_EXPLICIT",
+    "MEMORY_SUPERVISION_FEASIBILITY_NULL",
+    "MEMORY_SUPERVISION_MODES",
+    "MemoryUpdateLabel",
     "TrackingSampleBuildReport",
     "TrackingSampleConfig",
     "build_tracking_samples",
+    "load_memory_labels_jsonl",
+    "REFERENCE_POLICIES",
+    "REFERENCE_POLICY_FIXED_ANCHOR",
+    "REFERENCE_POLICY_SAMPLED_PRIOR",
     "SequenceCasePlan",
     "TemporalCaseSamplingPlan",
     "plan_temporal_presence_cases",

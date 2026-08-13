@@ -1,4 +1,4 @@
-"""目标存在性与可选语义记忆任务共享的 Prompt 数据结构和 v4 输出约束。"""
+"""目标存在性与可选语义记忆任务共享的 Prompt 数据结构和输出约束。"""
 
 from dataclasses import dataclass
 

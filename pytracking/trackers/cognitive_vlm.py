@@ -15,7 +15,11 @@ import numpy as np
 import yaml
 
 from cogtrack.cognition import CognitiveDecisionEngine, CognitiveStateMachine, StateMachineConfig
-from cogtrack.context import TrackingContextBuilder
+from cogtrack.context import (
+    REFERENCE_MODE_BBOX_TEXT,
+    TrackingContextBuilder,
+    validate_reference_mode,
+)
 from cogtrack.memory import (
     GatedMemoryUpdatePolicy,
     IdentityAnchor,
@@ -113,6 +117,17 @@ class CognitiveVLMTracker(BaseTracker):
         self.context_mode = str(self.params.get("context_mode", "pair")).lower()
         if self.context_mode not in {"pair", "mosaic"}:
             raise ValueError("context_mode 只允许 pair/mosaic")
+        # 为复现旧实验，缺省仍是 bbox_text；新 v5 配置必须显式写 visual_box，避免同名
+        # 配置在代码升级后静默改变输入协议。
+        self.reference_mode = validate_reference_mode(
+            str(self.params.get("reference_mode", REFERENCE_MODE_BBOX_TEXT))
+        )
+        self.use_init_language = self.params.get("use_init_language", True)
+        if not isinstance(self.use_init_language, bool):
+            raise TypeError("use_init_language 必须是 bool")
+        self.mosaic_panel_height = int(self.params.get("mosaic_panel_height", 240))
+        if self.mosaic_panel_height <= 0:
+            raise ValueError("mosaic_panel_height 必须是正整数")
 
         # 零样本评测必须用模型的原生坐标约定：Qwen2.5-VL 起输出的是它自己看到
         # 那张图的绝对像素，让它给 norm1000 等于考它没被训过的格式。norm1000 保
@@ -144,6 +159,13 @@ class CognitiveVLMTracker(BaseTracker):
             min_bbox_iou_consistency=float(memory_config.get("min_bbox_iou_consistency", 0.0)),
             min_positive_frame_gap=int(memory_config.get("min_positive_frame_gap", 5)),
             min_semantic_frame_gap=int(memory_config.get("min_semantic_frame_gap", 30)),
+            semantic_confirmations=int(memory_config.get("semantic_confirmations", 1)),
+            max_semantic_confirmation_gap=int(
+                memory_config.get("max_semantic_confirmation_gap", 300)
+            ),
+            min_semantic_text_similarity=float(
+                memory_config.get("min_semantic_text_similarity", 0.35)
+            ),
         )
         self._bank_config = bank_config
         self._memory_policy = GatedMemoryUpdatePolicy(policy_config)
@@ -212,7 +234,11 @@ class CognitiveVLMTracker(BaseTracker):
     def initialize(self, image: np.ndarray, info: dict[str, Any]) -> dict[str, Any]:
         bbox = validate_xywh(info["init_bbox"])
         self.sequence_name = str(info.get("sequence_name") or info.get("seq_name") or "unknown")
-        self.target_text = str(info.get("init_nlp") or "").strip()
+        # visual-v5 主实验只依赖首帧框指代，避免部分数据集有语言、部分没有语言造成
+        # 额外监督差异。旧实验缺省仍保留 init_nlp，确保历史配置可复现。
+        self.target_text = (
+            str(info.get("init_nlp") or "").strip() if self.use_init_language else ""
+        )
         frame_path = str(info.get("frame_path") or "")
         self.anchor = IdentityAnchor(
             frame_id=0,
@@ -222,7 +248,12 @@ class CognitiveVLMTracker(BaseTracker):
             image=image.copy(),
         )
         self.memory_bank = MemoryBank(self.anchor, self._bank_config)
-        self.context_builder = TrackingContextBuilder(self.anchor, bbox_protocol=self.bbox_protocol)
+        self.context_builder = TrackingContextBuilder(
+            self.anchor,
+            bbox_protocol=self.bbox_protocol,
+            reference_mode=self.reference_mode,
+            mosaic_panel_height=self.mosaic_panel_height,
+        )
         transition = self.state_machine.initialize(0, bbox)
 
         prediction = Prediction(
@@ -367,21 +398,30 @@ class CognitiveVLMTracker(BaseTracker):
                 text="",
                 image_ref=str(info.get("frame_path") or ""),
                 image=image.copy(),
-                metadata={"effective_context_mode": context.effective_mode},
+                metadata={
+                    "effective_context_mode": context.effective_mode,
+                    "reference_mode": context.reference_mode,
+                    "visual_marker_version": context.visual_marker_version,
+                },
             )
             memory_decisions["visual"] = self._memory_policy.process(bank, visual_candidate)
 
         proposal = frame_result.cognition.memory_update_proposal
         proposal_error = frame_result.cognition.memory_update_error
         if frame_result.execution.status is not ExecutionStatus.OK or frame_result.prediction is None:
+            self._memory_policy.reset_semantic_pending()
             semantic_decision = MemoryUpdateDecision(False, "本帧执行未成功，禁止写入语义记忆")
         elif not self.memory_output_enabled:
+            self._memory_policy.reset_semantic_pending()
             semantic_decision = MemoryUpdateDecision(False, "二字段 presence-only 协议未请求语义记忆")
         elif proposal_error is not None:
+            self._memory_policy.reset_semantic_pending()
             semantic_decision = MemoryUpdateDecision(False, proposal_error)
         elif proposal is None:
+            self._memory_policy.reset_semantic_pending()
             semantic_decision = MemoryUpdateDecision(False, "模型选择 memory_update=null")
         elif not self.semantic_memory_enabled:
+            self._memory_policy.reset_semantic_pending()
             semantic_decision = MemoryUpdateDecision(False, "配置禁用语义记忆写入")
         else:
             prediction = frame_result.prediction
@@ -396,7 +436,11 @@ class CognitiveVLMTracker(BaseTracker):
                 text=proposal,
                 image_ref=str(info.get("frame_path") or ""),
                 image=image.copy(),
-                metadata={"effective_context_mode": context.effective_mode},
+                metadata={
+                    "effective_context_mode": context.effective_mode,
+                    "reference_mode": context.reference_mode,
+                    "visual_marker_version": context.visual_marker_version,
+                },
             )
             semantic_decision = self._memory_policy.process(bank, semantic_candidate)
         memory_decisions["semantic"] = semantic_decision
@@ -531,8 +575,14 @@ class CognitiveVLMTracker(BaseTracker):
 
         return {
             "context_mode": self.context_mode,
+            "reference_mode": self.reference_mode,
+            "use_init_language": self.use_init_language,
+            "mosaic_panel_height": self.mosaic_panel_height,
             "bbox_protocol": self.bbox_protocol,
+            "memory_enabled": self.memory_enabled,
             "memory_output_enabled": self.memory_output_enabled,
+            "semantic_memory_enabled": self.semantic_memory_enabled,
+            "memory_policy": asdict(self._memory_policy.config),
             "vlm_backend": describe_backend(self.backend),
             "generation": self.generation_config.to_dict(),
         }

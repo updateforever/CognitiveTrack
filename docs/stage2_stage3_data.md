@@ -16,6 +16,8 @@
   稀疏推理中它是“上一次实际 VLM 观测”，不一定是视频的上一帧。
 - 输入始终使用完整图像，不裁成目标模板。画框只是视觉指代标记，不能抹除场景，
   也不能把历史位置当作当前位置先验。
+- 主实验不输入数据集额外提供的自然语言描述，只用首帧视觉框定义实例；语言描述作为
+  单独消融，避免不同数据源的标注覆盖率造成混杂。
 - 统一监督三个字段：`target_status`、当前帧 bbox、`memory_update`。普通样本的
   `memory_update` 为 `null`，只有经过可靠来源或审核的稳定外观变化才为短文本。
 - pair、mosaic、长间隔、消失/重现、干净/扰动历史以及记忆样本在一个训练集中
@@ -85,10 +87,10 @@ Qwen3-VL 统一使用三字段严格 JSON：
 Qwen3 官方 `[0,1000] xyxy` 协议，并在 ms-swift assistant 侧使用官方 `<bbox>` 与
 `objects.image_id` 绑定最后一张当前图。输入指代方式改变不等于输出坐标协议改变。
 
-## 4. 待冻结 Prompt 草案
+## 4. 已冻结的 v5 Prompt 语义
 
-下面是新范式的候选 Prompt。正式生成数据前必须用基座、旧 Stage-2 adapter 做小规模
-回放，确认图片编号、两图退化和三字段解析后再提升版本号并冻结。
+下面语义已落实为 `cogtrack/prompts/visual_tracking.py` 的 v5.0.0。代码会按两图退化或
+三图 mosaic 生成准确的图片编号；本节保留可读版，运行时以版本化代码为准。
 
 ```text
 System:
@@ -121,14 +123,9 @@ Return exactly:
  "memory_update":"short new stable visual delta" or null}
 ```
 
-需要重点讨论并通过实验决定：
-
-- 是否在 Prompt 中称历史为 `trusted`，以免模型过度相信扰动框；候选措辞是
-  `accepted past observations whose boxes may be imperfect`；
-- 是否明确框的颜色。首版应固定一种高对比颜色与线宽，并加入少量颜色/线宽增强，
-  防止模型把某个 RGB 值当成任务本身；
-- 两图退化时是否沿用同一 Prompt。建议用同一 Prompt，只省略 history mosaic 说明，
-  避免产生两个输出协议。
+已经冻结：历史称为 `accepted past observations whose boxes may be imperfect`；首版
+使用版本化红框与自适应线宽；两图和三图复用同一决策语义与输出协议。颜色/线宽增强
+保留为后续消融，不混进第一个可复现 baseline。
 
 ## 5. 统一训练数据组成
 
@@ -214,13 +211,14 @@ grounding。GRPO 仅在 SFT benchmark、memory 时机标签和 reward 回放可�
 - memory 更新 precision/recall、过度更新率、漏更新率；
 - 一条记忆进入后对后续跟踪的因果收益，而不只是文本是否通顺。
 
-截至 2026-08-13，本文件描述的是新规划，尚未完成以下实现：
+截至 2026-08-13，在线 anchor/history 共享绘框、v5 Prompt、tracker 配置、三字段
+canonical/ms-swift 导出和跨帧 semantic proposal 确认门控已经实现，并完成小样本图片、
+processor 和单 case 模型 smoke。仍未完成：
 
-- 在线 anchor 图改为画框并移除参考坐标文本；
-- 新统一 Prompt 的代码、版本和 tracker 配置；
-- 与在线绘框完全一致的统一数据生成器；
-- 三字段混合数据包和训练；
-- 跨帧 semantic proposal 稳定确认门控；
-- 正式 benchmark 对比。
+- 论文版五类 case 的精确配额 planner 与 rollout-history 生成；
+- 带可靠 provenance 的正式 memory label manifest；
+- visual-v5 正式三字段混合数据包与 LoRA；
+- CognitiveBench-Tiny 聚合对比和 Full 主表。
 
-任何 AI 不得把旧 Stage-1/2 的完成状态描述为上述新范式已经完成。
+任何 AI 不得把工程 smoke、旧 Stage-1/2 或 `feasibility_null` 小数据描述为 visual-v5
+正式训练已经完成。

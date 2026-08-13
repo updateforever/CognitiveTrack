@@ -1,9 +1,10 @@
 # L40 训练服务器部署与 Stage-1 复现
 
 > **历史配方提示（2026-08-13）：** 本文保留用于复现已经完成的旧 Stage-1 二字段、
-> reference 坐标文本实验。下一版正式研究方案已改为“过去参考/历史图视觉画框 + 一次
-> 统一三字段混合 LoRA SFT”，尚未实现；不要直接用本文命令启动下一版正式训练。最新
-> 状态见 [`project_status_20260813.md`](project_status_20260813.md)，完整设计见
+> reference 坐标文本实验。visual-v5 工程入口已经实现，但正式数据与训练尚未完成；
+> 不要直接用本文命令启动新实验。新训练服务器流程见
+> [`visual_v5_iteration.md`](visual_v5_iteration.md)，实际状态与完整设计分别见
+> [`project_status_20260813.md`](project_status_20260813.md)、
 > [`stage2_stage3_data.md`](stage2_stage3_data.md)。
 
 本文是面向训练服务器部署与实验复现的操作说明。目标是在不复制现有 Conda

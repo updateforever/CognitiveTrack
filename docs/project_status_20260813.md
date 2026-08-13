@@ -1,8 +1,8 @@
 # CognitiveTrack 讨论交接摘要（2026-08-13）
 
-本文供研究讨论和其他 AI 快速接手。完整恢复约束见根目录 `AGENTS.md`，统一数据与
-Prompt 草案见 `docs/stage2_stage3_data.md`。本页严格区分“已经完成的旧实验”和
-“尚待实现的新方案”。
+本文供研究讨论和其他 AI 快速接手。完整恢复约束见根目录 `AGENTS.md`，统一数据设计
+见 `docs/stage2_stage3_data.md`，本机/训练服务器分工见 `docs/visual_v5_iteration.md`。
+本页严格区分“旧实验”“visual-v5 工程可行性”和“尚未完成的正式训练/评测”。
 
 ## 1. 最新研究决策
 
@@ -31,8 +31,12 @@ Prompt 草案见 `docs/stage2_stage3_data.md`。本页严格区分“已经完�
 
 - 本文随代码维护；恢复时以 `git rev-parse HEAD` 为准，不再引用讨论开始时的旧 HEAD；
 - CognitiveBench v1 冻结标注已纳入 Git：995 序列、1,408,438 帧、343,616 关键帧；
-- 最近一次代码验证：Ruff 通过、131 tests passed、CognitiveBench 冻结标注校验通过、
+- 最近一次代码验证：Ruff 通过、143 tests passed、CognitiveBench 冻结标注校验通过、
   `git diff --check` 通过。
+- visual-v5 的共享绘框、统一 Prompt、在线 context、三字段 canonical/ms-swift 导出、
+  tracker 配置与跨帧 semantic gate 已实现；旧 `bbox_text` 路径显式保留用于复现。
+- 本机 TNL2K 小数据已完成真实图片生成和 Qwen3 processor 回放；Qwen3-VL-4B 基座已在
+  CognitiveBench-Tiny 单 case 上完成真实推理、严格解析和坐标转换。
 
 旧范式训练：
 
@@ -69,46 +73,48 @@ Base、Stage-1 与 Stage-2 已在冻结的 CognitiveBench-Tiny v1 上使用相�
 规划的新视觉画框输入。完整协议、全部指标与限制见
 [`legacy_staged_tiny_results_20260813.md`](legacy_staged_tiny_results_20260813.md)。
 
-## 3. 当前代码仍是什么范式
+## 3. visual-v5 当前实现
 
-新方案尚未实现。当前 `TrackingContextBuilder`：
+新协议以独立配置启用，不会改变旧实验：
 
-- 首帧完整图不画框；
-- 首帧 bbox 作为 Prompt 坐标文本传入；
-- history mosaic panel 会画框；
-- 当前搜索图无框；
-- Tiny 对照运行已增加统一的 mosaic、三字段、memory-enabled 配置，并在 Base、Stage-1、
-  Stage-2 间只替换权重；但首帧输入仍是“无框完整图 + Prompt 坐标文本”，因此仍属旧
-  输入范式，不是本页规划的新视觉画框实现。
+- `reference_mode: visual_box` 时，首帧和历史 mosaic 调用同一个 `red_box_v1` 渲染器；
+- current 始终复制为无框完整图；没有可用历史时从三图自动退化为两图；
+- visual-v5 配置显式关闭 `init_nlp`，与不使用语言描述的训练数据保持一致；
+- Prompt v5 使用 `accepted past observations whose boxes may be imperfect`，不把动态历史
+  描述成绝对真值；
+- canonical 三字段样本要求明确的 memory 监督模式。`feasibility_null` 只允许链路检查，
+  正式构建必须提供含来源的逐帧 explicit label；
+- visual-v5 的 ms-swift 输入不含 reference `<bbox>`；present 的 assistant `<bbox>` 只绑定
+  最后一张 current，absent 不创建空 `objects`；
+- visual-v5 的 semantic proposal 需要两个相近的跨帧提议才落库；单次非空输出只留审计
+  记录，语义确认窗口独立为 300 帧以适配稀疏观测；
+- `qwen3vl_4b_visual_v5_base[_vllm].yaml`、`visual_v5_stage2_vllm.yaml` 和
+  `visual_v5_sft_vllm.yaml` 分别用于基座、旧 Stage-2 兼容性诊断和新 adapter。
 
-三字段严格 parser、semantic memory 回灌、视觉 history bank、memory gate 和逐帧审计
-JSONL 已接入，并在 Tiny 旧权重兼容性对照中运行。但旧 Stage-1/2 没有接受 memory
-监督，这次运行不能证明语义记忆学习有效，更不能等同于新视觉画框范式已验证。
+旧 Stage-1/2 没有接受 visual-v5 或 memory 监督，因此旧 Tiny 指标仍只是历史基线。新
+基座单 case 成功也只证明模型能理解任务和输出协议，不能宣称聚合性能提升。
 
-## 4. 下一步实现边界
+## 4. 下一步执行边界
 
-需要同时修改，不能只改 Prompt：
+1. 本机保持轻量：维护代码、生成 1–2 条序列、做像素审计/processor 回放/真实模型 smoke。
+2. 训练服务器先运行 `synthesize_visual_v5_dataset.py --plan-only`，冻结 7:3 同序列
+   present/absent sampling plan；新 plan 强制 `fixed_identity_anchor` 且 current 不重复。
+3. 对 plan 中 current frame 构造带 provenance 的 memory label manifest；不得机械地把
+   所有普通 bbox 样本补成 `null` 后声称已完成 memory 监督。
+4. 训练服务器重放 plan，生成 visual-v5 probe，先做两步 smoke 和小样本过拟合，再跑
+   一轮 LoRA。
+5. 对同一 probe 比较从基座初始化与从旧 Stage-2 初始化，随后在 CognitiveBench-Tiny
+   使用固定 visual-v5 推理配置聚合评测。
+6. probe 有明确增益后，再实现论文版 case-bucket planner、rollout history 与正式大包；
+   最终才运行 Full 和 GRPO。
 
-1. `cogtrack/context/builder.py`：首帧和所有历史统一使用同一个绘框函数；当前图无框。
-2. `cogtrack/prompts/pair.py`、`mosaic.py`、`common.py`：删除输入坐标文字，冻结统一
-   三字段 Prompt 和新版本号。
-3. 训练数据构造与 ms-swift 导出：输入不再使用 reference `<bbox>` object；assistant
-   bbox 仍通过官方 object 绑定最后一张图。
-4. tracker 配置：mosaic、memory output/semantic enabled、Stage-2 或新 adapter 路径。
-5. 测试：像素级确认参考/历史有框、current 无框；两图/三图的图片计数与 bbox image_id；
-   无 current/future GT；parser 和 memory gate。
-6. 先生成小数据做 processor 回放、两步 smoke、小样本过拟合，再生成正式混合数据。
+完整命令、标签格式与验收边界见
+[`visual_v5_iteration.md`](visual_v5_iteration.md)。
 
-## 5. 需要讨论并冻结的问题
+## 5. 已冻结与仍待实验决定
 
-- 框颜色、线宽是否固定，是否加入少量样式增强；
-- 历史 mosaic 是否足够突出最后一个 panel，还是给最近可信观测单独一张图；
-- Prompt 使用 `trusted history` 会不会让模型过度相信扰动框，是否改成
-  `accepted past observations whose boxes may be imperfect`；
-- 无动态历史时采用两图退化，还是始终保留一个空 history 占位；
-- 统一训练从基座开始还是从旧 Stage-2 adapter 继续，必须做同数据验证集消融；
-- 普通 `memory_update=null` 的自动标签边界，以及 MGIT appearance/action/activity/story
-  的审核策略；
-- semantic proposal 是否必须跨帧确认后才写入，避免单帧错误文本污染后续 Prompt。
+已冻结：首版固定红框和自适应线宽；最近历史保留在 mosaic；无历史使用两图退化；
+Prompt 明确历史框可能有误；semantic proposal 跨帧确认后才写入。
 
-推荐先冻结这些问题，再改代码和重建数据；否则 Prompt、渲染方式和数据会反复重做。
+仍待指标决定：统一 SFT 从基座还是旧 Stage-2 初始化；正式 memory 正例/难负例的审核
+规模；GT/jitter/rollout/stale history 的最终配额；红框样式增强是否能提升跨模型泛化。

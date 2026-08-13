@@ -4,9 +4,10 @@
 ``JSONL`` 和自包含图片资产组成，随后可交给 ``tracking/export_swift_dataset.py``
 转换为 SFT 或 GRPO 数据。
 
-监督信号严格限制为数据集可直接提供的 ``present/absent`` 与 bbox。本模块不
-生成身份、细粒度可见性、推理文本或置信度标签。present 但 bbox 无效的帧会被
-跳过，而不会被错误解释为 absent。
+基础监督严格限制为数据集可直接提供的 ``present/absent`` 与 bbox。visual-v5 的
+``memory_update`` 必须由调用方提供带来源的显式标签；本模块不会从普通 bbox 伪造
+语义文本，也不生成身份、细粒度可见性、推理文本或置信度。present 但 bbox 无效的
+帧会被跳过，而不会被错误解释为 absent。
 """
 
 from __future__ import annotations
@@ -25,11 +26,56 @@ from typing import Sequence as TypingSequence
 import cv2
 import numpy as np
 
-from cogtrack.prompts import PromptSpec, build_mosaic_prompt, build_pair_prompt
+from cogtrack.context.visual import (
+    REFERENCE_MODE_BBOX_TEXT,
+    REFERENCE_MODE_VISUAL_BOX,
+    VISUAL_MARKER_VERSION,
+    build_history_mosaic,
+    draw_reference_box,
+    validate_reference_mode,
+)
+from cogtrack.prompts import (
+    PromptSpec,
+    build_mosaic_prompt,
+    build_pair_prompt,
+    build_visual_tracking_prompt,
+)
 from cogtrack.protocol import BoundingBoxError, clip_xywh, pixel_xywh_to_norm1000_xyxy
 from pytracking.evaluation.data import Sequence
 
-SOURCE_SCHEMA_VERSION = "cogtrack.training.source.v4"
+SOURCE_SCHEMA_VERSION = "cogtrack.training.source.v5"
+MEMORY_SUPERVISION_DISABLED = "disabled"
+MEMORY_SUPERVISION_FEASIBILITY_NULL = "feasibility_null"
+MEMORY_SUPERVISION_EXPLICIT = "explicit"
+MEMORY_SUPERVISION_MODES = frozenset(
+    {
+        MEMORY_SUPERVISION_DISABLED,
+        MEMORY_SUPERVISION_FEASIBILITY_NULL,
+        MEMORY_SUPERVISION_EXPLICIT,
+    }
+)
+
+
+@dataclass(frozen=True)
+class MemoryUpdateLabel:
+    """一帧显式语义记忆监督及其可审计来源。"""
+
+    value: str | None
+    source: str
+    reviewed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.value is not None:
+            if not isinstance(self.value, str) or not self.value.strip():
+                raise ValueError("非空 memory_update 标签必须是非空字符串")
+            normalized = " ".join(self.value.split())
+            if len(normalized) > 256 or len(normalized.split()) > 30:
+                raise ValueError("memory_update 标签必须不超过 256 字符且不超过 30 个词")
+            object.__setattr__(self, "value", normalized)
+        if not isinstance(self.source, str) or not self.source.strip():
+            raise ValueError("memory label source 必须是非空字符串")
+        if not isinstance(self.reviewed, bool):
+            raise TypeError("memory label reviewed 必须是 bool")
 
 
 @dataclass(frozen=True)
@@ -50,6 +96,8 @@ class TrackingSampleConfig:
     jpeg_quality: int = 95
     reuse_existing_assets: bool = False
     history_corruption_ratio: float = 0.0
+    reference_mode: str = REFERENCE_MODE_BBOX_TEXT
+    memory_supervision: str = MEMORY_SUPERVISION_DISABLED
 
     def __post_init__(self) -> None:
         if self.mode not in {"pair", "mosaic", "both"}:
@@ -80,6 +128,16 @@ class TrackingSampleConfig:
                 raise ValueError("max_image_side 必须为正整数或 None")
         if self.present_only and self.balance_presence:
             raise ValueError("present_only 与 balance_presence 不能同时启用")
+        object.__setattr__(self, "reference_mode", validate_reference_mode(self.reference_mode))
+        if self.memory_supervision not in MEMORY_SUPERVISION_MODES:
+            raise ValueError(
+                f"memory_supervision 必须是 {sorted(MEMORY_SUPERVISION_MODES)} 之一"
+            )
+        if (
+            self.reference_mode == REFERENCE_MODE_VISUAL_BOX
+            and self.memory_supervision == MEMORY_SUPERVISION_DISABLED
+        ):
+            raise ValueError("visual_box v5 训练样本必须启用三字段 memory_update 监督")
 
 
 @dataclass(frozen=True)
@@ -107,6 +165,10 @@ class TrackingSampleBuildReport:
     skipped_unknown_presence: int
     history_corruption_ratio: float
     corrupted_mosaic_count: int
+    memory_supervision: str
+    memory_null_count: int
+    memory_non_null_count: int
+    visual_marker_version: str | None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -124,6 +186,8 @@ class _MutableStats:
     skipped_invalid_bbox: int = 0
     skipped_unknown_presence: int = 0
     corrupted_mosaic_count: int = 0
+    memory_null_count: int = 0
+    memory_non_null_count: int = 0
 
 
 def _safe_component(value: str) -> str:
@@ -212,24 +276,6 @@ def _scale_bbox_to_image(
         float(bbox[3]) * scale_y,
     )
     return _clip_bbox_to_image(scaled, image)
-def _draw_reference(
-    image: np.ndarray,
-    bbox_xywh: TypingSequence[float],
-    *,
-    color: tuple[int, int, int] = (0, 255, 0),
-) -> np.ndarray:
-    """在 RGB 副本上绘制指定颜色的可信框，不修改原图。"""
-
-    output = np.ascontiguousarray(image.copy())
-    height, width = output.shape[:2]
-    x, y, box_width, box_height = clip_xywh(bbox_xywh, width, height)
-    x1 = max(0, min(width - 1, int(round(x))))
-    y1 = max(0, min(height - 1, int(round(y))))
-    x2 = max(x1, min(width - 1, int(round(x + box_width))))
-    y2 = max(y1, min(height - 1, int(round(y + box_height))))
-    thickness = max(2, int(round(min(width, height) / 180.0)))
-    cv2.rectangle(output, (x1, y1), (x2, y2), color, thickness)
-    return output
 
 
 def _resize_long_side(image: np.ndarray, max_image_side: int | None) -> np.ndarray:
@@ -245,45 +291,6 @@ def _resize_long_side(image: np.ndarray, max_image_side: int | None) -> np.ndarr
     resized_width = max(1, int(round(width * scale)))
     resized_height = max(1, int(round(height * scale)))
     return cv2.resize(image, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
-
-
-def _build_mosaic(
-    panels: list[tuple[int, np.ndarray, tuple[float, float, float, float]]],
-    *,
-    panel_height: int,
-) -> np.ndarray:
-    """用过去 GT 模拟在线已接受的可信框，并按时间顺序拼成 RGB mosaic。"""
-
-    rendered: list[np.ndarray] = []
-    for _frame_id, image, bbox in panels:
-        # RGB 红框与在线 ContextBuilder 的可信正记忆渲染保持一致。GT 只来自过去帧，
-        # 用于 teacher-forcing 历史上下文，不包含 current 或未来标签。
-        panel = _draw_reference(image, bbox, color=(255, 0, 0))
-        height, width = panel.shape[:2]
-        resized_width = max(1, int(round(width * panel_height / float(height))))
-        interpolation = cv2.INTER_AREA if panel_height < height else cv2.INTER_LINEAR
-        panel = cv2.resize(panel, (resized_width, panel_height), interpolation=interpolation)
-        # 不把绝对帧号写进视觉输入；时间顺序由 panel 的排列表达，frame_id 只保留在
-        # metadata/history_frame_ids 中供审计，避免模型学习数据集位置偏置。
-        rendered.append(panel)
-
-    if not rendered:
-        raise ValueError("构造 mosaic 至少需要一个有效历史帧")
-    columns = 1 if len(rendered) <= 2 else 2
-    rows = (len(rendered) + columns - 1) // columns
-    cell_width = max(panel.shape[1] for panel in rendered)
-    cell_height = panel_height
-    canvas = np.full(
-        (rows * cell_height, columns * cell_width, 3),
-        220,
-        dtype=np.uint8,
-    )
-    for index, panel in enumerate(rendered):
-        row, column = divmod(index, columns)
-        x = column * cell_width + (cell_width - panel.shape[1]) // 2
-        y = row * cell_height
-        canvas[y : y + panel.shape[0], x : x + panel.shape[1]] = panel
-    return canvas
 
 
 def _corrupt_history_panels(
@@ -502,18 +509,32 @@ def _answer(
     *,
     presence: str,
     bbox_norm1000_xyxy: tuple[float, float, float, float] | None,
+    memory_supervision: str,
+    memory_label: MemoryUpdateLabel | None,
 ) -> dict[str, Any]:
     if presence == "present":
         if bbox_norm1000_xyxy is None:
             raise ValueError("present 训练样本必须包含有效的 norm1000 bbox")
-        return {
+        answer: dict[str, Any] = {
             "target_status": "present",
             "bbox_norm1000_xyxy": list(bbox_norm1000_xyxy) if bbox_norm1000_xyxy else None,
         }
-    return {
-        "target_status": "absent",
-        "bbox_norm1000_xyxy": None,
-    }
+    else:
+        answer = {
+            "target_status": "absent",
+            "bbox_norm1000_xyxy": None,
+        }
+
+    if memory_supervision == MEMORY_SUPERVISION_DISABLED:
+        if memory_label is not None:
+            raise ValueError("memory_supervision=disabled 时不能传入 memory label")
+        return answer
+    if memory_label is None:
+        raise ValueError("三字段样本必须有显式 MemoryUpdateLabel")
+    if presence == "absent" and memory_label.value is not None:
+        raise ValueError("absent 样本的 memory_update 必须为 null")
+    answer["memory_update"] = memory_label.value
+    return answer
 
 
 def _record(
@@ -531,6 +552,9 @@ def _record(
     effective_mode: str,
     presence: str,
     bbox_norm1000_xyxy: tuple[float, float, float, float] | None,
+    reference_mode: str,
+    memory_supervision: str,
+    memory_label: MemoryUpdateLabel | None,
 ) -> dict[str, Any]:
     images = [reference_path]
     if history_path is not None:
@@ -543,8 +567,10 @@ def _record(
     answer = _answer(
         presence=presence,
         bbox_norm1000_xyxy=bbox_norm1000_xyxy,
+        memory_supervision=memory_supervision,
+        memory_label=memory_label,
     )
-    return {
+    row = {
         "schema_version": SOURCE_SCHEMA_VERSION,
         "id": (
             f"{sequence.dataset}::{sequence.name}::{reference_frame_id:08d}::{frame_id:08d}::"
@@ -566,15 +592,112 @@ def _record(
             "frame_id": frame_id,
             "reference_frame_id": reference_frame_id,
             "reference_bbox_norm1000_xyxy": list(reference_bbox_norm1000_xyxy),
-            "reference_mode": "full_frame_bbox_text",
+            "reference_mode": reference_mode,
+            "visual_marker_version": (
+                VISUAL_MARKER_VERSION if reference_mode == REFERENCE_MODE_VISUAL_BOX else None
+            ),
             "history_frame_ids": history_frame_ids,
             "requested_mode": requested_mode,
             "effective_mode": effective_mode,
             "prompt_name": prompt.name,
             "prompt_version": prompt.version,
             "bbox_format": "norm1000_xyxy",
+            "memory_supervision": memory_supervision,
+            "memory_label_source": memory_label.source if memory_label is not None else None,
+            "memory_label_reviewed": memory_label.reviewed if memory_label is not None else None,
+            # 当前通用构造器只验证第三字段输出；论文版 memory case 还需显式回放更早
+            # 已接受语义记忆，并提升 schema 后再把此字段设为 true。
+            "uses_semantic_memory_input": False,
         },
     }
+    if "memory_update" in answer:
+        row["memory_update"] = answer["memory_update"]
+    return row
+
+
+def _coerce_memory_label(value: Any) -> MemoryUpdateLabel:
+    if isinstance(value, MemoryUpdateLabel):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("显式 memory label 必须是 MemoryUpdateLabel 或 mapping")
+    if "memory_update" not in value:
+        raise ValueError("显式 memory label mapping 缺少 memory_update")
+    return MemoryUpdateLabel(
+        value=value.get("memory_update"),
+        source=str(value.get("source", "")),
+        reviewed=value.get("reviewed", False),
+    )
+
+
+def load_memory_labels_jsonl(
+    path: str | Path,
+) -> dict[str, dict[int, MemoryUpdateLabel]]:
+    """读取可审计的逐帧 ``memory_update`` 标签。
+
+    JSONL 每行对应一个 current frame，必须包含 ``dataset``、``sequence``、
+    ``frame_id``、``memory_update`` 和非空 ``source``。把读取逻辑放在训练模块而非
+    某个 CLI 中，保证单数据集 dry-run 与多数据集正式构建执行完全相同的校验。
+    """
+
+    label_path = Path(path).expanduser().resolve()
+    labels: dict[str, dict[int, MemoryUpdateLabel]] = {}
+    with label_path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"memory label JSONL 解析失败：{label_path}:{line_no}: {exc}"
+                ) from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"memory label 每行必须是对象：{label_path}:{line_no}")
+            dataset = str(row.get("dataset", row.get("source_dataset", ""))).strip()
+            sequence = str(row.get("sequence", row.get("source_sequence", ""))).strip()
+            if not dataset or not sequence or "frame_id" not in row or "memory_update" not in row:
+                raise ValueError(
+                    "memory label 缺少 dataset/sequence/frame_id/memory_update："
+                    f"{label_path}:{line_no}"
+                )
+            frame_id = int(row["frame_id"])
+            if frame_id < 0:
+                raise ValueError(f"memory label frame_id 不能为负数：{label_path}:{line_no}")
+            key = f"{dataset}::{sequence}"
+            per_sequence = labels.setdefault(key, {})
+            if frame_id in per_sequence:
+                raise ValueError(f"重复 memory label：{key} frame={frame_id}")
+            per_sequence[frame_id] = MemoryUpdateLabel(
+                value=row["memory_update"],
+                source=str(row.get("source", "")),
+                reviewed=row.get("reviewed", False),
+            )
+    if not labels:
+        raise ValueError(f"memory label 文件为空：{label_path}")
+    return labels
+
+
+def _memory_label_for_frame(
+    *,
+    memory_supervision: str,
+    labels_by_sequence: Mapping[str, Mapping[int, Any]] | None,
+    sequence_key: str,
+    frame_id: int,
+) -> MemoryUpdateLabel | None:
+    if memory_supervision == MEMORY_SUPERVISION_DISABLED:
+        return None
+    if memory_supervision == MEMORY_SUPERVISION_FEASIBILITY_NULL:
+        return MemoryUpdateLabel(
+            value=None,
+            source="feasibility_null_only_not_for_formal_training",
+            reviewed=False,
+        )
+    if labels_by_sequence is None or sequence_key not in labels_by_sequence:
+        raise ValueError(f"显式 memory 监督缺少序列标签：{sequence_key}")
+    frame_labels = labels_by_sequence[sequence_key]
+    if frame_id not in frame_labels:
+        raise ValueError(f"显式 memory 监督缺少帧标签：{sequence_key} frame={frame_id}")
+    return _coerce_memory_label(frame_labels[frame_id])
 
 
 def build_tracking_samples(
@@ -586,6 +709,7 @@ def build_tracking_samples(
     frame_ids_by_sequence: Mapping[str, TypingSequence[int]] | None = None,
     anchor_frame_ids_by_sequence: Mapping[str, int] | None = None,
     reference_frame_ids_by_sequence: Mapping[str, TypingSequence[int]] | None = None,
+    memory_labels_by_sequence: Mapping[str, Mapping[int, Any]] | None = None,
 ) -> TrackingSampleBuildReport:
     """流式构建源 JSONL 与图片资产，避免百万帧数据集占满内存。
 
@@ -600,9 +724,16 @@ def build_tracking_samples(
             有效 present 帧初始化时使用；未提供则严格使用标准 frame 0。
         reference_frame_ids_by_sequence: 可选的逐 case reference frame 计划；每个
             reference 必须早于对应的 current frame。未提供时所有 case 使用 anchor。
+        memory_labels_by_sequence: ``memory_supervision=explicit`` 时必填；键为
+            ``dataset::sequence``，内层键为 current frame_id。每条标签必须同时记录
+            ``memory_update``、``source`` 和可选 ``reviewed``。
     """
 
     options = config or TrackingSampleConfig()
+    if options.memory_supervision == MEMORY_SUPERVISION_EXPLICIT and memory_labels_by_sequence is None:
+        raise ValueError("memory_supervision=explicit 必须提供 memory_labels_by_sequence")
+    if options.memory_supervision != MEMORY_SUPERVISION_EXPLICIT and memory_labels_by_sequence is not None:
+        raise ValueError("只有 memory_supervision=explicit 才能提供 memory_labels_by_sequence")
     root = Path(output_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     source_path = root / "source_samples.jsonl"
@@ -662,11 +793,21 @@ def build_tracking_samples(
                 sequence_dir = _safe_component(sequence.name)
                 asset_dir = root / "images" / dataset_dir / sequence_dir
                 image_cache: dict[int, np.ndarray] = {}
-                reference_asset = asset_dir / f"reference_{anchor_frame_id:08d}.jpg"
+                reference_prefix = (
+                    "reference_boxed"
+                    if options.reference_mode == REFERENCE_MODE_VISUAL_BOX
+                    else "reference"
+                )
+                reference_asset = asset_dir / f"{reference_prefix}_{anchor_frame_id:08d}.jpg"
+                rendered_anchor = (
+                    draw_reference_box(anchor_image, anchor_bbox)
+                    if options.reference_mode == REFERENCE_MODE_VISUAL_BOX
+                    else anchor_image
+                )
                 _write_rgb(
                     reference_asset,
                     _resize_long_side(
-                        anchor_image,
+                        rendered_anchor,
                         options.max_image_side,
                     ),
                     jpeg_quality=options.jpeg_quality,
@@ -675,7 +816,7 @@ def build_tracking_samples(
                 )
                 image_cache[anchor_frame_id] = anchor_image
                 written_assets.add(reference_asset)
-                reference_relative = reference_asset.relative_to(root).as_posix()
+                anchor_reference_relative = reference_asset.relative_to(root).as_posix()
                 target_text = ""
                 if options.use_language_description:
                     target_text = (
@@ -702,6 +843,7 @@ def build_tracking_samples(
                 ):
                     reference_frame_id = anchor_frame_id
                     reference_bbox_norm = anchor_bbox_norm
+                    reference_relative = anchor_reference_relative
                     if planned_reference_frame_ids is not None:
                         reference_frame_id = int(planned_reference_frame_ids[planned_index])
                         planned_index += 1
@@ -715,15 +857,14 @@ def build_tracking_samples(
                                 f"序列 {sequence.name} 的 reference frame {reference_frame_id} 必须是有效 present 帧"
                             )
                         if reference_frame_id != anchor_frame_id:
-                            reference_asset_for_case = asset_dir / f"reference_{reference_frame_id:08d}.jpg"
-                            reference_source = (
-                                reference_asset_for_case
-                                if options.reuse_existing_assets and reference_asset_for_case.is_file()
-                                else sequence.frames[reference_frame_id]
+                            reference_asset_for_case = asset_dir / (
+                                f"{reference_prefix}_{reference_frame_id:08d}.jpg"
                             )
                             reference_image = image_cache.get(reference_frame_id)
                             if reference_image is None:
-                                reference_image = _read_rgb(reference_source)
+                                # 即使复用输出资产，也必须从未画框源帧读取；否则 visual_box
+                                # 重放会在已有框上二次绘制，破坏数据确定性。
+                                reference_image = _read_rgb(sequence.frames[reference_frame_id])
                                 image_cache[reference_frame_id] = reference_image
                             reference_bbox = _scale_bbox_to_image(
                                 _raw_bbox(sequence, reference_frame_id), reference_image, source_size
@@ -737,9 +878,14 @@ def build_tracking_samples(
                                 reference_bbox, ref_width, ref_height
                             )
                             if reference_asset_for_case not in written_assets:
+                                rendered_reference = (
+                                    draw_reference_box(reference_image, reference_bbox)
+                                    if options.reference_mode == REFERENCE_MODE_VISUAL_BOX
+                                    else reference_image
+                                )
                                 _write_rgb(
                                     reference_asset_for_case,
-                                    _resize_long_side(reference_image, options.max_image_side),
+                                    _resize_long_side(rendered_reference, options.max_image_side),
                                     jpeg_quality=options.jpeg_quality,
                                     overwrite=overwrite,
                                     reuse_existing=options.reuse_existing_assets,
@@ -780,21 +926,36 @@ def build_tracking_samples(
                         )
                         written_assets.add(current_asset)
                     current_relative = current_asset.relative_to(root).as_posix()
+                    memory_label = _memory_label_for_frame(
+                        memory_supervision=options.memory_supervision,
+                        labels_by_sequence=memory_labels_by_sequence,
+                        sequence_key=plan_key,
+                        frame_id=frame_id,
+                    )
+                    include_memory_update = options.memory_supervision != MEMORY_SUPERVISION_DISABLED
 
                     contexts: list[tuple[str, str, str | None, list[int], PromptSpec, str | None]] = []
                     if options.mode in {"pair", "both"}:
+                        if options.reference_mode == REFERENCE_MODE_VISUAL_BOX:
+                            pair_prompt = build_visual_tracking_prompt(
+                                history_count=0,
+                                target_text=target_text,
+                                include_memory_update=include_memory_update,
+                            )
+                        else:
+                            pair_prompt = build_pair_prompt(
+                                target_text=target_text,
+                                reference_has_box=False,
+                                reference_bbox_norm1000_xyxy=reference_bbox_norm,
+                                include_memory_update=include_memory_update,
+                            )
                         contexts.append(
                             (
                                 "pair",
                                 "pair",
                                 None,
                                 [],
-                                build_pair_prompt(
-                                    target_text=target_text,
-                                    reference_has_box=False,
-                                    reference_bbox_norm1000_xyxy=reference_bbox_norm,
-                                    include_memory_update=False,
-                                ),
+                                pair_prompt,
                                 None,
                             )
                         )
@@ -812,12 +973,19 @@ def build_tracking_samples(
                             source_size=source_size,
                         )
                         if panels:
-                            prompt = build_mosaic_prompt(
-                                len(panels),
-                                target_text=target_text,
-                                reference_bbox_norm1000_xyxy=reference_bbox_norm,
-                                include_memory_update=False,
-                            )
+                            if options.reference_mode == REFERENCE_MODE_VISUAL_BOX:
+                                prompt = build_visual_tracking_prompt(
+                                    history_count=len(panels),
+                                    target_text=target_text,
+                                    include_memory_update=include_memory_update,
+                                )
+                            else:
+                                prompt = build_mosaic_prompt(
+                                    len(panels),
+                                    target_text=target_text,
+                                    reference_bbox_norm1000_xyxy=reference_bbox_norm,
+                                    include_memory_update=include_memory_update,
+                                )
                             variants: list[
                                 tuple[
                                     list[
@@ -851,7 +1019,10 @@ def build_tracking_samples(
                                 _write_rgb(
                                     history_asset,
                                     _resize_long_side(
-                                        _build_mosaic(variant_panels, panel_height=options.mosaic_panel_height),
+                                        build_history_mosaic(
+                                            [(item[1], item[2]) for item in variant_panels],
+                                            panel_height=options.mosaic_panel_height,
+                                        ),
                                         options.max_image_side,
                                     ),
                                     jpeg_quality=options.jpeg_quality,
@@ -874,18 +1045,26 @@ def build_tracking_samples(
                         elif options.mode == "mosaic":
                             # 纯 mosaic 构建需要与在线推理保持一致：尚无可信历史时
                             # 退化为 pair。both 模式已经生成 pair，不再复制同一条样本。
+                            if options.reference_mode == REFERENCE_MODE_VISUAL_BOX:
+                                fallback_prompt = build_visual_tracking_prompt(
+                                    history_count=0,
+                                    target_text=target_text,
+                                    include_memory_update=include_memory_update,
+                                )
+                            else:
+                                fallback_prompt = build_pair_prompt(
+                                    target_text=target_text,
+                                    reference_has_box=False,
+                                    reference_bbox_norm1000_xyxy=reference_bbox_norm,
+                                    include_memory_update=include_memory_update,
+                                )
                             contexts.append(
                                 (
                                     "mosaic",
                                     "pair",
                                     None,
                                     [],
-                                    build_pair_prompt(
-                                        target_text=target_text,
-                                        reference_has_box=False,
-                                        reference_bbox_norm1000_xyxy=reference_bbox_norm,
-                                        include_memory_update=False,
-                                    ),
+                                    fallback_prompt,
                                     None,
                                 )
                             )
@@ -905,6 +1084,9 @@ def build_tracking_samples(
                             effective_mode=effective_mode,
                             presence=presence,
                             bbox_norm1000_xyxy=bbox_norm,
+                            reference_mode=options.reference_mode,
+                            memory_supervision=options.memory_supervision,
+                            memory_label=memory_label,
                         )
                         row["metadata"]["source_split"] = sequence.metadata.get("split")
                         row["metadata"]["used_language_description"] = bool(target_text)
@@ -919,6 +1101,9 @@ def build_tracking_samples(
                         stats.absent_count += int(presence == "absent")
                         stats.pair_count += int(effective_mode == "pair")
                         stats.mosaic_count += int(effective_mode == "mosaic")
+                        if memory_label is not None:
+                            stats.memory_null_count += int(memory_label.value is None)
+                            stats.memory_non_null_count += int(memory_label.value is not None)
                 stats.sequences_with_samples += int(sequence_samples > 0)
 
         if stats.sequence_count == 0:
@@ -938,7 +1123,7 @@ def build_tracking_samples(
         use_language_description=options.use_language_description,
         max_image_side=options.max_image_side,
         sampling_plan_applied=frame_ids_by_sequence is not None,
-        reference_mode="full_frame_bbox_text",
+        reference_mode=options.reference_mode,
         source_jsonl=source_path.relative_to(root).as_posix(),
         image_root=".",
         sequence_count=stats.sequence_count,
@@ -952,14 +1137,26 @@ def build_tracking_samples(
         skipped_unknown_presence=stats.skipped_unknown_presence,
         history_corruption_ratio=options.history_corruption_ratio,
         corrupted_mosaic_count=stats.corrupted_mosaic_count,
+        memory_supervision=options.memory_supervision,
+        memory_null_count=stats.memory_null_count,
+        memory_non_null_count=stats.memory_non_null_count,
+        visual_marker_version=(
+            VISUAL_MARKER_VERSION if options.reference_mode == REFERENCE_MODE_VISUAL_BOX else None
+        ),
     )
     report_path.write_text(json.dumps(report.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return report
 
 
 __all__ = [
+    "MEMORY_SUPERVISION_DISABLED",
+    "MEMORY_SUPERVISION_EXPLICIT",
+    "MEMORY_SUPERVISION_FEASIBILITY_NULL",
+    "MEMORY_SUPERVISION_MODES",
+    "MemoryUpdateLabel",
     "SOURCE_SCHEMA_VERSION",
     "TrackingSampleBuildReport",
     "TrackingSampleConfig",
     "build_tracking_samples",
+    "load_memory_labels_jsonl",
 ]

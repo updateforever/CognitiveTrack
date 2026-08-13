@@ -3,6 +3,7 @@
 import re
 import threading
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from typing import Any, Mapping, Optional
 
 from ..protocol.bbox import BBoxXYWH, bbox_iou_xywh, validate_xywh
@@ -65,22 +66,33 @@ class MemoryUpdatePolicyConfig:
     min_bbox_iou_consistency: float = 0.0
     min_positive_frame_gap: int = 5
     min_semantic_frame_gap: int = 30
+    # 缺省 1 保持旧 tracker 的即时语义写入行为；visual-v5 配置显式设为 2。
+    semantic_confirmations: int = 1
+    max_semantic_confirmation_gap: int = 300
+    min_semantic_text_similarity: float = 0.35
 
     def __post_init__(self) -> None:
-        value = float(self.min_bbox_iou_consistency)
-        if not 0.0 <= value <= 1.0:
+        bbox_iou = float(self.min_bbox_iou_consistency)
+        if not 0.0 <= bbox_iou <= 1.0:
             raise ValueError("min_bbox_iou_consistency 必须位于 [0, 1]")
+        text_similarity = float(self.min_semantic_text_similarity)
+        if not 0.0 <= text_similarity <= 1.0:
+            raise ValueError("min_semantic_text_similarity 必须位于 [0, 1]")
         for field_name in (
             "consecutive_positive_confirmations",
             "max_confirmation_gap",
             "min_positive_frame_gap",
             "min_semantic_frame_gap",
+            "semantic_confirmations",
+            "max_semantic_confirmation_gap",
         ):
             value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{field_name} 必须是非负整数")
         if self.consecutive_positive_confirmations < 1:
             raise ValueError("consecutive_positive_confirmations 至少为 1")
+        if self.semantic_confirmations < 1:
+            raise ValueError("semantic_confirmations 至少为 1")
 
 
 @dataclass(frozen=True)
@@ -109,19 +121,45 @@ class GatedMemoryUpdatePolicy:
         self._last_candidate_bbox: Optional[BBoxXYWH] = None
         self._last_positive_update_frame: Optional[int] = None
         self._last_semantic_update_frame: Optional[int] = None
+        self._pending_semantic_frame: Optional[int] = None
+        self._pending_semantic_text = ""
+        self._semantic_streak = 0
         self._record_counter = 0
         self._lock = threading.RLock()
 
     def reset_pending(self) -> None:
-        """在 absent、uncertain 或执行错误后中止尚未完成的正记忆确认。"""
+        """在 absent、uncertain 或执行错误后中止所有尚未完成的跨帧确认。"""
 
         with self._lock:
             self._positive_streak = 0
             self._last_candidate_frame = None
             self._last_candidate_bbox = None
+            self._reset_semantic_pending_unlocked()
 
-    def _reject(self, reason: str) -> MemoryUpdateDecision:
-        return MemoryUpdateDecision(False, reason, self._positive_streak)
+    def _reset_semantic_pending_unlocked(self) -> None:
+        self._pending_semantic_frame = None
+        self._pending_semantic_text = ""
+        self._semantic_streak = 0
+
+    def reset_semantic_pending(self) -> None:
+        """当模型本帧返回 null/非法提议时打断语义变化连续确认。"""
+
+        with self._lock:
+            self._reset_semantic_pending_unlocked()
+
+    @staticmethod
+    def _semantic_similarity(first: str, second: str) -> float:
+        """计算轻量、多语言可用的提议相似度，不引入额外模型推理。"""
+
+        normalized_first = " ".join(first.casefold().split())
+        normalized_second = " ".join(second.casefold().split())
+        if not normalized_first or not normalized_second:
+            return 0.0
+        return SequenceMatcher(None, normalized_first, normalized_second).ratio()
+
+    def _reject(self, reason: str, confirmations: int | None = None) -> MemoryUpdateDecision:
+        count = self._positive_streak if confirmations is None else confirmations
+        return MemoryUpdateDecision(False, reason, count)
 
     def _new_record(self, candidate: MemoryCandidate) -> MemoryRecord:
         self._record_counter += 1
@@ -162,10 +200,43 @@ class GatedMemoryUpdatePolicy:
                 return self._reject("只有 identity_match=same 的观测可更新正/语义记忆")
             if candidate.kind is MemoryKind.SEMANTIC:
                 if not candidate.text.strip():
+                    self._reset_semantic_pending_unlocked()
                     return self._reject("语义记忆文本为空")
                 if _is_noop_semantic_text(candidate.text):
+                    self._reset_semantic_pending_unlocked()
                     return self._reject("模型用文本表达无变化，按 memory_update=null 处理")
-                return MemoryUpdateDecision(True, "离散状态一致且文本非空的语义证据", 1, self._new_record(candidate))
+                text = " ".join(candidate.text.split())
+                within_gap = (
+                    self._pending_semantic_frame is not None
+                    and candidate.frame_id > self._pending_semantic_frame
+                    and candidate.frame_id - self._pending_semantic_frame
+                    <= self.config.max_semantic_confirmation_gap
+                )
+                similarity = (
+                    self._semantic_similarity(self._pending_semantic_text, text)
+                    if within_gap
+                    else 0.0
+                )
+                if within_gap and similarity >= self.config.min_semantic_text_similarity:
+                    self._semantic_streak += 1
+                else:
+                    self._semantic_streak = 1
+                self._pending_semantic_frame = candidate.frame_id
+                self._pending_semantic_text = text
+                if self._semantic_streak < self.config.semantic_confirmations:
+                    return self._reject(
+                        "等待跨帧相近 memory_update 提议确认"
+                        f"（{self._semantic_streak}/{self.config.semantic_confirmations}）",
+                        self._semantic_streak,
+                    )
+                confirmations = self._semantic_streak
+                self._reset_semantic_pending_unlocked()
+                return MemoryUpdateDecision(
+                    True,
+                    f"跨帧相近语义提议已确认（similarity={similarity:.3f}）",
+                    confirmations,
+                    self._new_record(candidate),
+                )
 
             # 正视觉记忆应包含可定位目标，便于后续正确裁剪和 mosaic。
             if candidate.bbox_xywh is None:

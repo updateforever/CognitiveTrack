@@ -89,3 +89,46 @@ def test_materialized_assistant_remains_strict_json() -> None:
         "bbox_pixel_xyxy": [10, 20, 30, 40],
     }
     assert json.loads(json.dumps(payload)) == payload
+
+
+def _visual_row(*, status: str) -> dict:
+    row = _row(status=status)
+    row["metadata"]["reference_mode"] = "visual_box"
+    row["metadata"]["visual_marker_version"] = "red_box_v1"
+    row["assistant"] = {
+        "target_status": status,
+        "bbox_norm1000_xyxy": row["bbox_norm1000_xyxy"],
+        "memory_update": None,
+    }
+    return row
+
+
+def test_visual_box_export_removes_input_bbox_object_and_keeps_current_output_binding(
+    tmp_path: Path,
+) -> None:
+    _image(tmp_path / "images/ref.jpg", (200, 100))
+    _image(tmp_path / "images/current.jpg", (400, 200))
+
+    present = to_qwen_grounding_record(
+        _visual_row(status="present"), image_root=tmp_path, model_family="qwen3_vl"
+    )
+    absent = to_qwen_grounding_record(
+        _visual_row(status="absent"), image_root=tmp_path, model_family="qwen3_vl"
+    )
+
+    assert present["objects"] == {
+        "bbox": [[200.0, 80.0, 320.0, 160.0]],
+        "bbox_type": "real",
+        "image_id": [1],
+    }
+    assert "objects" not in absent
+    assert present["messages"][2]["content"] == (
+        '{"target_status":"present","bbox_norm1000_xyxy":<bbox>,"memory_update":null}'
+    )
+    assert absent["messages"][2]["content"] == (
+        '{"target_status":"absent","bbox_norm1000_xyxy":null,"memory_update":null}'
+    )
+    assert present["messages"][1]["content"].count("<bbox>") == 0
+    assert "reference bbox" not in present["messages"][1]["content"].lower()
+    assert not validate_ms_swift_record(present, image_root=tmp_path)
+    assert not validate_ms_swift_record(absent, image_root=tmp_path)

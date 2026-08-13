@@ -1,10 +1,10 @@
-# CognitiveTrack v1 正式在线推理协议（Qwen3-VL-4B 零样本基线）。
-# Tiny 与 Full 必须复用本配置；pair/无记忆等变体只能作为消融实验。
+# v5 新范式零样本可行性基线：过去图视觉画框，current 无框，统一三字段输出。
 tracker_name: cognitive_vlm
-experiment_name: qwen3vl_4b_cognitive_v1_base
+experiment_name: qwen3vl_4b_visual_v5_base
 context_mode: mosaic
-# 冻结旧 Tiny 结果的输入协议；新视觉画框实验使用 visual_v5 配置。
-reference_mode: bbox_text
+reference_mode: visual_box
+use_init_language: false
+mosaic_panel_height: 240
 bbox_protocol: norm1000
 
 observation_policy:
@@ -20,7 +20,9 @@ memory:
   max_confirmation_gap: 30
   min_positive_frame_gap: 5
   min_semantic_frame_gap: 30
-  semantic_confirmations: 1
+  semantic_confirmations: 2
+  max_semantic_confirmation_gap: 300
+  min_semantic_text_similarity: 0.35
 
 model_config: ../models/qwen3vl_4b_vllm_base.yaml
 save_raw_response: true

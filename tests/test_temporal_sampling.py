@@ -4,7 +4,11 @@ import cv2
 import numpy as np
 import pytest
 
-from cogtrack.training.temporal_sampling import TemporalCaseSamplingPlan, plan_temporal_presence_cases
+from cogtrack.training.temporal_sampling import (
+    REFERENCE_POLICY_FIXED_ANCHOR,
+    TemporalCaseSamplingPlan,
+    plan_temporal_presence_cases,
+)
 from pytracking.evaluation.data import Sequence
 
 
@@ -93,6 +97,29 @@ def test_plan_reuses_real_absent_current_with_distinct_earlier_references(tmp_pa
     assert item.frame_ids.count(3) == 2
     assert len(set(pairs)) == len(pairs)
     assert all(reference < current for reference, current in pairs)
+
+
+def test_fixed_anchor_plan_never_reuses_current_or_changes_identity_anchor(tmp_path: Path) -> None:
+    sequences = [
+        _sequence(tmp_path, "mixed-1", [True, True, True, False, False, True, True, True]),
+        _sequence(tmp_path, "positive", [True] * 8),
+        _sequence(tmp_path, "mixed-2", [True, False, False, False, True, True, True, True]),
+        _sequence(tmp_path, "mixed-3", [True, True, False, False, False, True, True, True]),
+    ]
+
+    plan = plan_temporal_presence_cases(
+        sequences,
+        max_cases_per_sequence=5,
+        absent_ratio=0.3,
+        seed=11,
+        reference_policy=REFERENCE_POLICY_FIXED_ANCHOR,
+    )
+
+    assert plan.reference_policy == REFERENCE_POLICY_FIXED_ANCHOR
+    assert plan.actual_absent_ratio == pytest.approx(0.3)
+    for item in plan.sequences:
+        assert len(set(item.frame_ids)) == len(item.frame_ids)
+        assert set(item.reference_frame_ids) == {item.anchor_frame_id}
 
 
 def test_plan_uses_first_present_as_anchor_and_ignores_leading_absence(tmp_path: Path) -> None:

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """用真实 ms-swift 模板回放一条样本，验证 Qwen 两代坐标转换。
 
-该工具不加载模型权重，只加载本地 processor/tokenizer。它分别断言：
+该工具不加载模型权重，只加载本地 processor/tokenizer。可只验证一个已安装模型族，
+也可同时验证两代。它分别断言：
 
 * Qwen2.5-VL 的 `<bbox>` 被转换为 processor-resize 后绝对像素；
 * Qwen3-VL 的 `<bbox>` 被转换为 0-to-1000 相对坐标；
@@ -161,8 +162,8 @@ def _verify_family(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", required=True)
-    parser.add_argument("--qwen25-model", required=True)
-    parser.add_argument("--qwen3-model", required=True)
+    parser.add_argument("--qwen25-model")
+    parser.add_argument("--qwen3-model")
     parser.add_argument("--split", choices=("train", "val"), default="train")
     parser.add_argument("--max-pixels", type=int, default=200704)
     parser.add_argument("--output")
@@ -170,21 +171,22 @@ def main() -> int:
 
     os.environ["QWENVL_BBOX_FORMAT"] = "new"
     dataset_root = Path(args.dataset_root).expanduser().resolve()
+    requested = []
+    if args.qwen25_model:
+        requested.append(("qwen2_5_vl", args.qwen25_model))
+    if args.qwen3_model:
+        requested.append(("qwen3_vl", args.qwen3_model))
+    if not requested:
+        parser.error("至少提供 --qwen25-model 或 --qwen3-model 之一")
     reports = [
         _verify_family(
-            family="qwen2_5_vl",
-            model_path=Path(args.qwen25_model).expanduser().resolve(),
+            family=family,
+            model_path=Path(model_path).expanduser().resolve(),
             dataset_root=dataset_root,
             split=args.split,
             max_pixels=args.max_pixels,
-        ),
-        _verify_family(
-            family="qwen3_vl",
-            model_path=Path(args.qwen3_model).expanduser().resolve(),
-            dataset_root=dataset_root,
-            split=args.split,
-            max_pixels=args.max_pixels,
-        ),
+        )
+        for family, model_path in requested
     ]
     result = {
         "schema_version": "cogtrack.qwen_template_verification.v1",

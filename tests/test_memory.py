@@ -63,24 +63,65 @@ def test_semantic_memory_has_deduplication_and_update_cooldown():
     anchor = IdentityAnchor(0, (10, 10, 20, 20), image=np.zeros((40, 40, 3), dtype=np.uint8))
     bank = MemoryBank(anchor)
     policy = GatedMemoryUpdatePolicy(
-        MemoryUpdatePolicyConfig(min_semantic_frame_gap=30)
+        MemoryUpdatePolicyConfig(min_semantic_frame_gap=30, semantic_confirmations=2)
     )
 
-    first = policy.process(bank, _semantic_candidate(1, "Rear view reveals two white stripes."))
+    first_pending = policy.process(bank, _semantic_candidate(1, "Rear view reveals two white stripes."))
+    first = policy.process(bank, _semantic_candidate(2, "Rear view reveals two stable white stripes."))
     too_soon = policy.process(bank, _semantic_candidate(10, "The target now carries a red bag."))
-    duplicate = policy.process(bank, _semantic_candidate(40, " rear VIEW reveals  two WHITE stripes. "))
-    accepted_later = policy.process(bank, _semantic_candidate(40, "The target now carries a red bag."))
+    duplicate = policy.process(bank, _semantic_candidate(40, " rear VIEW reveals  two STABLE WHITE stripes. "))
+    later_pending = policy.process(bank, _semantic_candidate(40, "The target now carries a red bag."))
+    accepted_later = policy.process(bank, _semantic_candidate(41, "Target now carries the same red bag."))
 
+    assert first_pending.accepted is False
+    assert "等待跨帧" in first_pending.reason
     assert first.accepted is True
     assert too_soon.accepted is False
     assert "过近" in too_soon.reason
     assert duplicate.accepted is False
     assert "重复" in duplicate.reason
+    assert later_pending.accepted is False
     assert accepted_later.accepted is True
     assert [record.text for record in bank.records(MemoryKind.SEMANTIC)] == [
-        "Rear view reveals two white stripes.",
-        "The target now carries a red bag.",
+        "Rear view reveals two stable white stripes.",
+        "Target now carries the same red bag.",
     ]
+
+
+def test_semantic_confirmation_rejects_unrelated_second_proposal():
+    anchor = IdentityAnchor(0, (10, 10, 20, 20), image=np.zeros((40, 40, 3), dtype=np.uint8))
+    bank = MemoryBank(anchor)
+    policy = GatedMemoryUpdatePolicy(MemoryUpdatePolicyConfig(semantic_confirmations=2))
+
+    first = policy.process(bank, _semantic_candidate(1, "Rear view reveals two white stripes."))
+    unrelated = policy.process(bank, _semantic_candidate(2, "The target now carries a red bag."))
+
+    assert first.accepted is False
+    assert unrelated.accepted is False
+    assert unrelated.confirmations == 1
+    assert bank.records(MemoryKind.SEMANTIC) == ()
+
+
+def test_semantic_confirmation_uses_a_separate_sparse_frame_window():
+    anchor = IdentityAnchor(0, (10, 10, 20, 20), image=np.zeros((40, 40, 3), dtype=np.uint8))
+    bank = MemoryBank(anchor)
+    policy = GatedMemoryUpdatePolicy(
+        MemoryUpdatePolicyConfig(
+            max_confirmation_gap=30,
+            semantic_confirmations=2,
+            max_semantic_confirmation_gap=300,
+        )
+    )
+
+    first = policy.process(bank, _semantic_candidate(10, "Rear view reveals two white stripes."))
+    second = policy.process(
+        bank,
+        _semantic_candidate(100, "Rear view reveals two stable white stripes."),
+    )
+
+    assert first.accepted is False
+    assert second.accepted is True
+    assert second.confirmations == 2
 
 
 def test_no_change_text_is_treated_as_null_instead_of_polluting_memory():

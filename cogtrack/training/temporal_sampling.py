@@ -17,6 +17,12 @@ import numpy as np
 
 from pytracking.evaluation.data import Sequence
 
+REFERENCE_POLICY_SAMPLED_PRIOR = "sampled_prior_present"
+REFERENCE_POLICY_FIXED_ANCHOR = "fixed_identity_anchor"
+REFERENCE_POLICIES = frozenset(
+    {REFERENCE_POLICY_SAMPLED_PRIOR, REFERENCE_POLICY_FIXED_ANCHOR}
+)
+
 
 def sequence_sampling_key(sequence: Sequence) -> str:
     """返回跨数据集不冲突的稳定序列键。"""
@@ -104,6 +110,24 @@ class TemporalCaseSamplingPlan:
     absent_count: int
     absent_run_count: int
     sequences: tuple[SequenceCasePlan, ...]
+    reference_policy: str = REFERENCE_POLICY_SAMPLED_PRIOR
+
+    def __post_init__(self) -> None:
+        if self.reference_policy not in REFERENCE_POLICIES:
+            raise ValueError(
+                f"reference_policy 必须是 {sorted(REFERENCE_POLICIES)} 之一"
+            )
+        if self.reference_policy == REFERENCE_POLICY_FIXED_ANCHOR:
+            for item in self.sequences:
+                if len(set(item.frame_ids)) != len(item.frame_ids):
+                    raise ValueError("fixed_identity_anchor plan 不能复用同一个 current frame")
+                if any(
+                    reference != item.anchor_frame_id
+                    for reference in item.reference_frame_ids
+                ):
+                    raise ValueError(
+                        "fixed_identity_anchor plan 的所有 reference 必须等于永久 anchor"
+                    )
 
     @property
     def frame_ids_by_sequence(self) -> Mapping[str, tuple[int, ...]]:
@@ -138,6 +162,10 @@ class TemporalCaseSamplingPlan:
             "absent_count": self.absent_count,
             "absent_run_count": self.absent_run_count,
         }
+        # 默认策略对应已发布的旧 Stage-1 plan。省略该字段可保持旧 JSON 与 checksum
+        # 字节级兼容；visual-v5 的固定锚点策略必须显式写入并在重放时校验。
+        if self.reference_policy != REFERENCE_POLICY_SAMPLED_PRIOR:
+            payload["reference_policy"] = self.reference_policy
         if include_frame_ids:
             payload["sequences"] = [item.to_dict() for item in self.sequences]
         return payload
@@ -169,6 +197,9 @@ class TemporalCaseSamplingPlan:
             absent_count=int(payload["absent_count"]),
             absent_run_count=int(payload["absent_run_count"]),
             sequences=sequences,
+            reference_policy=str(
+                payload.get("reference_policy", REFERENCE_POLICY_SAMPLED_PRIOR)
+            ),
         )
         if plan.sequence_count != len(sequences):
             raise ValueError("sampling plan 的 sequence_count 与明细数量不一致")
@@ -369,6 +400,7 @@ def _build_pool(
     *,
     max_cases_per_sequence: int,
     frame_stride: int,
+    reference_policy: str,
 ) -> _StatePool | None:
     if sequence.ground_truth_rect is None:
         raise ValueError(f"序列 {sequence.name} 缺少 ground_truth_rect")
@@ -407,21 +439,25 @@ def _build_pool(
     if eligible_count == 0:
         return None
     target_count = min(max_cases_per_sequence, eligible_count)
-    min_absent = max(0, target_count - len(present_ids))
-    present_seen = 1
-    present_pair_capacity = 0
-    absent_pair_capacity = 0
-    sampled_absent_set = {frame_id for run in sampled_runs for frame_id in run}
-    for frame_id in range(anchor_frame_id + 1, len(sequence)):
-        state = _presence(sequence, frame_id)
-        if state == "present":
-            if frame_id in present_ids:
-                present_pair_capacity += present_seen
-            present_seen += 1
-        elif frame_id in sampled_absent_set:
-            absent_pair_capacity += present_seen
-    min_absent = max(0, target_count - present_pair_capacity)
-    max_absent = min(target_count, absent_pair_capacity)
+    if reference_policy == REFERENCE_POLICY_FIXED_ANCHOR:
+        # 永久锚点协议下每个 current 只能出现一次；不能再靠更换 reference 复制 case。
+        min_absent = max(0, target_count - len(present_ids))
+        max_absent = min(target_count, absent_count)
+    else:
+        present_seen = 1
+        present_pair_capacity = 0
+        absent_pair_capacity = 0
+        sampled_absent_set = {frame_id for run in sampled_runs for frame_id in run}
+        for frame_id in range(anchor_frame_id + 1, len(sequence)):
+            state = _presence(sequence, frame_id)
+            if state == "present":
+                if frame_id in present_ids:
+                    present_pair_capacity += present_seen
+                present_seen += 1
+            elif frame_id in sampled_absent_set:
+                absent_pair_capacity += present_seen
+        min_absent = max(0, target_count - present_pair_capacity)
+        max_absent = min(target_count, absent_pair_capacity)
     return _StatePool(
         sequence=sequence,
         anchor_frame_id=anchor_frame_id,
@@ -475,6 +511,7 @@ def plan_temporal_presence_cases(
     absent_ratio: float = 0.3,
     frame_stride: int = 1,
     seed: int = 20260809,
+    reference_policy: str = REFERENCE_POLICY_SAMPLED_PRIOR,
 ) -> TemporalCaseSamplingPlan:
     """生成全局比例受控、按连续状态区间覆盖的确定性帧计划。"""
 
@@ -484,6 +521,8 @@ def plan_temporal_presence_cases(
         raise ValueError("absent_ratio 必须位于 [0,1)")
     if isinstance(frame_stride, bool) or frame_stride <= 0:
         raise ValueError("frame_stride 必须是正整数")
+    if reference_policy not in REFERENCE_POLICIES:
+        raise ValueError(f"reference_policy 必须是 {sorted(REFERENCE_POLICIES)} 之一")
 
     pools = [
         pool
@@ -492,6 +531,7 @@ def plan_temporal_presence_cases(
             sequence,
             max_cases_per_sequence=max_cases_per_sequence,
             frame_stride=frame_stride,
+            reference_policy=reference_policy,
         ))
         is not None
     ]
@@ -544,19 +584,27 @@ def plan_temporal_presence_cases(
     sequence_plans: list[SequenceCasePlan] = []
     for pool, absent_count in zip(pools, absent_counts, strict=True):
         present_count = pool.target_count - absent_count
-        selected_absent = _select_absent_pair_currents(
-            pool.sequence.name,
-            pool.absent_runs,
-            absent_count,
-            reference_frame_ids=(pool.anchor_frame_id, *pool.reference_ids),
-        )
-        selected_present = _select_present_pair_currents(
-            pool.sequence.name,
-            pool.present_ids,
-            pool.absent_runs,
-            present_count,
-            reference_frame_ids=(pool.anchor_frame_id, *pool.reference_ids),
-        )
+        if reference_policy == REFERENCE_POLICY_FIXED_ANCHOR:
+            selected_absent = _select_absent(pool.absent_runs, absent_count)
+            selected_present = _select_present(
+                pool.present_ids,
+                pool.absent_runs,
+                present_count,
+            )
+        else:
+            selected_absent = _select_absent_pair_currents(
+                pool.sequence.name,
+                pool.absent_runs,
+                absent_count,
+                reference_frame_ids=(pool.anchor_frame_id, *pool.reference_ids),
+            )
+            selected_present = _select_present_pair_currents(
+                pool.sequence.name,
+                pool.present_ids,
+                pool.absent_runs,
+                present_count,
+                reference_frame_ids=(pool.anchor_frame_id, *pool.reference_ids),
+            )
         frame_ids = tuple(sorted((*selected_present, *selected_absent)))
         if len(frame_ids) != pool.target_count:
             raise RuntimeError(f"序列 {pool.sequence.name} 的采样数量与计划不一致")
@@ -566,11 +614,15 @@ def plan_temporal_presence_cases(
                 sequence=pool.sequence.name,
                 anchor_frame_id=pool.anchor_frame_id,
                 frame_ids=frame_ids,
-                reference_frame_ids=_reference_frames(
-                    pool.sequence,
-                    frame_ids,
-                    prior_present_ids=(pool.anchor_frame_id, *pool.reference_ids),
-                    seed=seed,
+                reference_frame_ids=(
+                    (pool.anchor_frame_id,) * len(frame_ids)
+                    if reference_policy == REFERENCE_POLICY_FIXED_ANCHOR
+                    else _reference_frames(
+                        pool.sequence,
+                        frame_ids,
+                        prior_present_ids=(pool.anchor_frame_id, *pool.reference_ids),
+                        seed=seed,
+                    )
                 ),
                 present_count=present_count,
                 absent_count=absent_count,
@@ -592,10 +644,14 @@ def plan_temporal_presence_cases(
         absent_count=actual_absent,
         absent_run_count=sum(item.absent_run_count for item in sequence_plans),
         sequences=tuple(sequence_plans),
+        reference_policy=reference_policy,
     )
 
 
 __all__ = [
+    "REFERENCE_POLICIES",
+    "REFERENCE_POLICY_FIXED_ANCHOR",
+    "REFERENCE_POLICY_SAMPLED_PRIOR",
     "SequenceCasePlan",
     "TemporalCaseSamplingPlan",
     "plan_temporal_presence_cases",

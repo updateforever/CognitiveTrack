@@ -15,6 +15,12 @@ from .identity import (
 )
 from .mosaic import MOSAIC_PROMPT_NAME, MOSAIC_PROMPT_VERSION, build_mosaic_prompt
 from .pair import PAIR_PROMPT_NAME, PAIR_PROMPT_VERSION, build_pair_prompt
+from .visual_tracking import (
+    VISUAL_MOSAIC_PROMPT_NAME,
+    VISUAL_PAIR_PROMPT_NAME,
+    VISUAL_TRACKING_PROMPT_VERSION,
+    build_visual_tracking_prompt,
+)
 
 __all__ = [
     "CANDIDATE_IDENTITY_PROMPT_NAME",
@@ -26,8 +32,12 @@ __all__ = [
     "PAIR_PROMPT_NAME",
     "PAIR_PROMPT_VERSION",
     "PromptSpec",
+    "VISUAL_MOSAIC_PROMPT_NAME",
+    "VISUAL_PAIR_PROMPT_NAME",
+    "VISUAL_TRACKING_PROMPT_VERSION",
     "build_candidate_identity_prompt",
     "build_identity_prompt",
     "build_mosaic_prompt",
     "build_pair_prompt",
+    "build_visual_tracking_prompt",
 ]

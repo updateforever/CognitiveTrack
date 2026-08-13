@@ -1,6 +1,12 @@
 import numpy as np
 
-from cogtrack.context import TrackingContextBuilder
+from cogtrack.context import (
+    REFERENCE_MODE_VISUAL_BOX,
+    VISUAL_MARKER_VERSION,
+    TrackingContextBuilder,
+    build_history_mosaic,
+    draw_reference_box,
+)
 from cogtrack.memory import IdentityAnchor, MemoryKind, MemoryRecord, MemorySource
 
 
@@ -51,3 +57,49 @@ def test_mosaic_uses_compact_grid_without_frame_number_header():
     # 四帧按 2x2 排列；没有旧实现额外添加的 30px 帧号标题行。
     assert result.images[1].shape[:2] == (480, 768)
     assert result.reference_frames == (0, 4, 8, 12, 16)
+
+
+def test_visual_box_pair_marks_only_past_anchor_and_has_no_coordinate_text():
+    anchor_image = np.zeros((100, 160, 3), dtype=np.uint8)
+    current_image = np.full((100, 160, 3), 17, dtype=np.uint8)
+    builder = TrackingContextBuilder(
+        IdentityAnchor(0, (10, 10, 20, 30), image=anchor_image),
+        reference_mode=REFERENCE_MODE_VISUAL_BOX,
+    )
+
+    result = builder.build_pair(current_image)
+
+    assert result.reference_mode == REFERENCE_MODE_VISUAL_BOX
+    assert result.visual_marker_version == VISUAL_MARKER_VERSION
+    assert result.prompt.name == "cognitive_visual_pair"
+    assert result.prompt.version == "5.0.0"
+    assert "red box" in result.prompt.user_prompt
+    assert "normalized 0-to-1000 xyxy coordinates" not in result.prompt.user_prompt
+    assert "[62.5, 100.0, 187.5, 400.0]" not in result.prompt.user_prompt
+    assert np.array_equal(result.images[0], draw_reference_box(anchor_image, (10, 10, 20, 30)))
+    assert np.array_equal(result.images[-1], current_image)
+    assert np.array_equal(anchor_image, np.zeros_like(anchor_image))
+
+
+def test_visual_box_online_mosaic_uses_shared_renderer():
+    image = np.zeros((100, 160, 3), dtype=np.uint8)
+    builder = TrackingContextBuilder(
+        IdentityAnchor(0, (10, 10, 20, 30), image=image),
+        reference_mode=REFERENCE_MODE_VISUAL_BOX,
+    )
+    record = MemoryRecord(
+        record_id="positive-shared-renderer",
+        kind=MemoryKind.POSITIVE,
+        frame_id=4,
+        source=MemorySource.VLM_PREDICTION,
+        bbox_xywh=(20, 20, 30, 30),
+        image=image,
+    )
+
+    result = builder.build_mosaic(image, (record,))
+    expected = build_history_mosaic(((image, (20, 20, 30, 30)),), panel_height=240)
+
+    assert np.array_equal(result.images[1], expected)
+    assert result.prompt.name == "cognitive_visual_mosaic"
+    assert "accepted past observations" in result.prompt.user_prompt
+    assert "may be imperfect" in result.prompt.user_prompt

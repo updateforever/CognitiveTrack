@@ -11,11 +11,11 @@
   标签与审核；
 - 不监督旧六分类、解释文本、身份标签、细粒度状态或数值置信度。
 
-完整输入范式、候选 Prompt、混合比例、MGIT 使用边界和消融见
-[stage2_stage3_data.md](stage2_stage3_data.md)。该方案目前是待实现规划，现有数据生成器
-仍使用旧 reference 坐标文本范式。
+完整输入范式、Prompt、混合比例、MGIT 使用边界和消融见
+[stage2_stage3_data.md](stage2_stage3_data.md)。共享绘框、v5 Prompt、三字段导出和
+visual-v5 probe 入口已经实现；正式分桶数据、训练和 benchmark 尚未完成。
 
-统一训练使用 v4 三字段样本：
+统一训练使用 v5 三字段样本：
 
 ```json
 {"target_status":"present","bbox_norm1000_xyxy":[100,120,400,520],"memory_update":"Rear view reveals two stable white stripes."}
@@ -29,7 +29,27 @@
 机械给所有旧样本追加 `null`。导出校验器必须严格拒绝缺字段、额外字段、空字符串以及
 `absent + 非空 memory_update`。
 
-## 2. 已完成的旧 Stage-1 数据（历史基线）
+## 2. Visual-v5 probe 数据
+
+多数据集入口为 `tracking/synthesize_visual_v5_dataset.py`。它复用旧数据管线中已经验证的
+官方 train split、7:3 同序列 presence 采样、完整序列 train/val 划分和 Qwen 官方坐标
+导出，但固定使用 visual box 与三字段协议。正式构建默认要求 `--memory-labels`；只有
+工程 dry-run 才允许：
+
+```bash
+python tracking/synthesize_visual_v5_dataset.py \
+  --datasets tnl2k --limit-sequences-per-dataset 2 \
+  --env-config configs/env.local.yaml \
+  --max-samples-per-sequence 4 --absent-ratio 0 \
+  --memory-supervision feasibility_null \
+  --output-dir data/feasibility/cogtrack_visual_v5_tnl2k
+```
+
+`feasibility_null` 会写入不可用于正式训练的 provenance。正式 plan、memory manifest、
+重放与训练命令见 [visual_v5_iteration.md](visual_v5_iteration.md)。该 probe 还不是论文版
+五类 case 精确配额数据；probe 有明确 benchmark 增益后再扩大合成复杂度。
+
+## 3. 已完成的旧 Stage-1 数据（历史基线）
 
 以下入口记录已经完成的旧二字段实验，不能直接生成新统一画框数据。它固定读取三个
 数据集的官方 `train` split，并在生成后再次审计每条样本的
@@ -60,7 +80,7 @@ present reference。传给 VLM 的 Image 1 是未画框、未裁剪的完整 ref
 reference 使用 current 或未来帧。下一版会改为在完整 reference/history 图上直接画框，
 current 仍无框，输出 bbox 仍绑定最后一张图。
 
-## 3. Qwen 官方坐标训练视图
+## 4. Qwen 官方坐标训练视图
 
 Qwen2.5-VL 与 Qwen3-VL 不是同一套 grounding 坐标：
 
@@ -90,6 +110,10 @@ ms-swift 根据实际模型模板处理 `<bbox>`；训练必须保留
 JSONL 交给另一代模型。`scripts/train_sft.sh` 会在加载模型前读取 Hugging Face
 `config.json:model_type` 和数据元数据，发现交叉使用就直接退出。
 
+上面的 JSON 是旧 `bbox_text` 示例。visual-v5 不在 user 消息中放 reference `<bbox>`，
+也不为 Image 1 创建输入 object；present 样本只有 assistant `<bbox>` 且
+`objects.image_id` 指向最后一张 current，absent 样本没有 `objects`。
+
 在新服务器上开始训练前，可用真实 ms-swift processor 对任意一条 present 样本做
 坐标回放（不加载模型权重）：
 
@@ -113,7 +137,7 @@ LaSOT 使用 `training_set.txt`；TNL2K 使用 `TNL2K_train_subset`；MGIT 使�
 `videocube.json[full][train]` 和 `data/train`。任何训练帧未解压或 split 不匹配都会
 立即失败，不会回退到测试集。
 
-## 4. 通用源样本构造器
+## 5. 通用源样本构造器
 
 `tracking/build_tracking_dataset.py` 直接消费 pytracking `Sequence`，支持 pair/mosaic、稳定抽样、
 关键帧和流式 JSONL。输出图片全部使用相对路径，可连同数据集整体移动。
@@ -126,11 +150,14 @@ python tracking/build_tracking_dataset.py \
 ```
 
 Mosaic 历史只能使用当前帧之前的有效正帧；无历史时与在线 tracker 一样自动退化为 pair。
+新协议使用 `--reference-mode visual_box`，并通过
+`--memory-supervision explicit --memory-labels <jsonl>` 提供正式第三字段。仅做管线检查时
+可改为 `--memory-supervision feasibility_null`。
 
 旧 identity 困难负样本构造器暂时隔离，其输出不能通过 v4 主协议校验，也不能
 与当前 presence 训练集混合。
 
-## 5. 校验与序列划分
+## 6. 校验与序列划分
 
 ```bash
 python tracking/export_qwen_grounding_dataset.py \
@@ -146,7 +173,7 @@ python tracking/export_qwen_grounding_dataset.py \
 
 GRPO 模式会删除 assistant 消息，并把参考答案移入 `solution`，避免标签泄漏。
 
-## 6. SFT 与 GRPO
+## 7. SFT 与 GRPO
 
 ```bash
 MODEL_PATH=/path/to/Qwen2.5-VL \
@@ -164,9 +191,10 @@ checkpoint 继续同一个 adapter，没有叠加 LoRA。最终结果为：
 - Stage-2：28,819 steps，7h15m14s，train loss 0.25926472，token accuracy 0.89407277，
   峰值 38.13GiB/卡。
 
-二者都尚未通过正式 benchmark 证明跟踪提升。下一版改为一次统一三字段混合 LoRA SFT，
-不再新建 Stage-1/2/3 三轮 adapter；从基座或旧 Stage-2 adapter 初始化由验证集消融决定。
-需要全参对照时必须显式设置 `TUNER_TYPE=full`。
+二者已完成 CognitiveBench-Tiny 的同协议初步聚合评测，但尚无 Full 主表，也没有接受
+visual-v5 输入或 memory 监督。下一版改为一次统一三字段混合 LoRA SFT，不再新建
+Stage-1/2/3 三轮 adapter；从基座或旧 Stage-2 adapter 初始化由验证集消融决定。需要
+全参对照时必须显式设置 `TUNER_TYPE=full`。
 
 正式 Stage-1 LoRA 已完成一轮训练：152,039 条 train、8,010 条按序列隔离的 val，
 19,005 steps，global world size 2、单卡 batch 4、global batch 8、学习率 5e-5。模型共

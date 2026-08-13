@@ -38,6 +38,8 @@ Sequence -> Tracker.initialize -> Tracker.track -> ResultWriter -> Evaluator
 - 输入图片保持完整、不做目标局部裁剪。下一版中所有过去的身份参考图和可信历史图
   统一直接画框，不再向模型提供 reference bbox 坐标文本；当前待预测的完整搜索图
   永远不画框。“所有图画框”只指过去的参考/历史图，不能给 current 画框造成泄漏。
+- visual-v5 主实验设置 `use_init_language: false`；数据集自然语言只允许作为显式消融，
+  不能因某些来源有描述、某些来源没有而混入主结果。
 - 正式在线输入保留永久首帧身份锚点，并显式提供最近可信 VLM 观测及更早历史；稀疏
   推理中的“最近”不是字面上一视频帧。首帧不能被滚动预测替换，动态历史必须门控，
   防止一次误跟踪自我强化。
@@ -62,9 +64,10 @@ Sequence -> Tracker.initialize -> Tracker.track -> ResultWriter -> Evaluator
   在推理结束后用于评测。
 - 训练、验证、测试按完整序列划分，禁止帧级泄漏。
 
-统一数据与候选 Prompt 的完整设计见
-[`docs/stage2_stage3_data.md`](docs/stage2_stage3_data.md)。截至 2026-08-13，该设计尚未
-实现到 tracker、Prompt 和数据生成代码；不要把规划当成已完成工程事实。
+统一数据与 Prompt 的完整设计见
+[`docs/stage2_stage3_data.md`](docs/stage2_stage3_data.md)。截至 2026-08-13，共享绘框、
+v5 Prompt、tracker、三字段导出和 semantic gate 已实现并通过小样本 smoke；正式分桶
+数据、SFT 和聚合 benchmark 尚未完成。不要把工程可行性当成训练效果。
 
 ## 3. Qwen 坐标协议：不可混用
 
@@ -177,15 +180,19 @@ Qwen2.5-VL 与 Qwen3-VL 不是同一套官方 grounding 坐标：
   `docs/legacy_staged_tiny_results_20260813.md`；Full 尚未运行，且这些结果不等于新的
   “历史图视觉画框 + 一次统一三字段混合训练”已经实现或训练。
 
-### 当前代码与新规划之间的差距
+### visual-v5 工程状态与剩余差距
 
-- 当前 `TrackingContextBuilder` 的首帧仍不画框，并在 Prompt 中传 reference bbox 坐标；
-  只有 history mosaic panel 会画框。
-- 当前用于 Tiny 对照的 Qwen3 tracker 配置已固定为 mosaic、三字段和 memory enabled，
-  并对 Base/Stage-1/Stage-2 只替换权重；pair 配置仅作阶段验证与消融。但这套运行时的
-  首帧仍走坐标文本，因此不能称为下一版视觉画框新范式。
-- 新规划需要同步修改 context builder、pair/mosaic Prompt、训练导出、tracker 配置与测试，
-  之后重新生成统一混合数据并训练。
+- `TrackingContextBuilder` 已支持 `reference_mode: visual_box`：anchor/history 复用
+  `red_box_v1` 绘框，current 永远无框；旧 `bbox_text` 模式显式保留用于历史复现。
+- v5.0.0 Prompt、三字段 canonical/ms-swift 导出和 Base/Stage-2/new-SFT tracker 配置已
+  接入；输入不再创建 reference `<bbox>` object，输出框只绑定最后一张 current。
+- semantic proposal 默认跨帧相似确认两次后才落库。真实 4B 单 case 已验证首个提议只
+  停留在 `1/2`，没有立即写入长期记忆。
+- 本机只完成 2 条 TNL2K 序列的 `feasibility_null` 数据、Qwen3 processor 回放和真实
+  模型 smoke；正式 memory manifest、论文版 case 分桶、LoRA 与新 Tiny/Full 指标仍缺失。
+- 训练服务器入口是 `tracking/synthesize_visual_v5_dataset.py`，详细分工和命令见
+  `docs/visual_v5_iteration.md`。它强制 sampling plan 使用 `fixed_identity_anchor`；旧
+  Stage-1 的 `sampled_prior_present` plan 不能拿来生成 visual-v5。
 
 ## 6. 新服务器最快恢复流程
 
@@ -340,16 +347,14 @@ Git commit、数据/模型 revision 与 checksum、GPU 拓扑和 NCCL 环境。
 
 当前安全的推进顺序是：
 
-1. 先讨论并冻结 `docs/stage2_stage3_data.md` 的视觉画框输入范式与 Prompt；明确框样式、
-   两图退化和最近可信观测的门控语义。
-2. 同步修改 context builder、Prompt、tracker 配置和训练导出，使训练/推理使用同一绘框
-   实现；当前搜索图必须保持无框。
-3. 构建小规模混合数据，完成 processor 回放、两步 smoke 和小样本过拟合；验证三字段
-   JSON、最后一张图 bbox 绑定和没有 current/future 泄漏。
-4. 生成正式统一混合数据，统计各数据桶、历史框来源和 memory 标签来源，随后只做一次
-   Qwen3-VL-4B LoRA SFT。
-5. 同时评测基座、旧 Stage-2 adapter、从基座统一训练、从 Stage-2 继续统一训练，按
-   CognitiveBench 的 presence、bbox、消失/重现、长 gap 和 memory 指标选择主模型。
+1. 在训练服务器生成并提交不含图片的 visual-v5 sampling plan 统计；本机不做全量数据。
+2. 构造带 provenance 的 memory manifest，并先跑两步 smoke 与小样本过拟合；禁止把
+   `feasibility_null` 数据用于正式训练。
+3. 用同一 visual-v5 probe 分别从基座和旧 Stage-2 初始化 LoRA，固定其他超参数。
+4. 在 CognitiveBench-Tiny 上同时评测基座、旧 Stage-2 兼容性对照和两个新 SFT，按
+   presence、bbox、消失/重现、长 gap、memory 和结构化错误选择方向。
+5. probe 有增益后再实现论文版五类 case 的精确配额和 rollout-history，生成正式统一
+   混合数据；Full 只切换 dataset config，不修改推理协议。
 6. 只有 SFT 与 memory reward 回放可靠后再做 GRPO；先纯 VLM，不转向 hybrid 主实验。
 
 ## 9. 开发与提交约束
