@@ -1,25 +1,21 @@
 # ms-swift 训练指引
 
-## 1. 监督边界
+## 1. 当前监督边界与统一训练
 
-训练按监督难度分阶段，不在第一轮同时学习所有能力：
+2026-08-13 起，下一版正式训练改为一次统一混合 LoRA SFT，不再依次做三次能力阶段：
 
-1. **Stage-1 Tracking + Presence**：使用 LaSOT、TNL2K、MGIT 官方训练集中的
-   真实 `present+bbox` 与 `absent+null`，按视频帧 case 控制为约 7:3。第一轮只用
-   pair，让主要训练容量用于跨帧定位，同时避免模型学成“永远 present”。此阶段不
-   使用数据集语言描述。
-2. **Stage-2 Temporal Context**：保持同一二字段监督，加入 mosaic、消失边界和
-   重现片段对照，评估可信视觉历史是否改善长时间隔判别。
-3. **Stage-3 Memory**：只有获得可靠的更新时机和语义增量标签后，才监督
-   `memory_update`；不从普通 bbox 数据伪造记忆文本。
+- 混合单参考、mosaic、长间隔、消失/重现、干净/扰动历史和记忆事件；
+- 所有过去的参考/历史图直接视觉画框，不再在 Prompt 中传 reference bbox 坐标；
+- 当前完整搜索图始终无框；
+- 所有样本统一输出三字段，普通样本的 `memory_update` 为 `null`，非空文本只来自可靠
+  标签与审核；
+- 不监督旧六分类、解释文本、身份标签、细粒度状态或数值置信度。
 
-三个阶段都不监督旧六分类、解释文本或数值置信度。Stage-1/2 使用不含
-`memory_update` 的二字段 Prompt，保证输入输出一致。
+完整输入范式、候选 Prompt、混合比例、MGIT 使用边界和消融见
+[stage2_stage3_data.md](stage2_stage3_data.md)。该方案目前是待实现规划，现有数据生成器
+仍使用旧 reference 坐标文本范式。
 
-Stage-2/3 的具体数据单位、事件审核和泄漏边界见
-[stage2_stage3_data.md](stage2_stage3_data.md)。
-
-后续只有在获得人工确认或可靠规则生成的记忆标签后，才使用 v4 三字段样本：
+统一训练使用 v4 三字段样本：
 
 ```json
 {"target_status":"present","bbox_norm1000_xyxy":[100,120,400,520],"memory_update":"Rear view reveals two stable white stripes."}
@@ -28,12 +24,15 @@ Stage-2/3 的具体数据单位、事件审核和泄漏边界见
 上例是 Qwen3-VL；Qwen2.5-VL 使用 `bbox_pixel_xyxy` 和 processor-resize 后绝对
 像素值。
 
-同一训练批次不应混用二字段和三字段 Prompt。导出校验器兼容两种版本，但会严格
-拒绝缺字段、额外字段、空字符串以及 `absent + 非空 memory_update`。
+同一正式训练批次不混用二字段和三字段 Prompt。旧二字段 Stage-1/2 数据只能作为历史
+基线；若用于新混合训练，必须重新渲染参考图并补充经过规则/审核的第三字段，而不能
+机械给所有旧样本追加 `null`。导出校验器必须严格拒绝缺字段、额外字段、空字符串以及
+`absent + 非空 memory_update`。
 
-## 2. 合成 Stage-1 正式训练数据
+## 2. 已完成的旧 Stage-1 数据（历史基线）
 
-正式入口固定读取三个数据集的官方 `train` split，并在生成后再次审计每条样本的
+以下入口记录已经完成的旧二字段实验，不能直接生成新统一画框数据。它固定读取三个
+数据集的官方 `train` split，并在生成后再次审计每条样本的
 来源。它会同时产出图片、源 manifest、校验报告，以及 Qwen2.5-VL/Qwen3-VL 各自
 可直接交给 ms-swift 的 `train.jsonl` / `val.jsonl`：
 
@@ -52,13 +51,14 @@ LaSOT 的 `full_occlusion/out_of_view`、TNL2K 的零框帧和 MGIT 的 `absent`
 不会跨序列配对或人工抹除目标。absent 区间优先覆盖首尾，present 则优先覆盖消失前
 和重现后的边界帧，再做时间均匀采样。默认将图片长边限制为 648。
 
-初始化遵循 pytracking 的 ``initialize(full_image, init_bbox)`` 接口。在线 benchmark
+旧范式初始化遵循 pytracking 的 ``initialize(full_image, init_bbox)`` 接口。在线 benchmark
 仍只用第一帧 GT 初始化；Stage-1 训练 pair 则从同序列选择严格早于当前帧的真实
 present reference。传给 VLM 的 Image 1 是未画框、未裁剪的完整 reference 帧，Image 2
 始终是未画 GT 的当前完整帧。reference 框通过 Prompt 中的 `<bbox>` 和
 `objects.image_id=0` 绑定 Image 1，当前 GT 仅在 assistant 答案中通过另一枚 `<bbox>`
 绑定最后一张图。reference/current 的时间顺序写入 sampling plan，并严格禁止
-reference 使用 current 或未来帧。
+reference 使用 current 或未来帧。下一版会改为在完整 reference/history 图上直接画框，
+current 仍无框，输出 bbox 仍绑定最后一张图。
 
 ## 3. Qwen 官方坐标训练视图
 
@@ -156,11 +156,17 @@ DATASET_ROOT=/path/to/dataset \
 bash scripts/train_sft.sh
 ```
 
-当前主 baseline 快捷入口为 `scripts/train_qwen3vl_4b_stage1.sh`，默认采用 LoRA。
-单卡 L40S smoke 已验证 Qwen3-VL-4B 的 LoRA SFT 可运行；Stage-1 两步峰值
-16.29GiB，Stage-2 mosaic 两步峰值 18.44GiB。正式实验统一沿用同一 LoRA adapter
-从 Stage-1 SFT 传递到 Stage-2/Stage-3 和 GRPO，避免切换全参/adapter 权重造成对比
-混乱。需要全参对照时必须显式设置 `TUNER_TYPE=full`。
+旧 baseline 快捷入口为 `scripts/train_qwen3vl_4b_stage1.sh`，默认采用 LoRA。已在 2×L40
+完成旧 Stage-1 pair64 与 Stage-2 mosaic robust v2 正式训练；Stage-2 从 Stage-1 最终
+checkpoint 继续同一个 adapter，没有叠加 LoRA。最终结果为：
+
+- Stage-1：19,005 steps，4h45m41s，train loss 0.29283377，token accuracy 0.882494；
+- Stage-2：28,819 steps，7h15m14s，train loss 0.25926472，token accuracy 0.89407277，
+  峰值 38.13GiB/卡。
+
+二者都尚未通过正式 benchmark 证明跟踪提升。下一版改为一次统一三字段混合 LoRA SFT，
+不再新建 Stage-1/2/3 三轮 adapter；从基座或旧 Stage-2 adapter 初始化由验证集消融决定。
+需要全参对照时必须显式设置 `TUNER_TYPE=full`。
 
 正式 Stage-1 LoRA 已完成一轮训练：152,039 条 train、8,010 条按序列隔离的 val，
 19,005 steps，global world size 2、单卡 batch 4、global batch 8、学习率 5e-5。模型共
@@ -210,12 +216,12 @@ bash scripts/train_sft.sh
 视觉表征适配时才设置 `FREEZE_VIT=false`，并在实验名中明确标记为全模型微调。
 
 GRPO 基础设施提供严格格式、存在性、bbox IoU 和内部一致性四个独立 reward，但
-当前正式 Stage-1 包首先用于 SFT。Qwen3-VL 的归一化 bbox reward 可直接复用 canonical
+旧 Stage-1 包首先用于二字段 SFT。Qwen3-VL 的归一化 bbox reward 可复用 canonical
 监督；Qwen2.5-VL 的 bbox reward 必须拿到该次 rollout processor 的真实缩放尺寸后再
 计算，不能用原图框或 norm1000 框冒充。完成这项 processor-aware reward 回放前，
 不把 Qwen2.5-VL bbox GRPO 列为已验证训练入口。
 
-当前第一阶段 SFT/GRPO 不监督身份、细粒度状态、记忆文本、解释文本或数值置信度。
-记忆学习应作为独立的第三阶段数据版本；在加入专门的更新时机和文本质量 reward
-之前，不把现有 presence GRPO 误称为记忆训练。
+统一 SFT 仍不监督身份、细粒度状态、解释文本或数值置信度，但会在同一三字段协议中
+监督稀疏语义记忆。只有经过审核或可靠规则确认的样本才能提供非空记忆；在加入专门的
+更新时机和文本质量 reward 之前，不把现有 presence GRPO 误称为记忆训练。
 奖励仅读取 `solution`/监督列，不读取跟踪运行时的未来信息。

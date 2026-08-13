@@ -9,6 +9,10 @@ CognitiveTrack 是一个建立在 [pytracking](https://github.com/visionml/pytra
 GRPO。所有实验遵循：第一帧仅用 GT 初始化，后续推理不读取当前或未来 GT；训练、
 验证和测试按完整序列划分。
 
+2026-08-13 的统一视觉画框与混合训练讨论摘要见
+[docs/project_status_20260813.md](docs/project_status_20260813.md)，完整设计草案见
+[docs/stage2_stage3_data.md](docs/stage2_stage3_data.md)。
+
 ## 主要特性
 
 - 标准 `Sequence -> initialize -> track -> ResultWriter -> Evaluator` 生命周期；
@@ -189,6 +193,10 @@ bash scripts/train_qwen3vl_4b_stage1.sh
 
 详细监督边界、数据格式、全参训练和 GRPO 说明见
 [docs/training.md](docs/training.md)。
+
+旧 Stage-1/Stage-2 分阶段训练结果仅作为历史对照；下一版将统一视觉画框输入与三字段
+混合训练。方案状态和已完成实验分别见
+[docs/project_status_20260813.md](docs/project_status_20260813.md) 与 `docs/` 下的实验归档。
 
 ## 代码结构
 
