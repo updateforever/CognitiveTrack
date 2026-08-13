@@ -4,6 +4,10 @@
 [AGENTS.md](AGENTS.md)。其中记录了研究边界、已验证进度、关键设计决策、换服务器
 恢复步骤、下一阶段顺序和禁止事项。
 
+2026-08-13 的统一视觉画框与混合训练讨论摘要见
+[docs/project_status_20260813.md](docs/project_status_20260813.md)，完整设计草案见
+[docs/stage2_stage3_data.md](docs/stage2_stage3_data.md)。
+
 CognitiveTrack 是一个建立在 **pytracking 标准推理范式**之上的大模型长时认知跟踪框架。项目关注的不是让视觉语言模型被迫逐帧画框，而是显式研究：
 
 1. 初始化目标当前是否可见且可定位；
@@ -174,12 +178,12 @@ bash scripts/train_sft.sh
 训练 Qwen3-VL 时同时换成 Qwen3-VL 模型和 `ms_swift/qwen3_vl/` 两个 JSONL，不能
 只换模型路径。两套 JSONL 共享同一批图像和样本划分，不会增加图片存储。
 
-Stage-1 只使用同序列真实状态，按约 70% `present+bbox`、30% `absent+null`
-构造 pair。在线评测仍使用首帧初始化；训练 pair 使用同序列中严格早于 current 的
-完整 present reference，并通过官方模型族坐标表示传入 reference bbox。current 同样
-保持完整且不画 GT；框通过 `<bbox>` 在 processor 阶段注入，mosaic 和记忆分别在
-后续阶段加入。数据标签边界见
-[docs/training.md](docs/training.md)。
+上面的命令记录已经完成的旧 Stage-1 二字段数据：约 70% `present+bbox`、30%
+`absent+null`，reference bbox 通过官方 grounding 坐标传入。2026-08-13 起下一版正式
+方案改为一次统一混合三字段 LoRA SFT：所有过去的参考/历史完整图直接画框，不再提供
+reference 坐标文本；当前完整搜索图始终无框；单参考、mosaic、消失/重现、历史扰动和
+语义记忆样本在一份数据中混合。完整草案与未完成清单见
+[docs/stage2_stage3_data.md](docs/stage2_stage3_data.md)，旧命令不能直接生成新范式数据。
 本地 7B 模型的 v4.1 三字段零样本探针及由此得到的数据优先级见
 [docs/qwen_v4_probe.md](docs/qwen_v4_probe.md)。
 
@@ -190,11 +194,19 @@ Stage-1 只使用同序列真实状态，按约 70% `present+bbox`、30% `absent
 - SUTrack-B384 Fast-iTPN、CLIP 文本塔、裁剪预处理、checkpoint runtime 和进程级模型缓存已经独立迁入；同时保留插件契约，便于替换其他 SUTrack 变体。
 - “每帧 SUTrack + 关键帧 VLM” hybrid 已用真实 SUTrack checkpoint 跑通。
 - ms-swift SFT 的 Qwen2.5/Qwen3 官方 grounding 视图、二/三字段校验和序列划分已可用；GRPO 的格式、presence、一致性 reward 已接入，bbox reward 需按模型族单独验证。
+- 已在 2×L40 完成旧范式 Qwen3-VL-4B Stage-1 和 Stage-2 的同一 LoRA 连续训练；
+  Stage-2 最终为 28,819 steps、train loss 0.25926472、token accuracy 0.89407277。该结果
+  只证明训练完成，尚无正式 benchmark 提升结论。
+- Stage-1/2 adapter 已上传私有 ModelScope 仓库
+  `updateforever/CognitiveTrack-Qwen3VL-4B-Stage1-LoRA`；Stage-2 位于
+  `stage2-mosaic-robust-v2/`，权重 SHA-256 为
+  `7437dd2be3bae21070059ef5ce704da7bbd5008607f7e04eb18b3638f04930a1`。
+- 新的视觉画框统一混合范式尚未实现或训练；当前 tracker 首帧仍走坐标文本，不能把
+  旧 Stage-2 权重描述为新范式模型。
 
-当前 Stage-1 主 baseline 选用 `Qwen3-VL-4B-Instruct`：规模适中，使用 Qwen3 官方
-`norm1000` grounding 协议，冻结视觉塔并全参训练 LLM 与视觉 merger。Qwen2.5-VL-3B
-保留为代际/成本对照；本机已有的 Qwen3-VL-32B 只计划做 LoRA 对照，不在
-8×24GB GPU 上强行做语言侧全参 AdamW。
+当前主 baseline 选用 `Qwen3-VL-4B-Instruct`：规模适中，输出使用 Qwen3 官方
+`norm1000` grounding 协议，训练默认采用 LoRA 并冻结视觉塔和 aligner。Qwen2.5-VL-3B
+保留为代际/成本对照；Qwen3-VL-32B 只考虑 LoRA 对照。
 
 ## 已验证的本地 Qwen 链路
 

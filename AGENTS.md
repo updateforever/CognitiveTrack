@@ -27,27 +27,40 @@ Sequence -> Tracker.initialize -> Tracker.track -> ResultWriter -> Evaluator
 
 - 当前优先级是纯 VLM 稀疏跟踪评测，不先做 SUTrack/VLM 工程融合。Hybrid 已有可用
   实现，但不是现阶段论文主实验。
-- Stage-1 主 baseline 是 `Qwen3-VL-4B-Instruct`；Qwen2.5-VL-3B 只作代际/成本
+- 主 baseline 是 `Qwen3-VL-4B-Instruct`；Qwen2.5-VL-3B 只作代际/成本
   对照，Qwen3-VL-32B 只考虑 LoRA 对照。
-- Stage-1/2 只监督 `present/absent` 与存在时的 bbox，不监督旧六分类、身份文字标签、
-  解释文本、细粒度状态或数值置信度。
+- 2026-08-13 起下一版正式训练不再按 Stage-1/2/3 顺序做三次 SFT，而是把单参考、
+  mosaic、长间隔、消失/重现、干净/扰动历史和记忆样本混合后做一次统一三字段 LoRA
+  SFT。旧 Stage-1/2 是已经完成的历史实验和初始化候选，不代表新范式已训练。
+- 统一训练监督 `present/absent`、存在时 bbox 和可空 `memory_update`；仍不监督旧六分类、
+  身份文字标签、解释文本、细粒度状态或数值置信度。
 - 负样本只能来自同一视频中真实的目标消失帧，禁止使用跨序列错配或人工抹除目标。
-- 输入图片保持完整，不做目标局部裁剪，不在图片上画 GT 框。在线 benchmark 的第一帧仍只用 GT 初始化；Stage-1 训练 pair 可使用同一序列中严格早于当前帧的任意真实 present reference，初始框通过文本/官方 grounding 对象传入，Image 2 是未标注的完整当前帧。
-- Stage-1 输出严格是两个字段。Qwen3 示例：
+- 输入图片保持完整、不做目标局部裁剪。下一版中所有过去的身份参考图和可信历史图
+  统一直接画框，不再向模型提供 reference bbox 坐标文本；当前待预测的完整搜索图
+  永远不画框。“所有图画框”只指过去的参考/历史图，不能给 current 画框造成泄漏。
+- 正式在线输入保留永久首帧身份锚点，并显式提供最近可信 VLM 观测及更早历史；稀疏
+  推理中的“最近”不是字面上一视频帧。首帧不能被滚动预测替换，动态历史必须门控，
+  防止一次误跟踪自我强化。
+- 下一版 Qwen3 输出严格是三个字段。例如：
 
 ```json
-{"target_status":"present","bbox_norm1000_xyxy":[100,120,400,520]}
+{"target_status":"present","bbox_norm1000_xyxy":[100,120,400,520],"memory_update":null}
 ```
 
-- 在线认知跟踪协议可以有第三字段 `memory_update`，其值同时表示“是否更新”和短语义
-  增量；`null` 表示不更新。但记忆监督属于 Stage-3，当前 Stage-1 数据和 tracker
-  配置必须关闭该字段。
+- `memory_update` 同时表示“是否更新”和短语义增量；`null` 表示不更新。非空标签只能
+  来自可靠现有标注、视觉/时间过滤和必要审核，普通 bbox 标签不得伪造记忆文本。
 - 记忆目标是模型自主学习“发生稳定重大外观变化时才更新”，不能从普通 bbox 标签
   伪造记忆文本。
 - `parse_error`、`model_error`、`skipped` 和模型预测的 `absent` 必须严格分离；工程
   失败不得伪装成目标消失。
-- 在线推理第一帧只用 GT 初始化，后续帧禁止把当前或未来 GT 传入 tracker。训练 pair 的 reference 只能来自同序列更早的 present 帧；GT 只能在推理结束后用于评测。
+- 在线推理第一帧只用 GT 初始化并在身份锚点图上画框，后续帧禁止把当前或未来 GT
+  传入 tracker。训练 reference/history 只能来自同序列严格更早的 present 帧；GT 只能
+  在推理结束后用于评测。
 - 训练、验证、测试按完整序列划分，禁止帧级泄漏。
+
+统一数据与候选 Prompt 的完整设计见
+[`docs/stage2_stage3_data.md`](docs/stage2_stage3_data.md)。截至 2026-08-13，该设计尚未
+实现到 tracker、Prompt 和数据生成代码；不要把规划当成已完成工程事实。
 
 ## 3. Qwen 坐标协议：不可混用
 
@@ -81,7 +94,7 @@ Qwen2.5-VL 与 Qwen3-VL 不是同一套官方 grounding 坐标：
 新增 tracker 时至少同步检查 tracker、parameter/config、prompt 三层。路径只放在
 `configs/env.local.yaml` 或环境变量中，禁止把本机绝对路径写入可提交配置。
 
-## 5. 截至 2026-08-10 的真实进度
+## 5. 截至 2026-08-13 的真实进度
 
 ### 工程与基线
 
@@ -113,9 +126,12 @@ Qwen2.5-VL 与 Qwen3-VL 不是同一套官方 grounding 坐标：
 - `sampling_plan.json` SHA-256：
   `158372c68e82918d9460826d89f601d1278a3f97e6980e2069718755689c03a7`。
 - 新版本目录为
-  `data/releases/cogtrack_stage1_lasot_tnl2k_mgit_tiny_pair64_v1`。截至 2026-08-11，
-  sampling plan 已冻结，图片与 ms-swift JSONL 正在当前服务器导出；完成前不得声称
-  正式数据包已验收完毕。
+  `data/releases/cogtrack_stage1_lasot_tnl2k_mgit_tiny_pair64_v1`。旧范式导出已完成：
+  train 152,039、val 8,010，完整序列划分。`source_samples.jsonl`、Qwen3 train/val
+  JSONL SHA-256 分别为
+  `e23c61307a132fee5d7ffc83d06bbaf072eda22292491815b21d432191cf9915`、
+  `f5db098150e950013dfefdf2db29be76fe65ca31a757e69aeaa607379d544dce`、
+  `e4b04c79acd6fffb422ac2fcdd3b1f3321c6707ba1977d8c45dd0089c2454543`。
 - 旧 LaSOT+TNL2K 48,400-case v1 从未用于实际训练，其统计和 sampling plan 不再作为
   当前正式数据输入，只保留为历史记录。
 - 构造 CLI 已支持 `--sampling-plan` 严格重放，源数据验收工具为
@@ -125,17 +141,40 @@ Qwen2.5-VL 与 Qwen3-VL 不是同一套官方 grounding 坐标：
 私有 ModelScope 数据仓库或原服务器取得；如果文档中仍是 `<OWNER/...>` 占位符，先向
 用户询问一次实际 ModelScope dataset ID/revision，不要静默重新抽样。
 
-### Qwen3-VL-4B SFT 冒烟
+### 已完成的旧范式 Stage-1/Stage-2 LoRA SFT
 
-- 环境：8×RTX 4090 24GB、PyTorch 2.8.0+cu128、transformers 4.57.1、ms-swift
-  4.3.1、flash-attn 2.8.3.post1。
-- 训练默认改为 `tuner_type=lora`，冻结视觉主干与对齐层，在语言模型线性层注入
-  LoRA；Stage-1/2/3 SFT 和后续 GRPO 统一沿用同一 adapter。全参方案仅作显式对照。
-- 总参数 4.438B，可训练 4.132B（93.10%）。
-- LoRA smoke 使用 BF16、单卡 batch 1；正式全局 batch 根据 4/8 卡资源设置。
-- 两步峰值 16.29GiB/卡，吞吐约 4.64 samples/s；首步 loss 1.536，两步平均 1.366。
-- 已完成单卡 L40S 上 Stage-1/Stage-2 各两步 LoRA smoke；尚未宣称完成正式一轮训练
-  或获得训练后 benchmark 提升。
+- 正式训练环境为本服务器 2×L40；基座为 `Qwen3-VL-4B-Instruct`，BF16，LoRA rank
+  16、alpha 32、dropout 0.05，语言模型线性层注入，视觉塔和 aligner 冻结。
+- Stage-1 旧 pair64 数据共 160,049 cases。最终 checkpoint：
+  `outputs/qwen3vl_4b_stage1_lora_pair64_v2_2gpu/v0-20260812-010602/checkpoint-19005`；
+  19,005/19,005 steps，4h45m41s，train loss 0.29283377，token accuracy 0.882494。
+- Stage-2 旧 mosaic robust v2 数据共 181,969 cases，其中 train 172,915、val 9,054、
+  corrupted-history 21,920。`source_samples.jsonl`、Qwen3 train/val JSONL SHA-256 分别为
+  `08d1ad9c8591fba5924cfb749d172ee7fc86768f0a0bce93d29d3177058a6055`、
+  `758c4e8f04c9dec8df695874ef30f871cf66e9dcc837fa25503df32fb18b6204`、
+  `602241dc4c7cbf316b3904f30ba069339ea990c3cb428b983c929a2d99a7d309`。
+- Stage-2 从 Stage-1 `checkpoint-19005` 继续训练同一个 adapter，没有叠加第二个 LoRA。
+  最终 checkpoint：
+  `outputs/qwen3vl_4b_stage2_lora_mosaic_robust_v2_2gpu/v0-20260812-100910/checkpoint-28819`；
+  28,819/28,819 steps，7h15m14s，train loss 0.25926472，token accuracy 0.89407277，
+  峰值显存 38.13GiB/卡。
+- Stage-1 和 Stage-2 adapter 已发布到私有 ModelScope 模型仓库
+  `updateforever/CognitiveTrack-Qwen3VL-4B-Stage1-LoRA`。Stage-1 位于仓库根目录；
+  Stage-2 位于 `stage2-mosaic-robust-v2/`，权重 SHA-256 为
+  `7437dd2be3bae21070059ef5ce704da7bbd5008607f7e04eb18b3638f04930a1`，已做远端
+  回下载校验。
+- 上述两次训练使用旧范式：参考图框通过坐标文本/grounding 对象传入，Stage-1/2 输出
+  是二字段。它们只证明训练完成，尚未通过正式 CognitiveBench 证明指标提升，也不等于
+  新的“历史图视觉画框 + 一次统一三字段混合训练”已经实现或训练。
+
+### 当前代码与新规划之间的差距
+
+- 当前 `TrackingContextBuilder` 的首帧仍不画框，并在 Prompt 中传 reference bbox 坐标；
+  只有 history mosaic panel 会画框。
+- 当前正式 Qwen3 tracker 配置仍为 pair、二字段并关闭 memory；三字段 parser、语义记忆
+  回灌和门控代码虽已存在，但尚未冻结为新范式配置。
+- 新规划需要同步修改 context builder、pair/mosaic Prompt、训练导出、tracker 配置与测试，
+  之后重新生成统一混合数据并训练。
 
 ## 6. 新服务器最快恢复流程
 
@@ -291,13 +330,17 @@ Git commit、数据/模型 revision 与 checksum、GPU 拓扑和 NCCL 环境。
 
 当前安全的推进顺序是：
 
-1. 在 L40 恢复固定 commit、环境、正式数据和 Qwen3-VL-4B。
-2. 复现两步 smoke，记录 L40 显存/吞吐，不改变 global batch 16。
-3. 完成一轮 Stage-1 SFT，并保存可恢复 checkpoint。
-4. 先跑纯 VLM 稀疏评测，比较零样本、SFT 后和 Qwen2.5 对照。
-5. 分析 present/absent、定位、消失/重现和长间隔 case，而不只看单一 AUC。
-6. Stage-1 确认有效后再构建 Stage-2 mosaic/时序上下文。
-7. 只有取得可靠更新时机和语义增量标签后才进入 Stage-3 memory SFT/GRPO。
+1. 先讨论并冻结 `docs/stage2_stage3_data.md` 的视觉画框输入范式与 Prompt；明确框样式、
+   两图退化和最近可信观测的门控语义。
+2. 同步修改 context builder、Prompt、tracker 配置和训练导出，使训练/推理使用同一绘框
+   实现；当前搜索图必须保持无框。
+3. 构建小规模混合数据，完成 processor 回放、两步 smoke 和小样本过拟合；验证三字段
+   JSON、最后一张图 bbox 绑定和没有 current/future 泄漏。
+4. 生成正式统一混合数据，统计各数据桶、历史框来源和 memory 标签来源，随后只做一次
+   Qwen3-VL-4B LoRA SFT。
+5. 同时评测基座、旧 Stage-2 adapter、从基座统一训练、从 Stage-2 继续统一训练，按
+   CognitiveBench 的 presence、bbox、消失/重现、长 gap 和 memory 指标选择主模型。
+6. 只有 SFT 与 memory reward 回放可靠后再做 GRPO；先纯 VLM，不转向 hybrid 主实验。
 
 ## 9. 开发与提交约束
 
