@@ -133,6 +133,15 @@ class OpenAIVLMConfig:
         elif generation_fields:
             data["generation"] = GenerationConfig(**generation_fields)
 
+        # vLLM 多卡评测通常是一卡一个服务端口。模型 YAML 保持可提交，具体
+        # endpoint 由 worker 的环境变量注入；model_name 也允许同样方式切换
+        # base / LoRA。这里只展开连接字段，路径字段仍由 tracker 的统一路径
+        # 解析逻辑处理，避免两套规则互相覆盖。
+        for key in ("base_url", "model_name", "api_key_env", "api_key_fallback"):
+            value = data.get(key)
+            if isinstance(value, str):
+                data[key] = os.path.expandvars(value)
+
         valid_fields = set(cls.__dataclass_fields__)
         unknown = sorted(set(data) - valid_fields)
         if unknown:

@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from pytracking.datasets.registry import list_datasets, load_dataset  # noqa: E402
+from pytracking.datasets.subset import sequence_subset_from_config  # noqa: E402
 from pytracking.evaluation.environment import load_environment  # noqa: E402
 
 
@@ -55,6 +56,11 @@ def main() -> int:
             raise TypeError("source_roots 必须是 mapping")
         overrides.update({str(name).lower(): str(path) for name, path in source_roots.items()})
         environment = load_environment(args.env_config, overrides=overrides)
+        configured_names = (
+            sequence_subset_from_config(dataset_config, args.dataset_config)
+            if args.dataset_config
+            else None
+        )
 
         # 显式序列和 limit 均走 loader 的按名称快路径，避免仅为结构检查就展开
         # CognitiveBench 上百万个帧路径；无论哪种模式都不会读取图像像素。
@@ -62,8 +68,13 @@ def main() -> int:
         sequences = load_dataset(
             str(dataset_name),
             environment=environment,
-            sequence_names=args.sequence,
-            limit=None if args.sequence else max(args.limit, 0),
+            sequence_names=args.sequence or configured_names,
+            # 冻结子集应默认完整检查；--limit 只约束没有清单的普通数据集。
+            limit=(
+                None
+                if args.sequence or configured_names is not None
+                else max(args.limit, 0)
+            ),
             **dataset_kwargs,
         )
     except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:

@@ -258,7 +258,7 @@ def test_model_controlled_semantic_memory_is_written_and_reused_in_next_prompt()
     assert second["cognition"]["memory_updated"] is False
 
 
-def test_absent_output_with_memory_proposal_is_a_parse_error():
+def test_absent_output_rejects_only_memory_proposal():
     tracker = _tracker(
         context_mode="pair",
         responses=[
@@ -276,8 +276,10 @@ def test_absent_output_with_memory_proposal_is_a_parse_error():
 
     output = tracker.track(image, {"frame_num": 1, "frame_path": "0001.jpg"})
 
-    assert output["execution"]["status"] == "parse_error"
-    assert output["prediction"] is None
+    assert output["execution"]["status"] == "ok"
+    assert output["prediction"]["target_presence"] == "absent"
+    assert output["cognition"]["memory_update_proposal"] is None
+    assert "absent" in output["cognition"]["memory_update_error"]
     assert output["memory_decision"]["semantic"]["accepted"] is False
 
 

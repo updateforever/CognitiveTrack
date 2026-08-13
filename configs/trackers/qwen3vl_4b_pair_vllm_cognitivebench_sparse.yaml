@@ -1,0 +1,15 @@
+tracker_name: cognitive_vlm
+experiment_name: qwen3vl_4b_pair_vllm_cognitivebench_sparse
+context_mode: pair
+bbox_protocol: norm1000
+
+observation_policy:
+  type: keyframe
+
+memory:
+  enabled: false
+  model_output_enabled: false
+  semantic_enabled: false
+
+model_config: ../models/qwen3vl_4b_vllm_base.yaml
+save_raw_response: true

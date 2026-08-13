@@ -27,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from pytracking.datasets.registry import list_datasets, load_dataset  # noqa: E402
+from pytracking.datasets.subset import sequence_subset_from_config  # noqa: E402
 from pytracking.evaluation.environment import load_environment  # noqa: E402
 from pytracking.evaluation.observation_policy import (  # noqa: E402
     DenseObservationPolicy,
@@ -73,7 +74,9 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_configs(args: argparse.Namespace) -> tuple[TrackerSpec, str, str | None, dict[str, str], str]:
+def _resolve_configs(
+    args: argparse.Namespace,
+) -> tuple[TrackerSpec, str, str | None, dict[str, str], str, tuple[str, ...] | None]:
     tracker_payload: dict[str, Any] = {}
     if args.tracker_config:
         tracker_payload = _read_yaml(args.tracker_config)
@@ -89,8 +92,13 @@ def _resolve_configs(args: argparse.Namespace) -> tuple[TrackerSpec, str, str | 
     )
 
     dataset_payload: dict[str, Any] = {}
+    dataset_sequence_names: tuple[str, ...] | None = None
     if args.dataset_config:
         dataset_payload = _read_yaml(args.dataset_config)
+        dataset_sequence_names = sequence_subset_from_config(
+            dataset_payload,
+            args.dataset_config,
+        )
     dataset_name = args.dataset or dataset_payload.get("name")
     if not dataset_name:
         raise ValueError("请提供 --dataset 或 --dataset-config 中的 name")
@@ -109,13 +117,27 @@ def _resolve_configs(args: argparse.Namespace) -> tuple[TrackerSpec, str, str | 
     policy_kind = (
         args.observation or str((tracker_payload.get("observation_policy") or {}).get("type", "dense")).lower()
     )
-    return tracker_spec, str(dataset_name), str(split) if split is not None else None, dataset_overrides, policy_kind
+    return (
+        tracker_spec,
+        str(dataset_name),
+        str(split) if split is not None else None,
+        dataset_overrides,
+        policy_kind,
+        dataset_sequence_names,
+    )
 
 
 def main() -> int:
     args = _parser().parse_args()
     try:
-        tracker_spec, dataset_name, split, dataset_overrides, policy_kind = _resolve_configs(args)
+        (
+            tracker_spec,
+            dataset_name,
+            split,
+            dataset_overrides,
+            policy_kind,
+            dataset_sequence_names,
+        ) = _resolve_configs(args)
         environment = load_environment(args.env_config, overrides=dataset_overrides)
         if args.results_dir:
             environment = environment.with_results_path(args.results_dir)
@@ -123,7 +145,9 @@ def main() -> int:
         sequences = load_dataset(
             dataset_name,
             environment=environment,
-            sequence_names=args.sequence,
+            # 显式 --sequence 仍用于单 case 调试并拥有最高优先级；否则使用
+            # dataset YAML 冻结的 Tiny/Lite 序列清单。
+            sequence_names=args.sequence or dataset_sequence_names,
             **dataset_kwargs,
         )
 

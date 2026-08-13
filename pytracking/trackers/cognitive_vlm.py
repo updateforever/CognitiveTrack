@@ -372,10 +372,13 @@ class CognitiveVLMTracker(BaseTracker):
             memory_decisions["visual"] = self._memory_policy.process(bank, visual_candidate)
 
         proposal = frame_result.cognition.memory_update_proposal
+        proposal_error = frame_result.cognition.memory_update_error
         if frame_result.execution.status is not ExecutionStatus.OK or frame_result.prediction is None:
             semantic_decision = MemoryUpdateDecision(False, "本帧执行未成功，禁止写入语义记忆")
         elif not self.memory_output_enabled:
             semantic_decision = MemoryUpdateDecision(False, "二字段 presence-only 协议未请求语义记忆")
+        elif proposal_error is not None:
+            semantic_decision = MemoryUpdateDecision(False, proposal_error)
         elif proposal is None:
             semantic_decision = MemoryUpdateDecision(False, "模型选择 memory_update=null")
         elif not self.semantic_memory_enabled:
@@ -409,6 +412,7 @@ class CognitiveVLMTracker(BaseTracker):
                 target_text=frame_result.cognition.target_text,
                 reasoning=frame_result.cognition.reasoning,
                 memory_update_proposal=proposal,
+                memory_update_error=proposal_error,
                 memory_updated=bool(semantic_decision.accepted),
                 memory_update_reason=semantic_decision.reason,
             ),

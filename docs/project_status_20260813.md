@@ -29,9 +29,10 @@ Prompt 草案见 `docs/stage2_stage3_data.md`。本页严格区分“已经完�
 
 代码状态：
 
-- Git HEAD：`70b9dd1ea0721abf6c5d6b7275f96a27163f27c5`；
+- 本文随代码维护；恢复时以 `git rev-parse HEAD` 为准，不再引用讨论开始时的旧 HEAD；
 - CognitiveBench v1 冻结标注已纳入 Git：995 序列、1,408,438 帧、343,616 关键帧；
-- 最近一次代码验证：Ruff 通过、126 tests passed、`git diff --check` 通过。
+- 最近一次代码验证：Ruff 通过、131 tests passed、CognitiveBench 冻结标注校验通过、
+  `git diff --check` 通过。
 
 旧范式训练：
 
@@ -54,7 +55,19 @@ ModelScope：
 - 已从远端重新下载权重并完成 SHA-256 校验；
 - 只上传推理 adapter、训练参数/状态、日志、曲线和 checksum，未上传 optimizer/RNG。
 
-目前没有正式 CognitiveBench 证据证明 Stage-1/2 提升了跟踪指标。
+Base、Stage-1 与 Stage-2 已在冻结的 CognitiveBench-Tiny v1 上使用相同稀疏推理协议
+完成一次初步聚合评测：
+
+| 实验 | Hold-last AUC | Observation-only AUC | Presence F1 | Absent FPR | Reappearance recovery |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Base | 21.81 | 21.61 | 93.41 | 33.11 | 30.67 |
+| Stage-1 | 52.64 | 56.45 | 96.05 | 45.14 | 88.96 |
+| Stage-2 | 55.05 | 58.62 | 96.16 | 15.24 | 89.57 |
+
+这组结果说明旧跟踪 SFT 有明显初步潜力，Stage-2 也改善了 Stage-1 的定位、absent FPR
+和结构化输出稳定性。但它只覆盖 24 条 Tiny 完整序列，不是 Full 主表，也没有使用本页
+规划的新视觉画框输入。完整协议、全部指标与限制见
+[`legacy_staged_tiny_results_20260813.md`](legacy_staged_tiny_results_20260813.md)。
 
 ## 3. 当前代码仍是什么范式
 
@@ -64,10 +77,13 @@ ModelScope：
 - 首帧 bbox 作为 Prompt 坐标文本传入；
 - history mosaic panel 会画框；
 - 当前搜索图无框；
-- 正式 Qwen3 tracker 配置仍是 pair、二字段、memory disabled。
+- Tiny 对照运行已增加统一的 mosaic、三字段、memory-enabled 配置，并在 Base、Stage-1、
+  Stage-2 间只替换权重；但首帧输入仍是“无框完整图 + Prompt 坐标文本”，因此仍属旧
+  输入范式，不是本页规划的新视觉画框实现。
 
-已有但尚未正式启用的能力包括三字段严格 parser、semantic memory 回灌、视觉 history
-bank、memory gate 和逐帧审计 JSONL。不能把这些代码存在等同于新范式已验证。
+三字段严格 parser、semantic memory 回灌、视觉 history bank、memory gate 和逐帧审计
+JSONL 已接入，并在 Tiny 旧权重兼容性对照中运行。但旧 Stage-1/2 没有接受 memory
+监督，这次运行不能证明语义记忆学习有效，更不能等同于新视觉画框范式已验证。
 
 ## 4. 下一步实现边界
 

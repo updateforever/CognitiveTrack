@@ -340,6 +340,7 @@ def parse_training_tracking_answer(value: Any) -> dict[str, Any]:
             bbox_protocol=bbox_protocol,
             model_image_size=(1000, 1000) if bbox_protocol == "qwen_abs_pixel" else None,
             require_memory_update="memory_update" in answer,
+            strict_memory_update=True,
         )
     except (ModelOutputParseError, OverflowError, TypeError, ValueError) as error:
         raise ValueError(f"答案不符合推理协议：{error}") from error

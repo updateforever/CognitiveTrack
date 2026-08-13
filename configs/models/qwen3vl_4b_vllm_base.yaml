@@ -1,0 +1,19 @@
+backend: openai_api
+base_url: ${COGTRACK_VLLM_BASE_URL}
+model_name: qwen3vl-base
+processor_path: Qwen3-VL-4B-Instruct
+api_key_env: LOCAL_VLLM_API_KEY
+api_key_fallback: local-test-key
+
+# 与 Hugging Face baseline 使用相同的视觉分辨率上限；JPEG 95 只降低本机
+# HTTP 编解码开销，base 与 LoRA 实验始终共享这一设置，保证对比公平。
+max_image_side: 648
+image_format: jpeg
+jpeg_quality: 95
+timeout_s: 180.0
+max_retries: 2
+retry_backoff_s: 1.0
+
+max_new_tokens: 128
+temperature: 0.0
+do_sample: false

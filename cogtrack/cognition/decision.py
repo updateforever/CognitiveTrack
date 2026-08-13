@@ -78,6 +78,9 @@ class CognitiveDecisionEngine:
                 # 在解析层直接报 parse_error，不会退化成带偏移的“正常”预测。
                 model_image_size=response.current_frame_size(),
                 require_memory_update=prompt.include_memory_update,
+                # 在线推理分层校验：第三字段非法只拒绝记忆，不丢弃合法的核心跟踪
+                # 判断。训练数据验收会显式启用 strict_memory_update。
+                strict_memory_update=False,
             )
         except ModelOutputParseError as error:
             execution = ExecutionInfo.failure(

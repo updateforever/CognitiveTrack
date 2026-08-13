@@ -49,6 +49,10 @@ Sequence -> Tracker.initialize -> Tracker.track -> ResultWriter -> Evaluator
 
 - `memory_update` 同时表示“是否更新”和短语义增量；`null` 表示不更新。非空标签只能
   来自可靠现有标注、视觉/时间过滤和必要审核，普通 bbox 标签不得伪造记忆文本。
+- 正式 benchmark 推理不随训练阶段切换模式：固定使用首帧完整图身份锚点、在线可信
+  历史预测 mosaic、当前关键帧完整图，以及三字段输出。Stage-1/2 的阶段专用 pair
+  配置只作训练验证或消融。第三字段缺失/非法时拒绝记忆提议并留痕，但只要核心
+  `target_status+bbox` 合法，就不能把整帧降成 parse_error。
 - 记忆目标是模型自主学习“发生稳定重大外观变化时才更新”，不能从普通 bbox 标签
   伪造记忆文本。
 - `parse_error`、`model_error`、`skipped` 和模型预测的 `absent` 必须严格分离；工程
@@ -110,6 +114,9 @@ Qwen2.5-VL 与 Qwen3-VL 不是同一套官方 grounding 坐标：
 - CognitiveBench v1 的 995 序列冻结标注已纳入
   `benchmarks/cognitivebench/v1/`，共 1,408,438 帧和 343,616 个 0-based 关键帧；
   benchmark 不含图像，运行时仍依赖 LaSOT-test、TNL2K-test 和 MGIT-val。
+- CognitiveBench-Tiny v1 已冻结为 24 条完整序列（MGIT/LaSOT/TNL2K=1/7/16），
+  共 39,251 帧、9,892 个关键帧和 9,868 次非初始化 VLM 请求。Tiny 先产正式初步
+  结果，Full 后补最终主表；二者只允许切换 dataset config，不得更改推理协议。
 
 ### Stage-1 正式数据
 
@@ -164,15 +171,19 @@ Qwen2.5-VL 与 Qwen3-VL 不是同一套官方 grounding 坐标：
   `7437dd2be3bae21070059ef5ce704da7bbd5008607f7e04eb18b3638f04930a1`，已做远端
   回下载校验。
 - 上述两次训练使用旧范式：参考图框通过坐标文本/grounding 对象传入，Stage-1/2 输出
-  是二字段。它们只证明训练完成，尚未通过正式 CognitiveBench 证明指标提升，也不等于
-  新的“历史图视觉画框 + 一次统一三字段混合训练”已经实现或训练。
+  是二字段。Base/Stage-1/Stage-2 已在冻结的 CognitiveBench-Tiny 同协议完成一次初步
+  聚合评测：hold-last AUC 为 21.81/52.64/55.05，observation-only AUC 为
+  21.61/56.45/58.62。完整口径见
+  `docs/legacy_staged_tiny_results_20260813.md`；Full 尚未运行，且这些结果不等于新的
+  “历史图视觉画框 + 一次统一三字段混合训练”已经实现或训练。
 
 ### 当前代码与新规划之间的差距
 
 - 当前 `TrackingContextBuilder` 的首帧仍不画框，并在 Prompt 中传 reference bbox 坐标；
   只有 history mosaic panel 会画框。
-- 当前正式 Qwen3 tracker 配置仍为 pair、二字段并关闭 memory；三字段 parser、语义记忆
-  回灌和门控代码虽已存在，但尚未冻结为新范式配置。
+- 当前用于 Tiny 对照的 Qwen3 tracker 配置已固定为 mosaic、三字段和 memory enabled，
+  并对 Base/Stage-1/Stage-2 只替换权重；pair 配置仅作阶段验证与消融。但这套运行时的
+  首帧仍走坐标文本，因此不能称为下一版视觉画框新范式。
 - 新规划需要同步修改 context builder、pair/mosaic Prompt、训练导出、tracker 配置与测试，
   之后重新生成统一混合数据并训练。
 

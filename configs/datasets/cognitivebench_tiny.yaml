@@ -1,0 +1,5 @@
+name: cognitivebench
+split: test
+# Tiny 只冻结完整序列清单；图片、GT、presence 与关键帧全部复用 CognitiveBench v1。
+root: benchmarks/cognitivebench/v1
+sequences_file: ../../benchmarks/cognitivebench/v1/subsets/tiny24.txt

@@ -1,0 +1,22 @@
+# CognitiveTrack v1 冻结正式推理协议，仅将权重替换为 Stage-2 mosaic adapter。
+tracker_name: cognitive_vlm
+experiment_name: qwen3vl_4b_cognitive_v1_stage2
+context_mode: mosaic
+bbox_protocol: norm1000
+
+observation_policy:
+  type: keyframe
+
+memory:
+  enabled: true
+  model_output_enabled: true
+  semantic_enabled: true
+  max_positive_records: 3
+  max_semantic_records: 4
+  confirmations: 2
+  max_confirmation_gap: 30
+  min_positive_frame_gap: 5
+  min_semantic_frame_gap: 30
+
+model_config: ../models/qwen3vl_4b_vllm_stage2.yaml
+save_raw_response: true

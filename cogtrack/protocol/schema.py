@@ -126,6 +126,9 @@ class CognitionInfo:
     target_text: str = ""
     reasoning: str = ""
     memory_update_proposal: Optional[str] = None
+    # 第三字段是可选的慢路径提议。它违反记忆约束时保留错误用于审计，但不能
+    # 擦除已经合法解析的 target_status/bbox 核心跟踪结果。
+    memory_update_error: Optional[str] = None
     memory_updated: bool = False
     memory_update_reason: str = ""
 
@@ -139,6 +142,11 @@ class CognitionInfo:
             if not isinstance(proposal, str) or not proposal.strip():
                 raise ProtocolValidationError("memory_update_proposal 必须是非空字符串或 None")
             object.__setattr__(self, "memory_update_proposal", proposal.strip())
+        memory_error = self.memory_update_error
+        if memory_error is not None:
+            if not isinstance(memory_error, str) or not memory_error.strip():
+                raise ProtocolValidationError("memory_update_error 必须是非空字符串或 None")
+            object.__setattr__(self, "memory_update_error", memory_error.strip())
 
 
 @dataclass(frozen=True)

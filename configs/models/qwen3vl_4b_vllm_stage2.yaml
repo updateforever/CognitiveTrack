@@ -1,0 +1,18 @@
+backend: openai_api
+base_url: ${COGTRACK_VLLM_BASE_URL}
+model_name: cogtrack-stage2
+processor_path: Qwen3-VL-4B-Instruct
+api_key_env: LOCAL_VLLM_API_KEY
+api_key_fallback: local-test-key
+
+# 与 Base/Stage1 正式 Tiny 评测完全相同，确保只比较 checkpoint 差异。
+max_image_side: 648
+image_format: jpeg
+jpeg_quality: 95
+timeout_s: 180.0
+max_retries: 2
+retry_backoff_s: 1.0
+
+max_new_tokens: 128
+temperature: 0.0
+do_sample: false

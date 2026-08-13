@@ -31,6 +31,10 @@ GRPO。所有实验遵循：第一帧仅用 GT 初始化，后续推理不读取
 仓库包含 CognitiveBench v1 的冻结标注：995 个长时序列、1,408,438 帧和 343,616
 个关键帧。标注由 LaSOT test、TNL2K test 和 MGIT val 组成，不包含原始图像。
 
+项目同时冻结 `CognitiveBench-Tiny v1`：从三个来源选取 24 条完整序列，共 39,251 帧
+和 9,892 个关键帧。Tiny 用于快速正式迭代，Full 用于最终主表；Tiny 不是截帧 smoke，
+两者复用完全相同的标注、评测器与推理协议。
+
 完整数据格式和使用约束见
 [benchmarks/cognitivebench/v1/README.md](benchmarks/cognitivebench/v1/README.md)。clone 后可
 离线检查标注完整性：
@@ -124,16 +128,19 @@ python tracking/smoke_test_qwen.py \
   --env-config configs/env.local.yaml
 ```
 
-运行完整 CognitiveBench 关键帧稀疏评测：
+正式 CognitiveTrack v1 推理固定使用首帧身份锚点、可信历史预测 mosaic、当前关键帧
+全图，以及 `target_status + bbox + memory_update` 三字段协议。先在 Tiny 上评测：
 
 ```bash
 python tracking/test.py \
   --config configs/env.local.yaml \
-  --tracker-config configs/trackers/qwen3vl_4b_pair_sft_cognitivebench_sparse.yaml \
-  --dataset-config configs/datasets/cognitivebench.yaml
+  --tracker-config configs/trackers/qwen3vl_4b_cognitive_stage1_vllm.yaml \
+  --dataset-config configs/datasets/cognitivebench_tiny.yaml
 ```
 
-零样本基座使用 `configs/trackers/qwen3vl_4b_pair_cognitivebench_sparse.yaml`。SUTrack 与
+确认协议和性能趋势后，仅将数据配置换成 `configs/datasets/cognitivebench.yaml` 即可
+运行 Full。零样本基座使用 `configs/trackers/qwen3vl_4b_cognitive_vllm.yaml`。pair、
+无历史和无语义记忆配置只用于消融，不作为不同训练阶段的主推理模式。SUTrack 与
 Hybrid 配置位于 `configs/trackers/`；SUTrack checkpoint 通过
 `COGTRACK_SUTRACK_CHECKPOINT` 注入，不在 YAML 中写绝对路径。
 
@@ -196,7 +203,8 @@ bash scripts/train_qwen3vl_4b_stage1.sh
 
 旧 Stage-1/Stage-2 分阶段训练结果仅作为历史对照；下一版将统一视觉画框输入与三字段
 混合训练。方案状态和已完成实验分别见
-[docs/project_status_20260813.md](docs/project_status_20260813.md) 与 `docs/` 下的实验归档。
+[docs/project_status_20260813.md](docs/project_status_20260813.md) 与
+[旧分阶段 Tiny 结果](docs/legacy_staged_tiny_results_20260813.md)。
 
 ## 代码结构
 

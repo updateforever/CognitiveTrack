@@ -54,11 +54,14 @@ def test_tracking_parser_accepts_a_short_memory_delta():
 
 
 @pytest.mark.parametrize("memory_update", ["", 1, [], {}])
-def test_tracking_parser_rejects_invalid_memory_update(memory_update):
+def test_tracking_parser_rejects_only_invalid_memory_branch(memory_update):
     payload = _valid_payload()
     payload["memory_update"] = memory_update
-    with pytest.raises(ModelOutputParseError, match="memory_update"):
-        parse_tracking_output(json.dumps(payload), image_width=200, image_height=100)
+    parsed = parse_tracking_output(json.dumps(payload), image_width=200, image_height=100)
+
+    assert parsed.prediction.target_presence.value == "present"
+    assert parsed.cognition.memory_update_proposal is None
+    assert "memory_update" in parsed.cognition.memory_update_error
 
 
 def test_absent_prediction_cannot_update_memory():
@@ -68,8 +71,22 @@ def test_absent_prediction_cannot_update_memory():
         bbox_norm1000_xyxy=None,
         memory_update="The target changed appearance.",
     )
-    with pytest.raises(ModelOutputParseError, match="absent.*memory_update"):
-        parse_tracking_output(json.dumps(payload), image_width=200, image_height=100)
+    parsed = parse_tracking_output(json.dumps(payload), image_width=200, image_height=100)
+
+    assert parsed.prediction.target_presence.value == "absent"
+    assert parsed.cognition.memory_update_proposal is None
+    assert "absent" in parsed.cognition.memory_update_error
+
+
+def test_missing_optional_memory_field_preserves_core_tracking_result():
+    payload = _valid_payload()
+    del payload["memory_update"]
+
+    parsed = parse_tracking_output(json.dumps(payload), image_width=200, image_height=100)
+
+    assert parsed.prediction.target_presence.value == "present"
+    assert parsed.cognition.memory_update_proposal is None
+    assert "缺少 memory_update" in parsed.cognition.memory_update_error
 
 
 def test_bbox_iou():

@@ -1,0 +1,30 @@
+# CognitiveBench-Tiny v1：24 条完整序列，禁止按帧截断。
+# MGIT-val (1)
+273
+
+# LaSOT-test (7)
+cat-3
+elephant-16
+leopard-20
+mouse-17
+shark-6
+swing-10
+truck-16
+
+# TNL2K-test (16)
+Bullet_video_10_done
+CartoonHuLuWa_video_06_done
+CartoonKobe_video_03_done
+CartoonSlamDUNK_video_06_done
+Chase_video_U01-Done
+Chase_video_X03-2
+Fire_video_10-Done
+JordanBasketball_video_04-Done
+NBA_Bull_video_04-Done
+Ship_video_X29-Done
+Soccer_video_03-Done
+advSamp_Bicycle_video_04-Done
+advSamp_Juediqiusheng_video_012-Done
+monitor_E-bike5
+monitor_child
+test_002_BF5_FireGUN_video_05

@@ -16,6 +16,33 @@ CognitiveBench v1 是 CognitiveTrack 的冻结长时认知跟踪评测标注。�
 总体 absent 比例为 9.5320%；关键帧中的 absent 比例为 9.6634%。MGIT 使用 val 是
 因为其 test GT 不公开。
 
+## Tiny 正式子集
+
+`subsets/tiny24.txt` 冻结了 CognitiveBench-Tiny v1。它包含 24 条**完整序列**，
+不是截取片段：MGIT/LaSOT/TNL2K 分别为 1/7/16 条，共 39,251 帧、9,892 个关键帧，
+其中关键帧 absent 比例为 11.9389%，包含 163 次 absent→present 重现。除序列清单外，
+Tiny 与 Full 共用同一份图片、逐帧 GT、presence 标注和关键帧索引。
+去掉注释与空行后，以换行连接的 24 个序列名 SHA-256 为
+`e4faa241f6a44165ca5e26d13c1abe581de60c3a7c272fcb743fd40789e77e90`。
+
+Tiny 用于快速产生可以正式比较的模型结果；Full 用于最终论文主表。二者必须使用同一
+正式 tracker 配置。Tiny 不是调参集，不能按单个模型表现重新挑选序列。序列按 Full
+中的来源占比近似分层，再结合长度、关键帧数、消失比例、重现次数与关键帧间隔覆盖
+挑选；清单发布后即冻结。
+
+加载 Tiny：
+
+```bash
+python tracking/inspect_dataset.py \
+  --dataset-config configs/datasets/cognitivebench_tiny.yaml \
+  --env-config configs/env.local.yaml
+```
+
+正式推理协议固定为：首帧全图身份锚点及文本坐标、可信历史预测 mosaic、当前关键帧
+全图；输出 `target_status`、Qwen3 原生 `bbox_norm1000_xyxy` 与 `memory_update`。历史
+只能来自在线预测经门控接受的过去帧，禁止使用后续 GT。pair、无历史、无语义记忆等
+模式只作为消融实验。
+
 ## 目录格式
 
 ```text

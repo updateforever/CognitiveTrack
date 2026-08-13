@@ -128,6 +128,7 @@ def parse_tracking_output(
     bbox_protocol: str = BBOX_PROTOCOL_NORM1000,
     model_image_size: Optional[Tuple[int, int]] = None,
     require_memory_update: bool = True,
+    strict_memory_update: bool = False,
 ) -> ParsedTrackingOutput:
     """严格解析 pair/mosaic 跟踪输出，并转换 bbox 坐标。
 
@@ -146,13 +147,24 @@ def parse_tracking_output(
     validate_bbox_protocol(bbox_protocol)
     bbox_key = bbox_protocol_json_key(bbox_protocol)
     data = _load_json_object(raw_text)
-    expected = {
+    core_keys = {
         "target_status",
         bbox_key,
     }
+    expected = set(core_keys)
     if require_memory_update:
         expected.add("memory_update")
-    _require_exact_keys(data, expected, "tracking")
+    # target_status/bbox 是核心跟踪协议，必须严格存在。memory_update 是独立的
+    # 可选慢路径：缺失或非法时拒绝更新并留痕，但不抹掉合法核心预测。
+    missing_core = sorted(core_keys - set(data))
+    unknown = sorted(set(data) - expected)
+    if missing_core or unknown:
+        details = []
+        if missing_core:
+            details.append(f"缺少字段 {missing_core}")
+        if unknown:
+            details.append(f"未知字段 {unknown}")
+        raise ModelOutputParseError(f"tracking 输出字段不符合 v4 协议：{'；'.join(details)}")
 
     presence = _enum(data["target_status"], TargetPresence, "target_status")
     if presence is TargetPresence.UNCERTAIN:
@@ -191,16 +203,23 @@ def parse_tracking_output(
             raise ModelOutputParseError(f"{bbox_key} 非法：{error}") from error
 
     memory_update: Optional[str] = None
+    memory_update_error: Optional[str] = None
     if require_memory_update:
-        raw_memory = data["memory_update"]
-        if raw_memory is not None:
-            if not isinstance(raw_memory, str):
-                raise ModelOutputParseError("memory_update 必须是 null 或字符串")
-            memory_update = raw_memory.strip()
-            if not memory_update:
-                raise ModelOutputParseError("memory_update 字符串不能为空；不更新时必须使用 null")
-            if len(memory_update) > 300:
-                raise ModelOutputParseError("memory_update 不能超过 300 个字符")
+        if "memory_update" not in data:
+            memory_update_error = "缺少 memory_update；已按 null 拒绝记忆更新"
+        else:
+            raw_memory = data["memory_update"]
+            if raw_memory is not None:
+                if not isinstance(raw_memory, str):
+                    memory_update_error = "memory_update 必须是 null 或字符串；已按 null 处理"
+                else:
+                    candidate = raw_memory.strip()
+                    if not candidate:
+                        memory_update_error = "memory_update 字符串不能为空；已按 null 处理"
+                    elif len(candidate) > 300:
+                        memory_update_error = "memory_update 不能超过 300 个字符；已按 null 处理"
+                    else:
+                        memory_update = candidate
 
     # v4 的身份和可定位性不再由模型生成，而由二分类标签与 bbox 确定性派生。
     if presence is TargetPresence.ABSENT:
@@ -209,7 +228,8 @@ def parse_tracking_output(
         identity = IdentityMatch.NOT_APPLICABLE
         localizability = Localizability.NOT_APPLICABLE
         if memory_update is not None:
-            raise ModelOutputParseError("absent 时 memory_update 必须为 null")
+            memory_update = None
+            memory_update_error = "absent 时 memory_update 必须为 null；已拒绝记忆更新"
     elif normalized_bbox is None:
         raise ModelOutputParseError(f"present + localizable 时必须输出 {bbox_key}")
     else:
@@ -228,7 +248,13 @@ def parse_tracking_output(
     except ProtocolValidationError as error:
         raise ModelOutputParseError(f"tracking 输出字段语义冲突：{error}") from error
 
-    cognition = CognitionInfo(memory_update_proposal=memory_update)
+    if memory_update_error is not None and strict_memory_update:
+        raise ModelOutputParseError(memory_update_error)
+
+    cognition = CognitionInfo(
+        memory_update_proposal=memory_update,
+        memory_update_error=memory_update_error,
+    )
     return ParsedTrackingOutput(prediction, cognition, normalized_bbox, bbox_protocol)
 
 
