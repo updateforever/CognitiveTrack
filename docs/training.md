@@ -1,255 +1,129 @@
-# ms-swift 训练指引
+# ms-swift 分阶段训练指引
 
-## 1. 当前监督边界与统一训练
+## 1. 当前训练顺序
 
-2026-08-13 起，下一版正式训练改为一次统一混合 LoRA SFT，不再依次做三次能力阶段：
+CognitiveTrack 不再按旧 pair/mosaic 的模型能力名称切换推理模式。所有当前 checkpoint
+共享 VLT-v6.3 三图输入和三字段输出，只改变哪些字段已有可靠监督：
 
-- 混合单参考、mosaic、长间隔、消失/重现、干净/扰动历史和记忆事件；
-- 所有过去的参考/历史图直接视觉画框，不再在 Prompt 中传 reference bbox 坐标；
-- 当前完整搜索图始终无框；
-- 所有样本统一输出三字段，普通样本的 `memory_update` 为 `null`，非空文本只来自可靠
-  标签与审核；
-- 不监督旧六分类、解释文本、身份标签、细粒度状态或数值置信度。
-
-完整输入范式、Prompt、混合比例、MGIT 使用边界和消融见
-[stage2_stage3_data.md](stage2_stage3_data.md)。共享绘框、v5 Prompt、三字段导出和
-visual-v5 probe 入口已经实现；正式分桶数据、训练和 benchmark 尚未完成。
-
-统一训练使用 v5 三字段样本：
-
-```json
-{"target_status":"present","bbox_norm1000_xyxy":[100,120,400,520],"memory_update":"Rear view reveals two stable white stripes."}
-```
-
-上例是 Qwen3-VL；Qwen2.5-VL 使用 `bbox_pixel_xyxy` 和 processor-resize 后绝对
-像素值。
-
-同一正式训练批次不混用二字段和三字段 Prompt。旧二字段 Stage-1/2 数据只能作为历史
-基线；若用于新混合训练，必须重新渲染参考图并补充经过规则/审核的第三字段，而不能
-机械给所有旧样本追加 `null`。导出校验器必须严格拒绝缺字段、额外字段、空字符串以及
-`absent + 非空 memory_update`。
-
-## 2. Visual-v5 probe 数据
-
-多数据集入口为 `tracking/synthesize_visual_v5_dataset.py`。它复用旧数据管线中已经验证的
-官方 train split、7:3 同序列 presence 采样、完整序列 train/val 划分和 Qwen 官方坐标
-导出，但固定使用 visual box 与三字段协议。正式构建默认要求 `--memory-labels`；只有
-工程 dry-run 才允许：
-
-```bash
-python tracking/synthesize_visual_v5_dataset.py \
-  --datasets tnl2k --limit-sequences-per-dataset 2 \
-  --env-config configs/env.local.yaml \
-  --max-samples-per-sequence 4 --absent-ratio 0 \
-  --memory-supervision feasibility_null \
-  --output-dir data/feasibility/cogtrack_visual_v5_tnl2k
-```
-
-`feasibility_null` 会写入不可用于正式训练的 provenance。正式 plan、memory manifest、
-重放与训练命令见 [visual_v5_iteration.md](visual_v5_iteration.md)。该 probe 还不是论文版
-五类 case 精确配额数据；probe 有明确 benchmark 增益后再扩大合成复杂度。
-
-## 3. 已完成的旧 Stage-1 数据（历史基线）
-
-以下入口记录已经完成的旧二字段实验，不能直接生成新统一画框数据。它固定读取三个
-数据集的官方 `train` split，并在生成后再次审计每条样本的
-来源。它会同时产出图片、源 manifest、校验报告，以及 Qwen2.5-VL/Qwen3-VL 各自
-可直接交给 ms-swift 的 `train.jsonl` / `val.jsonl`：
-
-```bash
-python tracking/synthesize_stage1_dataset.py \
-  --datasets lasot tnl2k mgit \
-  --mgit-version tiny --allow-missing-mgit-sequences \
-  --env-config configs/env.local.yaml \
-  --context-mode pair --max-samples-per-sequence 64 \
-  --absent-ratio 0.3 \
-  --output-dir data/releases/cogtrack_stage1_lasot_tnl2k_mgit_tiny_pair64_v1
-```
-
-构造器先扫描同序列连续状态区间，再在全数据集层面分配 absent 配额。负样本只来自
-LaSOT 的 `full_occlusion/out_of_view`、TNL2K 的零框帧和 MGIT 的 `absent` 属性；
-不会跨序列配对或人工抹除目标。absent 区间优先覆盖首尾，present 则优先覆盖消失前
-和重现后的边界帧，再做时间均匀采样。默认将图片长边限制为 648。
-
-旧范式初始化遵循 pytracking 的 ``initialize(full_image, init_bbox)`` 接口。在线 benchmark
-仍只用第一帧 GT 初始化；Stage-1 训练 pair 则从同序列选择严格早于当前帧的真实
-present reference。传给 VLM 的 Image 1 是未画框、未裁剪的完整 reference 帧，Image 2
-始终是未画 GT 的当前完整帧。reference 框通过 Prompt 中的 `<bbox>` 和
-`objects.image_id=0` 绑定 Image 1，当前 GT 仅在 assistant 答案中通过另一枚 `<bbox>`
-绑定最后一张图。reference/current 的时间顺序写入 sampling plan，并严格禁止
-reference 使用 current 或未来帧。下一版会改为在完整 reference/history 图上直接画框，
-current 仍无框，输出 bbox 仍绑定最后一张图。
-
-## 4. Qwen 官方坐标训练视图
-
-Qwen2.5-VL 与 Qwen3-VL 不是同一套 grounding 坐标：
-
-| 模型族 | JSONL 目录 | 模型实际看到的坐标 | 输出字段 |
+| 阶段 | 初始化 | 监督 | 推理时 memory |
 | --- | --- | --- | --- |
-| Qwen2.5-VL | `ms_swift/qwen2_5_vl/` | processor resize 后绝对像素 `xyxy` | `bbox_pixel_xyxy` |
-| Qwen3-VL | `ms_swift/qwen3_vl/` | `[0,1000]` 相对 `xyxy` | `bbox_norm1000_xyxy` |
+| Base | Qwen3-VL-4B-Instruct | 无 | 关闭写入 |
+| Core SFT | Base | presence + bbox；memory 值 mask | 关闭写入 |
+| Memory SFT | Core | core + update/null + 完整状态快照 | 开启并门控 |
+| TU-GRPO | Memory SFT | 当前 GT + 文本 groundedness + 轨迹效用 reward | 开启并门控 |
 
-两套 JSONL 都不预先复刻 `smart_resize`，而是保存导出 JPEG 上的真实框：
+旧 Stage-1/2 训练只作历史对照，配方和结果见 [`archive/`](archive/README.md)。
+
+## 2. Core SFT
+
+VLT-v6.3 固定使用三张完整图：带框初始模板、按时间从左到右且由白色竖向分隔带隔开的
+近期三帧带框历史条带和无框当前图；不足三帧时复制最近可用历史进行右侧 padding。文本包含
+不可变 initial identity 和当前 maintained state。Core 数据没有记忆真值，因此答案仍
+带 `memory_update:null`，但训练只将该 JSON 值的 token loss 设为 0：
 
 ```json
-{
-  "messages": [
-    {"role": "user", "content": "<image><image>... Initialization target bbox: <bbox> ..."},
-    {"role": "assistant", "content": "{\"target_status\":\"present\",\"bbox_pixel_xyxy\":<bbox>}"}
-  ],
-  "objects": {
-    "bbox": [[308.8,172.4,377.7,186.6], [309.3,172.9,378.2,187.1]],
-    "bbox_type": "real",
-    "image_id": [0,1]
-  }
-}
+{"target_status":"present","bbox_norm1000_xyxy":[100,120,400,520],"memory_update":null}
 ```
 
-ms-swift 根据实际模型模板处理 `<bbox>`；训练必须保留
-`QWENVL_BBOX_FORMAT=new`。同一 canonical 数据只复用图片和 split，不能把某一代
-JSONL 交给另一代模型。`scripts/train_sft.sh` 会在加载模型前读取 Hugging Face
-`config.json:model_type` 和数据元数据，发现交叉使用就直接退出。
+状态、bbox、字段名和 JSON 闭合继续受监督。实现和完整命令见
+[`vlt_v6_core_sft.md`](vlt_v6_core_sft.md)。标准入口：
 
-上面的 JSON 是旧 `bbox_text` 示例。visual-v5 不在 user 消息中放 reference `<bbox>`，
-也不为 Image 1 创建输入 object；present 样本只有 assistant `<bbox>` 且
-`objects.image_id` 指向最后一张 current，absent 样本没有 `objects`。
-
-在新服务器上开始训练前，可用真实 ms-swift processor 对任意一条 present 样本做
-坐标回放（不加载模型权重）：
+训练模型的 `6.3.0` native System Prompt 不重复 JSON、坐标或格式要求；三字段协议由
+assistant 监督内化。对通用未训练 VLM 的 strict comparison Prompt 必须使用独立 profile
+和 manifest 标记，不能拿它生成 native SFT 数据。
 
 ```bash
-python tools/verify_qwen_grounding_templates.py \
-  --dataset-root /path/to/dataset \
-  --qwen25-model /path/to/Qwen2.5-VL \
-  --qwen3-model /path/to/Qwen3-VL
+export MODEL_PATH=/models/Qwen3-VL-4B-Instruct
+export DATASET_ROOT=/datasets/derived/cogtrack_vlt_v6_core
+export TRAIN_DATA="$DATASET_ROOT/ms_swift/qwen3_vl/train.jsonl"
+export VAL_DATA="$DATASET_ROOT/ms_swift/qwen3_vl/val.jsonl"
+export OUTPUT_DIR=/outputs/cogtrack/qwen3vl_4b_vlt_v6_core
+export QWEN_MODEL_FAMILY=qwen3_vl
+
+bash scripts/train_qwen3vl_4b_vlt_v6_core.sh
 ```
 
-先做小规模管线检查：
+正式训练前必须执行 `tracking/validate_sft_supervision.py` 和真实 processor mask 回放；
+不能只检查字符串长度或假设 `<bbox>` 展开后仍受监督。
+
+## 3. Memory SFT
+
+Memory SFT 继续使用完全相同的在线输入和输出。差别是显式 memory 样本来自
+`memory_labels.v1`，其 `memory_update` 值参与 loss：
+
+```json
+{"target_status":"present","bbox_norm1000_xyxy":[100,120,400,520],"memory_update":"the same white dog, now seen from the rear; black ears and red collar remain visible"}
+```
+
+`null` 是经过事件筛选的 hard-null，不是机械给所有普通 bbox 样本补空标签。非空内容是
+完整替换状态；`absent` 必须为 null。建议首轮 batch 混合 70% core 和 30% memory，
+memory 内约 25% update、75% hard-null，最终比例由 validation 选择。
+
+状态标签生成工具仍待实现；在 [`state_annotation.md`](state_annotation.md) 的审核集、
+provenance 和无未来泄漏校验完成前，不提供虚假的“一键全量训练”命令。
+
+## 4. TU-GRPO
+
+GRPO 只从已稳定的 Memory SFT 初始化。现有 reward 模块可复用格式、presence 和 bbox
+IoU；下一步新增 target/distractor groundedness、身份漂移惩罚和 accept/keep 双分支
+短轨迹效用。未来 GT 只进入 reward，不得进入模型输入。
+
+先做离线 reward replay，再按 `format/current → event/ground → cached trajectory → true
+trajectory` 逐级打开。完整定义、消融和成功标准见 [`grpo.md`](grpo.md)。在 trajectory
+reward 和 ms-swift 插件尚未落地前，不将现有 presence GRPO 入口称为完整方法。
+
+## 5. Qwen 坐标与数据视图
+
+两代模型的训练 JSONL 不能交叉使用：
+
+| 模型族 | JSONL | 坐标 | 输出字段 |
+| --- | --- | --- | --- |
+| Qwen3-VL | `ms_swift/qwen3_vl/` | 当前图 `[0,1000]` 相对 `xyxy` | `bbox_norm1000_xyxy` |
+| Qwen2.5-VL | `ms_swift/qwen2_5_vl/` | processor resize 后绝对像素 `xyxy` | `bbox_pixel_xyxy` |
+
+两者均保留 `QWENVL_BBOX_FORMAT=new`，并通过 ms-swift 的 `<bbox>` 与
+`objects.image_id` 将 assistant bbox 绑定最后一张 current 图。visual-box 输入不会为
+Image 1 创建 reference `<bbox>` object。
 
 ```bash
-python tracking/synthesize_stage1_dataset.py \
-  --datasets tnl2k --limit-sequences-per-dataset 50 \
-  --max-samples-per-sequence 4 --absent-ratio 0.3 --context-mode pair \
-  --output-dir data/stage1_debug
+python tracking/validate_qwen_training_view.py \
+  --model "$MODEL_PATH" \
+  --dataset "$TRAIN_DATA" --dataset "$VAL_DATA" \
+  --expected-family "$QWEN_MODEL_FAMILY"
 ```
 
-LaSOT 使用 `training_set.txt`；TNL2K 使用 `TNL2K_train_subset`；MGIT 使用官方
-`videocube.json[full][train]` 和 `data/train`。任何训练帧未解压或 split 不匹配都会
-立即失败，不会回退到测试集。
+## 6. LoRA 与常规全参 SFT
 
-## 5. 通用源样本构造器
+主实验优先 LoRA，便于快速比较标签与 reward 设计。用户所说的“常规全参微调”定义为：
+语言模型和对齐层可训练、视觉编码器冻结。只有专门研究视觉表征适配时才解冻视觉侧，
+并在实验名中明确标记。
 
-`tracking/build_tracking_dataset.py` 直接消费 pytracking `Sequence`，支持 pair/mosaic、稳定抽样、
-关键帧和流式 JSONL。输出图片全部使用相对路径，可连同数据集整体移动。
-
-```bash
-python tracking/build_tracking_dataset.py \
-  --dataset cognitivebench --env-config configs/env.local.yaml \
-  --output-dir data/cognitive_pair --mode pair \
-  --frame-stride 10 --max-samples-per-sequence 64
-```
-
-Mosaic 历史只能使用当前帧之前的有效正帧；无历史时与在线 tracker 一样自动退化为 pair。
-新协议使用 `--reference-mode visual_box`，并通过
-`--memory-supervision explicit --memory-labels <jsonl>` 提供正式第三字段。仅做管线检查时
-可改为 `--memory-supervision feasibility_null`。
-
-旧 identity 困难负样本构造器暂时隔离，其输出不能通过 v4 主协议校验，也不能
-与当前 presence 训练集混合。
-
-## 6. 校验与序列划分
-
-```bash
-python tracking/export_qwen_grounding_dataset.py \
-  --input data/cognitive_pair/source_samples.jsonl \
-  --dataset-root data/cognitive_pair \
-  --output-dir data/cognitive_pair/ms_swift \
-  --model-families qwen2_5_vl qwen3_vl
-```
-
-划分单位是完整序列，不是帧。导出器会检查图片、`<image>`/`<bbox>` 数量、
-`objects.bbox`、`image_id`、版本化二/三字段 JSON 和二分类状态；默认任何非法样本
-都会阻止导出。
-
-GRPO 模式会删除 assistant 消息，并把参考答案移入 `solution`，避免标签泄漏。
-
-## 7. SFT 与 GRPO
-
-```bash
-MODEL_PATH=/path/to/Qwen2.5-VL \
-TRAIN_DATA=/path/to/dataset/ms_swift/qwen2_5_vl/train.jsonl \
-VAL_DATA=/path/to/dataset/ms_swift/qwen2_5_vl/val.jsonl \
-DATASET_ROOT=/path/to/dataset \
-bash scripts/train_sft.sh
-```
-
-旧 baseline 快捷入口为 `scripts/train_qwen3vl_4b_stage1.sh`，默认采用 LoRA。已在 2×L40
-完成旧 Stage-1 pair64 与 Stage-2 mosaic robust v2 正式训练；Stage-2 从 Stage-1 最终
-checkpoint 继续同一个 adapter，没有叠加 LoRA。最终结果为：
-
-- Stage-1：19,005 steps，4h45m41s，train loss 0.29283377，token accuracy 0.882494；
-- Stage-2：28,819 steps，7h15m14s，train loss 0.25926472，token accuracy 0.89407277，
-  峰值 38.13GiB/卡。
-
-二者已完成 CognitiveBench-Tiny 的同协议初步聚合评测，但尚无 Full 主表，也没有接受
-visual-v5 输入或 memory 监督。下一版改为一次统一三字段混合 LoRA SFT，不再新建
-Stage-1/2/3 三轮 adapter；从基座或旧 Stage-2 adapter 初始化由验证集消融决定。需要
-全参对照时必须显式设置 `TUNER_TYPE=full`。
-
-正式 Stage-1 LoRA 已完成一轮训练：152,039 条 train、8,010 条按序列隔离的 val，
-19,005 steps，global world size 2、单卡 batch 4、global batch 8、学习率 5e-5。模型共
-约 4.471B 参数，其中 33.0301M（0.7388%）可训练；最终 train loss 为 0.29283377，
-token accuracy 为 0.882494。该次运行设置了 `eval_strategy=no`，因此没有 validation
-loss，不能仅根据训练曲线宣称泛化提升。
-
-发布的 adapter 为 ModelScope
-`updateforever/CognitiveTrack-Qwen3VL-4B-Stage1-LoRA`，核心权重 SHA-256：
-
-```text
-732ff15f4791f75c1ca16b2a72163fe59ff8a8059e87e765caf22382ddd07131
-```
-
-训练效果必须在冻结 CognitiveBench 全集上比较零样本与 LoRA 的相同观察策略，并列
-报告 hold-last、observation-only 和 presence 指标。单帧 case 只用于定位错误原因。
-
-此前的全参参考结果为：8×4090、单卡
-batch=2、全局 batch=16 的两步实测中，模型共 4.438B 参数、可训练 4.132B
-（93.10%），峰值 16.29GiB/卡，吞吐约 4.64 samples/s。视觉主干保持冻结，Qwen3
-新增的主 merger 与三个 deepstack merger 均参与训练。
-
-代际对照入口为 `scripts/train_qwen25vl_3b_stage1.sh`。相同机器设置下，Qwen2.5
-单卡 batch=4、全局 batch=32，实测峰值 18.63GiB/卡、吞吐约 9.75 samples/s；
-完整 45,980 条训练集预计约 1.3 小时，另加验证与保存时间。
-
-Qwen3-VL 训练时必须同时替换模型路径和 `qwen3_vl` 数据目录。可选
-`QWEN_MODEL_FAMILY=qwen2_5_vl|qwen3_vl` 会再增加一层显式断言。
-
-8×24GB GPU 上做 3B/4B 全参数微调时必须分片参数、梯度和优化器状态。可使用
-PyTorch FSDP（无需额外安装）或 DeepSpeed ZeRO-3：
+8×24GB GPU 做 3B/4B 全参对照时必须用 FSDP 或 ZeRO-3 分片参数、梯度和优化器状态：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC_PER_NODE=8 \
 TUNER_TYPE=full FSDP_MODE=fsdp2 \
 FREEZE_LLM=false FREEZE_VIT=true FREEZE_ALIGNER=false \
 LEARNING_RATE=1e-5 EPOCHS=1 BATCH_SIZE=1 GRAD_ACC_STEPS=4 \
-MODEL_PATH=/path/to/Qwen2.5-VL-3B-Instruct \
-TRAIN_DATA=/path/to/dataset/ms_swift/qwen2_5_vl/train.jsonl \
-VAL_DATA=/path/to/dataset/ms_swift/qwen2_5_vl/val.jsonl \
-DATASET_ROOT=/path/to/dataset \
+MODEL_PATH="$MODEL_PATH" TRAIN_DATA="$TRAIN_DATA" VAL_DATA="$VAL_DATA" \
+DATASET_ROOT="$DATASET_ROOT" OUTPUT_DIR="$OUTPUT_DIR" \
 bash scripts/train_sft.sh
 ```
 
-这里的“常规全参 SFT”指语言模型和对齐层全参更新、视觉编码器冻结。这样优先保留
-基座已有的视觉/grounding 表征，只让语言侧学习跨帧判别和结构化输出。只有专门研究
-视觉表征适配时才设置 `FREEZE_VIT=false`，并在实验名中明确标记为全模型微调。
+LoRA 与 full 不是两个不同推理协议，不能因训练方式改变测试 prompt、历史长度或观察策略。
 
-GRPO 基础设施提供严格格式、存在性、bbox IoU 和内部一致性四个独立 reward，但
-旧 Stage-1 包首先用于二字段 SFT。Qwen3-VL 的归一化 bbox reward 可复用 canonical
-监督；Qwen2.5-VL 的 bbox reward 必须拿到该次 rollout processor 的真实缩放尺寸后再
-计算，不能用原图框或 norm1000 框冒充。完成这项 processor-aware reward 回放前，
-不把 Qwen2.5-VL bbox GRPO 列为已验证训练入口。
+## 7. 数据与训练验收
 
-统一 SFT 仍不监督身份、细粒度状态、解释文本或数值置信度，但会在同一三字段协议中
-监督稀疏语义记忆。只有经过审核或可靠规则确认的样本才能提供非空记忆；在加入专门的
-更新时机和文本质量 reward 之前，不把现有 presence GRPO 误称为记忆训练。
-奖励仅读取 `solution`/监督列，不读取跟踪运行时的未来信息。
+每次训练前后至少保存：
+
+- 完整序列 train/validation split 和 sampling/annotation plan；
+- JSONL、图片 manifest、模型权重的 SHA-256；
+- model family、prompt name/version、supervision profile；
+- ms-swift/transformers/torch revision 与 Git commit；
+- 两步 smoke、小样本过拟合、正式 loss 和 validation 记录；
+- 可训练参数量、world size、global batch、学习率、显存和吞吐；
+- 最终 adapter、trainer state 和恢复命令。
+
+训练 loss 只证明优化过程运行，效果结论必须来自固定 CognitiveBench-Tiny/Full。Core
+checkpoint 关闭 semantic write；Memory/TU-GRPO checkpoint 同时报告 memory-on 与
+forced-null，证明提升确实来自状态维护而非其他训练差异。

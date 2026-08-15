@@ -149,6 +149,9 @@ class Sequence:
             values["bbox"] = self.ground_truth_rect[0].tolist()
         if self.language_query:
             values["nlp"] = self.language_query
+            language_scope = self.metadata.get("language_scope")
+            if language_scope:
+                values["language_scope"] = str(language_scope)
         if self.object_class:
             values["object_class"] = self.object_class
         return {0: values}

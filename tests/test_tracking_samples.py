@@ -5,11 +5,17 @@ import cv2
 import numpy as np
 import pytest
 
-from cogtrack.context import REFERENCE_MODE_VISUAL_BOX, VISUAL_MARKER_VERSION
+from cogtrack.context import (
+    HISTORY_LAYOUT_RECENT_STRIP_3_V2,
+    PROMPT_PROFILE_VLT_V6,
+    REFERENCE_MODE_VISUAL_BOX,
+    VISUAL_MARKER_VERSION,
+)
 from cogtrack.training.swift_dataset import to_ms_swift_record, validate_ms_swift_record
 from cogtrack.training.tracking_samples import (
     MEMORY_SUPERVISION_EXPLICIT,
     MEMORY_SUPERVISION_FEASIBILITY_NULL,
+    MEMORY_SUPERVISION_MASKED_NULL,
     MemoryUpdateLabel,
     TrackingSampleConfig,
     build_tracking_samples,
@@ -425,3 +431,62 @@ def test_memory_label_jsonl_loader_rejects_duplicates_and_preserves_provenance(
         )
     with pytest.raises(ValueError, match="重复 memory label"):
         load_memory_labels_jsonl(label_path)
+
+
+def test_vlt_v6_core_data_uses_three_images_text_and_masked_memory(tmp_path: Path) -> None:
+    sequence = _make_sequence(
+        tmp_path / "source",
+        [[10, 10, 20, 10], [20, 10, 20, 10], [0, 0, 0, 0]],
+        [True, True, False],
+    )
+    output = tmp_path / "vlt-v6"
+    report = build_tracking_samples(
+        [sequence],
+        output,
+        config=TrackingSampleConfig(
+            mode="mosaic",
+            reference_mode=REFERENCE_MODE_VISUAL_BOX,
+            prompt_profile=PROMPT_PROFILE_VLT_V6,
+            force_history_image=True,
+            memory_supervision=MEMORY_SUPERVISION_MASKED_NULL,
+            use_language_description=True,
+        ),
+    )
+    rows = _read_rows(output / "source_samples.jsonl")
+
+    assert report.schema_version == "cogtrack.training.source.v6"
+    assert report.prompt_profile == PROMPT_PROFILE_VLT_V6
+    assert report.force_history_image is True
+    assert report.history_layout_version == HISTORY_LAYOUT_RECENT_STRIP_3_V2
+    assert report.memory_null_count == 2
+    assert report.memory_non_null_count == 0
+    assert report.semantic_memory_input_count == 0
+    assert all(len(row["images"]) == 3 for row in rows)
+    assert all(row["metadata"]["effective_mode"] == "mosaic" for row in rows)
+    assert rows[0]["metadata"]["history_anchor_fallback"] is True
+    assert rows[1]["metadata"]["history_anchor_fallback"] is False
+    assert rows[0]["metadata"]["history_frame_ids"] == [0, 0, 0]
+    assert rows[1]["metadata"]["history_frame_ids"] == [1, 1, 1]
+    assert all(
+        row["metadata"]["history_layout_version"]
+        == HISTORY_LAYOUT_RECENT_STRIP_3_V2
+        for row in rows
+    )
+    history_images = [cv2.imread(str(output / row["images"][1])) for row in rows]
+    assert all(image is not None and image.shape[0] == 240 for image in history_images)
+    assert all(image is not None and image.shape[1] == 1454 for image in history_images)
+    assert all(row["assistant"]["memory_update"] is None for row in rows)
+    assert all(row["metadata"]["memory_loss_masked"] is True for row in rows)
+    assert all(
+        row["metadata"]["sft_supervision_profile"] == "tracking_core" for row in rows
+    )
+    assert all("small gray target" in row["user_prompt"] for row in rows)
+    assert all("Initial target identity: small gray target" in row["user_prompt"] for row in rows)
+    assert all(
+        "Current maintained target state: small gray target" in row["user_prompt"]
+        for row in rows
+    )
+    assert all(
+        row["metadata"]["current_target_state"] == "small gray target" for row in rows
+    )
+    assert all("Decision order" not in row["user_prompt"] for row in rows)

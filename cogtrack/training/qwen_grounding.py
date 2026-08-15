@@ -20,8 +20,19 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from PIL import Image
 
-from cogtrack.context import REFERENCE_MODE_BBOX_TEXT, REFERENCE_MODE_VISUAL_BOX
-from cogtrack.prompts import build_mosaic_prompt, build_pair_prompt, build_visual_tracking_prompt
+from cogtrack.context import (
+    PROMPT_PROFILE_VISUAL_V5,
+    PROMPT_PROFILE_VLT_V6,
+    REFERENCE_MODE_BBOX_TEXT,
+    REFERENCE_MODE_VISUAL_BOX,
+    validate_prompt_profile,
+)
+from cogtrack.prompts import (
+    build_mosaic_prompt,
+    build_pair_prompt,
+    build_visual_tracking_prompt,
+    build_vlt_tracking_prompt,
+)
 from cogtrack.protocol import (
     BBOX_PROTOCOL_NORM1000,
     BBOX_PROTOCOL_QWEN_ABS_PIXEL,
@@ -123,7 +134,10 @@ def _build_prompt(row: Mapping[str, Any], *, model_family: str):
     include_memory_update = isinstance(assistant, Mapping) and "memory_update" in assistant
     if reference_mode == REFERENCE_MODE_VISUAL_BOX:
         if not include_memory_update:
-            raise ValueError("visual_box v5 样本必须使用三字段 memory_update 协议")
+            raise ValueError("visual_box 样本必须使用三字段 memory_update 协议")
+        prompt_profile = validate_prompt_profile(
+            str(metadata.get("prompt_profile", PROMPT_PROFILE_VISUAL_V5))
+        )
         history_ids = metadata.get("history_frame_ids")
         history_count = 0
         if effective_mode == "mosaic":
@@ -132,10 +146,25 @@ def _build_prompt(row: Mapping[str, Any], *, model_family: str):
             history_count = len(history_ids)
         elif effective_mode != "pair":
             raise ValueError(f"不支持的 effective_mode：{effective_mode!r}")
-        return build_visual_tracking_prompt(
+        builder = (
+            build_vlt_tracking_prompt
+            if prompt_profile == PROMPT_PROFILE_VLT_V6
+            else build_visual_tracking_prompt
+        )
+        initial_identity = str(
+            metadata.get("initial_identity_description")
+            or metadata.get("initial_target_text")
+            or ""
+        )
+        current_state = str(
+            metadata.get("current_target_state")
+            or metadata.get("recent_semantic_memory")
+            or ""
+        )
+        return builder(
             history_count=history_count,
-            target_text="",
-            semantic_memory="",
+            target_text=initial_identity,
+            semantic_memory=current_state,
             bbox_protocol=protocol,
             include_memory_update=True,
         )
@@ -243,7 +272,7 @@ def to_qwen_grounding_record(
     if include_memory_update and memory_update is not None and not isinstance(memory_update, str):
         raise ValueError("memory_update 必须是字符串或 null")
     if reference_mode == REFERENCE_MODE_VISUAL_BOX and not include_memory_update:
-        raise ValueError("visual_box v5 样本必须包含 memory_update")
+        raise ValueError("visual_box 样本必须包含 memory_update")
     if status == "absent" and memory_update is not None:
         raise ValueError("absent 样本的 memory_update 必须为 null")
 

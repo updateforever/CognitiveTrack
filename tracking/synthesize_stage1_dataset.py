@@ -7,10 +7,11 @@ test/val 的参数。每条样本只监督：
 1. 根据完整过去参考图中的目标指代，判断同一目标在当前帧中是否存在；
 2. 目标存在时在当前帧中的官方 Qwen grounding 框。
 
-默认 profile 保留旧 Stage-1 坐标文本/二字段行为，用于复现实验。新视觉指代 probe
-通过 ``tracking/synthesize_visual_v5_dataset.py`` 调用同一构建引擎：过去参考图画框、
-当前图无框，并强制使用三字段监督。两种 profile 都不使用数据集自然语言描述，也不
-构造 reasoning、置信度或旧六分类标签。
+默认 profile 保留旧 Stage-1 坐标文本/二字段行为，用于复现实验。视觉指代实验通过
+独立 wrapper 调用同一构建引擎：visual-v5 保留历史协议；VLT-v6 固定“带框初始化图 +
+历史轨迹 mosaic + 当前搜索图”，并加入初始化文本和最近状态记忆。VLT-v6 的首轮核心
+SFT 保留三字段输出，但只监督存在性与 bbox，``memory_update`` 值由 ms-swift mask。
+所有 profile 均不构造 reasoning、置信度或旧六分类标签。
 present/absent 均来自同一训练视频的真实逐帧标注；默认以 case 为单位保持约 7:3。
 生成结果包含自包含图片资产、可审计源 JSONL，以及已经按完整序列划分并校验通过
 的 ms-swift train/val JSONL。
@@ -47,6 +48,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from cogtrack.context import (  # noqa: E402
+    PROMPT_PROFILE_VISUAL_V5,
+    PROMPT_PROFILE_VLT_V6,
     REFERENCE_MODE_BBOX_TEXT,
     REFERENCE_MODE_VISUAL_BOX,
     REFERENCE_MODES,
@@ -54,10 +57,13 @@ from cogtrack.context import (  # noqa: E402
 from cogtrack.training import (  # noqa: E402
     MEMORY_SUPERVISION_DISABLED,
     MEMORY_SUPERVISION_EXPLICIT,
+    MEMORY_SUPERVISION_MASKED_NULL,
     MEMORY_SUPERVISION_MODES,
     QWEN_MODEL_FAMILIES,
     REFERENCE_POLICY_FIXED_ANCHOR,
     REFERENCE_POLICY_SAMPLED_PRIOR,
+    SFT_SUPERVISION_FULL,
+    SFT_SUPERVISION_TRACKING_CORE,
     TemporalCaseSamplingPlan,
     TrackingSampleConfig,
     build_tracking_samples,
@@ -77,16 +83,21 @@ from pytracking.evaluation.environment import EnvironmentSettings, load_environm
 STAGE1_DATASETS = ("lasot", "tnl2k", "mgit")
 DATASET_VERSION = "cogtrack.stage1_tracking_presence.v1"
 VISUAL_V5_DATASET_VERSION = "cogtrack.visual_tracking_probe.v5"
-SYNTHESIS_PROFILES = ("legacy_stage1", "visual_v5")
+VLT_V6_DATASET_VERSION = "cogtrack.vlt_tracking_core.v6.3"
+SYNTHESIS_PROFILES = ("legacy_stage1", "visual_v5", "vlt_v6")
 
 
 def _parser(profile: str = "legacy_stage1") -> argparse.ArgumentParser:
     if profile not in SYNTHESIS_PROFILES:
         raise ValueError(f"profile 必须是 {SYNTHESIS_PROFILES} 之一")
     is_visual_v5 = profile == "visual_v5"
+    is_vlt_v6 = profile == "vlt_v6"
+    is_visual_reference = is_visual_v5 or is_vlt_v6
     parser = argparse.ArgumentParser(
         description=(
-            "从 LaSOT/TNL2K/MGIT 官方训练集构造 visual-v5 三字段跟踪数据。"
+            "从 LaSOT/TNL2K/MGIT 官方训练集构造 VLT-v6 核心跟踪数据。"
+            if is_vlt_v6
+            else "从 LaSOT/TNL2K/MGIT 官方训练集构造 visual-v5 三字段跟踪数据。"
             if is_visual_v5
             else "从 LaSOT/TNL2K/MGIT 官方训练集构造旧 Stage-1 跟踪与存在性数据。"
         ),
@@ -105,21 +116,31 @@ def _parser(profile: str = "legacy_stage1") -> argparse.ArgumentParser:
     parser.add_argument(
         "--context-mode",
         choices=("pair", "mosaic", "both"),
-        default="both" if is_visual_v5 else "pair",
-        help="首轮建议 pair；both 会额外生成 mosaic，适合后续时序上下文实验。",
+        default="mosaic" if is_vlt_v6 else "both" if is_visual_v5 else "pair",
+        help=(
+            "VLT-v6 固定 mosaic 三图；其他 profile 可选择 pair/mosaic/both。"
+            if is_vlt_v6
+            else "首轮建议 pair；both 会额外生成 mosaic，适合后续时序上下文实验。"
+        ),
     )
     parser.add_argument(
         "--reference-mode",
         choices=tuple(sorted(REFERENCE_MODES)),
-        default=REFERENCE_MODE_VISUAL_BOX if is_visual_v5 else REFERENCE_MODE_BBOX_TEXT,
-        help="visual_v5 必须使用 visual_box；legacy_stage1 必须使用 bbox_text。",
+        default=REFERENCE_MODE_VISUAL_BOX if is_visual_reference else REFERENCE_MODE_BBOX_TEXT,
+        help="visual_v5/vlt_v6 必须使用 visual_box；legacy_stage1 必须使用 bbox_text。",
     )
     parser.add_argument(
         "--memory-supervision",
         choices=tuple(sorted(MEMORY_SUPERVISION_MODES)),
-        default=MEMORY_SUPERVISION_EXPLICIT if is_visual_v5 else MEMORY_SUPERVISION_DISABLED,
+        default=(
+            MEMORY_SUPERVISION_MASKED_NULL
+            if is_vlt_v6
+            else MEMORY_SUPERVISION_EXPLICIT
+            if is_visual_v5
+            else MEMORY_SUPERVISION_DISABLED
+        ),
         help=(
-            "visual_v5 正式构建使用 explicit；feasibility_null 只允许管线验证，不能作为正式训练集。"
+            "visual_v5 正式构建使用 explicit；vlt_v6 首轮使用 masked_null，仅屏蔽记忆值 loss。"
         ),
     )
     parser.add_argument(
@@ -149,7 +170,16 @@ def _parser(profile: str = "legacy_stage1") -> argparse.ArgumentParser:
         type=int,
         help="每个数据集仅取前 N 个官方训练序列，仅用于 dry-run。",
     )
-    parser.add_argument("--history-size", type=int, default=4, help="mosaic 最多包含的过去可信帧数。")
+    parser.add_argument(
+        "--history-size",
+        type=int,
+        default=3 if is_vlt_v6 else 4,
+        help=(
+            "VLT-v6 固定读取最近三次可信观测；其他 profile 为 mosaic 最大历史帧数。"
+            if is_vlt_v6
+            else "mosaic 最多包含的过去可信帧数。"
+        ),
+    )
     parser.add_argument("--mosaic-panel-height", type=int, default=240)
     parser.add_argument(
         "--history-corruption-ratio",
@@ -193,9 +223,9 @@ def _parser(profile: str = "legacy_stage1") -> argparse.ArgumentParser:
         "--qwen-model-families",
         nargs="+",
         choices=QWEN_MODEL_FAMILIES,
-        default=["qwen3_vl"] if is_visual_v5 else list(QWEN_MODEL_FAMILIES),
+        default=["qwen3_vl"] if is_visual_reference else list(QWEN_MODEL_FAMILIES),
         help=(
-            "生成模型专属训练视图；visual_v5 默认只导出 Qwen3-VL，旧 profile 默认同时导出两代。"
+            "生成模型专属训练视图；视觉指代 profile 默认只导出 Qwen3-VL。"
         ),
     )
     parser.add_argument("--force", action="store_true", help="覆盖同名构建产物；不会删除其他目录。")
@@ -408,6 +438,7 @@ def _export_ms_swift(
     seed: int,
     requested_absent_ratio: float,
     model_families: list[str],
+    profile: str,
 ) -> dict[str, Any]:
     canonical_records = list(read_jsonl(source_path))
     if not canonical_records:
@@ -418,7 +449,14 @@ def _export_ms_swift(
         metadata = record.get("metadata", {})
         if metadata.get("source_split") != "train":
             raise ValueError(f"样本 {index} 不是 train 来源")
-        if metadata.get("used_language_description") is not False:
+        if profile == "vlt_v6":
+            if metadata.get("prompt_profile") != PROMPT_PROFILE_VLT_V6:
+                raise ValueError(f"样本 {index} 未使用 vlt_v6 Prompt")
+            if not str(metadata.get("initial_target_text") or "").strip():
+                raise ValueError(f"样本 {index} 缺少初始化目标文本或视觉锚点回退描述")
+            if len(record.get("images", [])) != 3:
+                raise ValueError(f"样本 {index} 不符合 vlt_v6 固定三图协议")
+        elif metadata.get("used_language_description") is not False:
             raise ValueError(f"样本 {index} 意外使用了语言描述")
         if record.get("target_status") not in {"present", "absent"}:
             raise ValueError(f"样本 {index} 缺少合法 present/absent 标签")
@@ -543,11 +581,23 @@ def main(*, profile: str = "legacy_stage1") -> int:
                 raise ValueError("legacy_stage1 profile 只允许 --reference-mode bbox_text")
             if args.memory_supervision != MEMORY_SUPERVISION_DISABLED:
                 raise ValueError("legacy_stage1 profile 不监督 memory_update")
-        else:
+        elif profile == "visual_v5":
             if args.reference_mode != REFERENCE_MODE_VISUAL_BOX:
                 raise ValueError("visual_v5 profile 只允许 --reference-mode visual_box")
             if not args.plan_only and args.memory_supervision == MEMORY_SUPERVISION_DISABLED:
                 raise ValueError("visual_v5 数据必须使用三字段 memory_update 监督")
+        else:
+            if args.reference_mode != REFERENCE_MODE_VISUAL_BOX:
+                raise ValueError("vlt_v6 profile 只允许 --reference-mode visual_box")
+            if args.context_mode != "mosaic":
+                raise ValueError("vlt_v6 正式协议固定 --context-mode mosaic")
+            if args.memory_supervision not in {
+                MEMORY_SUPERVISION_MASKED_NULL,
+                MEMORY_SUPERVISION_EXPLICIT,
+            }:
+                raise ValueError("vlt_v6 只允许 masked_null 核心 SFT 或 explicit 记忆监督")
+            if args.history_size != 3:
+                raise ValueError("vlt_v6 正式协议固定 --history-size 3")
         if args.memory_supervision == MEMORY_SUPERVISION_EXPLICIT and not args.memory_labels:
             if not args.plan_only:
                 raise ValueError("--memory-supervision explicit 必须同时提供 --memory-labels")
@@ -559,7 +609,7 @@ def main(*, profile: str = "legacy_stage1") -> int:
         dataset_names = list(dict.fromkeys(args.datasets))
         reference_policy = (
             REFERENCE_POLICY_FIXED_ANCHOR
-            if profile == "visual_v5"
+            if profile in {"visual_v5", "vlt_v6"}
             else REFERENCE_POLICY_SAMPLED_PRIOR
         )
         environment = load_environment(args.env_config)
@@ -635,12 +685,18 @@ def main(*, profile: str = "legacy_stage1") -> int:
             mosaic_panel_height=args.mosaic_panel_height,
             history_corruption_ratio=args.history_corruption_ratio,
             present_only=args.absent_ratio == 0,
-            use_language_description=False,
+            use_language_description=profile == "vlt_v6",
             max_image_side=args.max_image_side,
             jpeg_quality=args.jpeg_quality,
             reuse_existing_assets=args.reuse_existing_assets,
             reference_mode=args.reference_mode,
             memory_supervision=args.memory_supervision,
+            prompt_profile=(
+                PROMPT_PROFILE_VLT_V6
+                if profile == "vlt_v6"
+                else PROMPT_PROFILE_VISUAL_V5
+            ),
+            force_history_image=profile == "vlt_v6",
         )
         build_report = build_tracking_samples(
             sequences,
@@ -700,13 +756,25 @@ def main(*, profile: str = "legacy_stage1") -> int:
             seed=args.seed,
             requested_absent_ratio=args.absent_ratio,
             model_families=list(dict.fromkeys(args.qwen_model_families)),
+            profile=profile,
+        )
+        sft_supervision_profile = (
+            SFT_SUPERVISION_TRACKING_CORE
+            if args.memory_supervision == MEMORY_SUPERVISION_MASKED_NULL
+            else SFT_SUPERVISION_FULL
         )
         dataset_info = {
             "schema_version": (
-                VISUAL_V5_DATASET_VERSION if profile == "visual_v5" else DATASET_VERSION
+                VLT_V6_DATASET_VERSION
+                if profile == "vlt_v6"
+                else VISUAL_V5_DATASET_VERSION
+                if profile == "visual_v5"
+                else DATASET_VERSION
             ),
             "task": (
-                "visual_tracking_v5_probe"
+                "vlt_v6_tracking_core"
+                if profile == "vlt_v6"
+                else "visual_tracking_v5_probe"
                 if profile == "visual_v5"
                 else "stage1_tracking_presence"
             ),
@@ -718,6 +786,9 @@ def main(*, profile: str = "legacy_stage1") -> int:
             "target_status": ["present", "absent"] if args.absent_ratio > 0 else ["present"],
             "canonical_bbox_format": "norm1000_xyxy",
             "reference_mode": args.reference_mode,
+            "prompt_profile": build_report.prompt_profile,
+            "force_history_image": build_report.force_history_image,
+            "history_layout_version": build_report.history_layout_version,
             "reference_policy": reference_policy,
             "reference_canonical_bbox_format": "norm1000_xyxy",
             "training_coordinate_protocols": {
@@ -726,13 +797,18 @@ def main(*, profile: str = "legacy_stage1") -> int:
             },
             "coordinate_conversion_owner": "ms-swift model template",
             "qwen_vl_bbox_format": "new",
-            "uses_language_description": False,
-            "uses_semantic_memory_input": False,
+            "uses_initial_target_text": profile == "vlt_v6",
+            "uses_dataset_language_where_online_safe": profile == "vlt_v6",
+            "uses_semantic_memory_input": build_report.semantic_memory_input_count > 0,
             "memory_supervision": args.memory_supervision,
-            "supervises_memory": args.memory_supervision != MEMORY_SUPERVISION_DISABLED,
+            "supervises_memory": args.memory_supervision == MEMORY_SUPERVISION_EXPLICIT,
+            "memory_loss_masked": args.memory_supervision == MEMORY_SUPERVISION_MASKED_NULL,
+            "sft_supervision_profile": sft_supervision_profile,
             "data_tier": (
                 "legacy_baseline"
                 if profile == "legacy_stage1"
+                else "core_sft_probe"
+                if args.memory_supervision == MEMORY_SUPERVISION_MASKED_NULL
                 else (
                     "sft_probe"
                     if args.memory_supervision == MEMORY_SUPERVISION_EXPLICIT
@@ -741,7 +817,8 @@ def main(*, profile: str = "legacy_stage1") -> int:
             ),
             "sft_eligible": (
                 profile == "legacy_stage1"
-                or args.memory_supervision == MEMORY_SUPERVISION_EXPLICIT
+                or args.memory_supervision
+                in {MEMORY_SUPERVISION_EXPLICIT, MEMORY_SUPERVISION_MASKED_NULL}
             ),
             "paper_full_eligible": profile == "legacy_stage1",
             "supervises_confidence": False,

@@ -79,6 +79,8 @@ def _tracker(
     memory_output_enabled=True,
     reference_mode="bbox_text",
     use_init_language=True,
+    prompt_profile="visual_v5",
+    force_history_image=False,
 ):
     model_config = Path(__file__).resolve().parents[1] / "configs/models/qwen25vl_7b.yaml"
     tracker = CognitiveVLMTracker(
@@ -86,6 +88,8 @@ def _tracker(
             {
                 "context_mode": context_mode,
                 "reference_mode": reference_mode,
+                "prompt_profile": prompt_profile,
+                "force_history_image": force_history_image,
                 "use_init_language": use_init_language,
                 "model_config": str(model_config),
                 "_config_path": str(Path(__file__).resolve()),
@@ -386,3 +390,62 @@ def test_tracker_sequence_state_is_not_shared():
     assert len(first.memory_bank) == 0
     assert len(second.memory_bank) == 0
     assert second_output["memory"]["anchor"]["bbox_xywh"] == [50.0, 20.0, 10.0, 15.0]
+
+
+def test_vlt_v6_runtime_uses_safe_initial_text_latest_memory_and_three_images():
+    tracker = _tracker(
+        context_mode="mosaic",
+        reference_mode="visual_box",
+        prompt_profile="vlt_v6",
+        force_history_image=True,
+        use_init_language=True,
+    )
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+    tracker.initialize(
+        image,
+        {
+            "init_bbox": [20, 10, 40, 30],
+            "init_nlp": "a small gray vehicle",
+            "init_language_scope": "initial_target",
+            "dataset_name": "tnl2k",
+            "sequence_name": "vlt-v6",
+        },
+    )
+
+    context = tracker._build_context(image)
+
+    assert len(context.images) == 3
+    assert context.prompt.name == "cognitive_vlt_mosaic"
+    assert context.prompt.version == "6.3.0"
+    assert context.reference_frames == (0, 0, 0, 0)
+    assert context.images[1].shape[:2] == (240, 1454)
+    assert "a small gray vehicle" in context.prompt.user_prompt
+    runtime = tracker.describe_runtime()
+    assert runtime["target_text_source"] == "dataset_initial_language"
+    assert runtime["history_layout_version"] == "recent_strip_3_v2"
+
+
+def test_vlt_v6_rejects_mgit_full_video_story_from_online_input():
+    tracker = _tracker(
+        context_mode="mosaic",
+        reference_mode="visual_box",
+        prompt_profile="vlt_v6",
+        force_history_image=True,
+        use_init_language=True,
+    )
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+    tracker.initialize(
+        image,
+        {
+            "init_bbox": [20, 10, 40, 30],
+            "init_nlp": "Later in the video the target disappears behind a tree.",
+            "init_language_scope": "full_video_story",
+            "dataset_name": "mgit",
+            "sequence_name": "no-future-leak",
+        },
+    )
+
+    prompt = tracker._build_context(image).prompt.user_prompt
+    assert "Later in the video" not in prompt
+    assert "target marked by the red box" in prompt
+    assert tracker.target_text_source == "visual_anchor_fallback"

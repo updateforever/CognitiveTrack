@@ -9,10 +9,11 @@ CognitiveTrack 是一个建立在 [pytracking](https://github.com/visionml/pytra
 GRPO。所有实验遵循：第一帧仅用 GT 初始化，后续推理不读取当前或未来 GT；训练、
 验证和测试按完整序列划分。
 
-当前 visual-v5 基线使用“带框首帧身份锚点 + 可选带框历史 mosaic + 无框当前全图”的
-统一输入，输出目标存在性、当前框与可空语义记忆更新。设计与复现实验说明见
-[docs/stage2_stage3_data.md](docs/stage2_stage3_data.md) 和
-[docs/visual_v5_iteration.md](docs/visual_v5_iteration.md)。
+当前 VLT-v6.3 基线使用固定三图输入：带框首帧身份锚点、从左到右排列的近期三帧带框
+历史条带和无框当前全图。历史 panel 由白色竖向分隔带隔开；不足三帧时复制最近可用
+历史进行右侧 padding。文本状态分为不可变初始身份与可替换当前目标状态，输出目标
+存在性、当前框和可空状态更新。首轮 SFT 只监督存在性与 bbox；完整研究路线见
+[docs/research_plan.md](docs/research_plan.md)。
 
 ## 主要特性
 
@@ -25,7 +26,7 @@ GRPO。所有实验遵循：第一帧仅用 GT 初始化，后续推理不读取
 - TXT bbox 与逐帧 JSONL 双结果格式；
 - pytracking 定位指标、稀疏执行指标和目标存在性诊断；
 - 基于 LaSOT、TNL2K、MGIT 的确定性训练数据构造；
-- ms-swift LoRA/全参 SFT 和 GRPO 训练入口。
+- ms-swift LoRA/全参 SFT，以及可扩展的 GRPO reward 接口。
 
 ## CognitiveBench
 
@@ -100,23 +101,8 @@ modelscope download Qwen/Qwen3-VL-4B-Instruct \
   --max-workers 4
 ```
 
-### CognitiveTrack Stage-1 LoRA
-
-Stage-1 adapter 发布在 ModelScope：
-`updateforever/CognitiveTrack-Qwen3VL-4B-Stage1-LoRA`。它在 Qwen3-VL-4B-Instruct
-上训练，只监督 `target_status` 和目标存在时的 bbox，不是合并后的完整模型。
-
-```bash
-modelscope download updateforever/CognitiveTrack-Qwen3VL-4B-Stage1-LoRA \
-  --local-dir checkpoints/modelscope/CognitiveTrack-Qwen3VL-4B-Stage1-LoRA \
-  --max-workers 4
-
-cd checkpoints/modelscope/CognitiveTrack-Qwen3VL-4B-Stage1-LoRA
-sha256sum -c SHA256SUMS
-cd ../../..
-
-export COGTRACK_QWEN3_4B_ADAPTER="$PWD/checkpoints/modelscope/CognitiveTrack-Qwen3VL-4B-Stage1-LoRA"
-```
+已发布的 Stage-1/2 adapter 属于旧协议，只用于历史复现。当前 checkpoint 与实验完成度
+统一记录在 [docs/project_status.md](docs/project_status.md)。
 
 ## 推理
 
@@ -124,23 +110,24 @@ export COGTRACK_QWEN3_4B_ADAPTER="$PWD/checkpoints/modelscope/CognitiveTrack-Qwe
 
 ```bash
 python tracking/smoke_test_qwen.py \
-  --tracker-config configs/trackers/qwen3vl_4b_visual_v5_base.yaml \
+  --tracker-config configs/trackers/qwen3vl_4b_vlt_v6_base.yaml \
   --dataset-config configs/datasets/cognitivebench_tiny.yaml \
   --env-config configs/env.local.yaml
 ```
 
-正式 CognitiveTrack v1 推理固定使用首帧身份锚点、可信历史预测 mosaic、当前关键帧
-全图，以及 `target_status + bbox + memory_update` 三字段协议。先在 Tiny 上评测：
+正式 VLT-v6.3 推理固定使用初始化文本、首帧身份锚点、三帧可信历史条带、最近状态
+记忆、当前关键帧全图，以及 `target_status + bbox + memory_update` 三字段协议。先在
+Tiny 上评测：
 
 ```bash
 python tracking/test.py \
   --config configs/env.local.yaml \
-  --tracker-config configs/trackers/qwen3vl_4b_visual_v5_base_vllm.yaml \
+  --tracker-config configs/trackers/qwen3vl_4b_vlt_v6_base_vllm.yaml \
   --dataset-config configs/datasets/cognitivebench_tiny.yaml
 ```
 
 确认协议和性能趋势后，仅将数据配置换成 `configs/datasets/cognitivebench.yaml` 即可
-运行 Full。新 SFT adapter 使用 `qwen3vl_4b_visual_v5_sft_vllm.yaml`；旧坐标文本、pair、
+运行 Full。核心 SFT adapter 使用 `qwen3vl_4b_vlt_v6_core_sft_vllm.yaml`；旧坐标文本、pair、
 无历史和无语义记忆配置只用于历史复现或消融。SUTrack 与 Hybrid 配置位于
 `configs/trackers/`；SUTrack checkpoint 通过
 `COGTRACK_SUTRACK_CHECKPOINT` 注入，不在 YAML 中写绝对路径。
@@ -149,7 +136,7 @@ python tracking/test.py \
 
 ```bash
 python tracking/evaluate.py \
-  --input /outputs/cogtrack/cognitive_vlm/qwen3vl_4b_pair_sft_cognitivebench_sparse/cognitivebench
+  --input /outputs/cogtrack/<tracker-run>/cognitivebench
 ```
 
 实验结论以冻结数据、固定观察策略和完整序列聚合指标为准，不根据人工挑选的单帧
@@ -171,42 +158,42 @@ rate、present miss rate 和 decision coverage。
 
 ## 数据与训练
 
-visual-v5 使用 LaSOT train、TNL2K train 和 MGIT train 中同一序列的真实
+VLT-v6.3 使用 LaSOT train、TNL2K train 和 MGIT train 中同一序列的真实
 present/absent 帧。所有 reference/history 严格早于 current；负样本只来自原视频的
 真实目标消失帧。下面命令先生成可重放的采样计划：
 
 ```bash
-python tracking/synthesize_visual_v5_dataset.py \
+python tracking/synthesize_vlt_v6_dataset.py \
   --datasets lasot tnl2k mgit \
   --mgit-version tiny --allow-missing-mgit-sequences \
   --env-config configs/env.local.yaml \
+  --history-size 3 \
   --max-samples-per-sequence 20 \
   --absent-ratio 0.3 \
-  --output-dir data/plans/cogtrack_visual_v5_probe \
+  --output-dir data/plans/cogtrack_vlt_v6_core \
   --plan-only
 ```
 
-正式三字段数据必须提供带来源的逐帧 memory label manifest；完整渲染、校验与训练命令
-见 [docs/training.md](docs/training.md)。Qwen3-VL 使用 `[0,1000]` 相对 `xyxy`；
+首轮三字段数据无需伪造 memory label；训练时只屏蔽 `memory_update` 的值。完整渲染、
+字段级 loss 校验与训练命令见 [docs/vlt_v6_core_sft.md](docs/vlt_v6_core_sft.md)。
+Qwen3-VL 使用 `[0,1000]` 相对 `xyxy`；
 Qwen2.5-VL 使用 processor resize 后绝对像素 `xyxy`，两代 JSONL 不能交叉使用。
 
 ```bash
 export MODEL_PATH=/models/Qwen3-VL-4B-Instruct
-export DATASET_ROOT=/datasets/cogtrack_visual_v5_probe
+export DATASET_ROOT=/datasets/cogtrack_vlt_v6_core
 export TRAIN_DATA="$DATASET_ROOT/ms_swift/qwen3_vl/train.jsonl"
 export VAL_DATA="$DATASET_ROOT/ms_swift/qwen3_vl/val.jsonl"
-export OUTPUT_DIR=/outputs/cogtrack/qwen3vl_4b_visual_v5_probe
+export OUTPUT_DIR=/outputs/cogtrack/qwen3vl_4b_vlt_v6_core
 export QWEN_MODEL_FAMILY=qwen3_vl
 
-bash scripts/train_sft.sh
+bash scripts/train_qwen3vl_4b_vlt_v6_core.sh
 ```
 
-详细监督边界、数据格式、全参训练和 GRPO 说明见
-[docs/training.md](docs/training.md)。
-
-旧 Stage-1/Stage-2 分阶段训练结果仅作为历史对照。当前状态和已完成实验分别见
-[docs/project_status_20260813.md](docs/project_status_20260813.md) 与
-[旧分阶段 Tiny 结果](docs/legacy_staged_tiny_results_20260813.md)。
+详细监督边界、数据格式和训练说明见 [docs/training.md](docs/training.md)。状态标签冷启动
+与轨迹效用 GRPO 分别见 [docs/state_annotation.md](docs/state_annotation.md) 和
+[docs/grpo.md](docs/grpo.md)。当前完成度见 [docs/project_status.md](docs/project_status.md)，
+旧尝试统一保存在 [docs/archive/](docs/archive/README.md)。
 
 ## 代码结构
 

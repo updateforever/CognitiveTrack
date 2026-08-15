@@ -1,4 +1,9 @@
-# 统一时序跟踪与记忆混合训练设计
+# 统一时序跟踪与记忆混合训练设计（归档）
+
+> 历史设计说明：当前首轮训练已改为 VLT-v6 core SFT，只监督存在性与 bbox，并对
+> `memory_update` 值做 loss mask；不再要求在坐标训练前完成记忆标签或 GRPO。当前入口
+> 与监督边界见 [VLT-v6 core SFT](../vlt_v6_core_sft.md)。本文保留作为后续记忆训练与
+> 长时 case 分桶参考。
 
 > 2026-08-13 设计草案，供后续 AI 和研究讨论使用。本文替代原先依次训练
 > Stage-1 pair、Stage-2 mosaic、Stage-3 memory 的规划。已经完成的 Stage-1/2

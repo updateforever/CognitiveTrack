@@ -16,8 +16,12 @@ import yaml
 
 from cogtrack.cognition import CognitiveDecisionEngine, CognitiveStateMachine, StateMachineConfig
 from cogtrack.context import (
+    PROMPT_PROFILE_VISUAL_V5,
+    PROMPT_PROFILE_VLT_V6,
     REFERENCE_MODE_BBOX_TEXT,
     TrackingContextBuilder,
+    history_layout_for_prompt_profile,
+    validate_prompt_profile,
     validate_reference_mode,
 )
 from cogtrack.memory import (
@@ -122,6 +126,22 @@ class CognitiveVLMTracker(BaseTracker):
         self.reference_mode = validate_reference_mode(
             str(self.params.get("reference_mode", REFERENCE_MODE_BBOX_TEXT))
         )
+        self.prompt_profile = validate_prompt_profile(
+            str(self.params.get("prompt_profile", PROMPT_PROFILE_VISUAL_V5))
+        )
+        self.history_layout_version = history_layout_for_prompt_profile(
+            self.prompt_profile
+        )
+        if (
+            self.prompt_profile == PROMPT_PROFILE_VLT_V6
+            and self.reference_mode == REFERENCE_MODE_BBOX_TEXT
+        ):
+            raise ValueError("vlt_v6 必须与 reference_mode=visual_box 配合使用")
+        self.force_history_image = self.params.get("force_history_image", False)
+        if not isinstance(self.force_history_image, bool):
+            raise TypeError("force_history_image 必须是 bool")
+        if self.force_history_image and self.context_mode != "mosaic":
+            raise ValueError("force_history_image 只适用于 context_mode=mosaic")
         self.use_init_language = self.params.get("use_init_language", True)
         if not isinstance(self.use_init_language, bool):
             raise TypeError("use_init_language 必须是 bool")
@@ -194,6 +214,7 @@ class CognitiveVLMTracker(BaseTracker):
         self.decision_engine = CognitiveDecisionEngine(self.state_machine)
         self.sequence_name = ""
         self.target_text = ""
+        self.target_text_source = "disabled"
         self.anchor: IdentityAnchor | None = None
         self.memory_bank: MemoryBank | None = None
         self.context_builder: TrackingContextBuilder | None = None
@@ -234,11 +255,7 @@ class CognitiveVLMTracker(BaseTracker):
     def initialize(self, image: np.ndarray, info: dict[str, Any]) -> dict[str, Any]:
         bbox = validate_xywh(info["init_bbox"])
         self.sequence_name = str(info.get("sequence_name") or info.get("seq_name") or "unknown")
-        # visual-v5 主实验只依赖首帧框指代，避免部分数据集有语言、部分没有语言造成
-        # 额外监督差异。旧实验缺省仍保留 init_nlp，确保历史配置可复现。
-        self.target_text = (
-            str(info.get("init_nlp") or "").strip() if self.use_init_language else ""
-        )
+        self.target_text, self.target_text_source = self._resolve_initial_target_text(info)
         frame_path = str(info.get("frame_path") or "")
         self.anchor = IdentityAnchor(
             frame_id=0,
@@ -252,6 +269,8 @@ class CognitiveVLMTracker(BaseTracker):
             self.anchor,
             bbox_protocol=self.bbox_protocol,
             reference_mode=self.reference_mode,
+            prompt_profile=self.prompt_profile,
+            force_history_image=self.force_history_image,
             mosaic_panel_height=self.mosaic_panel_height,
         )
         transition = self.state_machine.initialize(0, bbox)
@@ -288,6 +307,31 @@ class CognitiveVLMTracker(BaseTracker):
             is_initialization=True,
         )
 
+    def _resolve_initial_target_text(self, info: Mapping[str, Any]) -> tuple[str, str]:
+        """选择不会读取未来叙事的初始化文本，并记录来源。
+
+        LaSOT/TNL2K 的语言是初始化目标描述；当前 MGIT loader 的 ``story`` 描述可能
+        覆盖整段视频，不能作为在线初始输入。没有安全文本时，VLT-v6 使用不含额外
+        语义的视觉指代占位句，任务仍由 Image 1 红框唯一确定。
+        """
+
+        if not self.use_init_language:
+            return "", "disabled"
+        dataset_name = str(info.get("dataset_name") or "").strip().lower()
+        language_scope = str(info.get("init_language_scope") or "").strip().lower()
+        description = str(info.get("init_nlp") or "").strip()
+        unsafe_story = language_scope == "full_video_story" or (
+            dataset_name == "mgit" and language_scope != "initial_target"
+        )
+        if description and not unsafe_story:
+            return description, "dataset_initial_language"
+        object_class = str(info.get("init_object_class") or "").strip()
+        if object_class:
+            return object_class, "dataset_object_class"
+        if self.prompt_profile == PROMPT_PROFILE_VLT_V6:
+            return "the target marked by the red box in Image 1", "visual_anchor_fallback"
+        return "", "unavailable"
+
     def _require_initialized(self) -> tuple[MemoryBank, TrackingContextBuilder]:
         if self.memory_bank is None or self.context_builder is None:
             raise RuntimeError("必须先调用 initialize()")
@@ -295,10 +339,15 @@ class CognitiveVLMTracker(BaseTracker):
 
     def _build_context(self, image: np.ndarray):
         bank, builder = self._require_initialized()
-        semantic_memory = "\n".join(
-            f"- {record.text}"
+        semantic_records = tuple(
+            record
             for record in bank.records(MemoryKind.SEMANTIC)
             if record.text.strip()
+        )
+        latest_semantic = (
+            max(semantic_records, key=lambda record: record.frame_id).text
+            if semantic_records
+            else ""
         )
         if self.context_mode == "mosaic":
             records = bank.select_positive(self.history_size)
@@ -306,13 +355,13 @@ class CognitiveVLMTracker(BaseTracker):
                 image,
                 records,
                 self.target_text,
-                semantic_memory,
+                latest_semantic,
                 self.memory_output_enabled,
             )
         return builder.build_pair(
             image,
             self.target_text,
-            semantic_memory,
+            latest_semantic,
             self.memory_output_enabled,
         )
 
@@ -402,6 +451,7 @@ class CognitiveVLMTracker(BaseTracker):
                     "effective_context_mode": context.effective_mode,
                     "reference_mode": context.reference_mode,
                     "visual_marker_version": context.visual_marker_version,
+                    "history_layout_version": context.history_layout_version,
                 },
             )
             memory_decisions["visual"] = self._memory_policy.process(bank, visual_candidate)
@@ -440,6 +490,7 @@ class CognitiveVLMTracker(BaseTracker):
                     "effective_context_mode": context.effective_mode,
                     "reference_mode": context.reference_mode,
                     "visual_marker_version": context.visual_marker_version,
+                    "history_layout_version": context.history_layout_version,
                 },
             )
             semantic_decision = self._memory_policy.process(bank, semantic_candidate)
@@ -576,7 +627,11 @@ class CognitiveVLMTracker(BaseTracker):
         return {
             "context_mode": self.context_mode,
             "reference_mode": self.reference_mode,
+            "prompt_profile": self.prompt_profile,
+            "force_history_image": self.force_history_image,
+            "history_layout_version": self.history_layout_version,
             "use_init_language": self.use_init_language,
+            "target_text_source": self.target_text_source,
             "mosaic_panel_height": self.mosaic_panel_height,
             "bbox_protocol": self.bbox_protocol,
             "memory_enabled": self.memory_enabled,

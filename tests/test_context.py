@@ -1,9 +1,15 @@
 import numpy as np
 
 from cogtrack.context import (
+    HISTORY_LAYOUT_COMPACT_GRID_V1,
+    HISTORY_LAYOUT_RECENT_STRIP_3_V1,
+    HISTORY_LAYOUT_RECENT_STRIP_3_V2,
+    HISTORY_STRIP_SEPARATOR_COLOR_RGB,
+    PROMPT_PROFILE_VLT_V6,
     REFERENCE_MODE_VISUAL_BOX,
     VISUAL_MARKER_VERSION,
     TrackingContextBuilder,
+    arrange_history_items,
     build_history_mosaic,
     draw_reference_box,
 )
@@ -50,13 +56,76 @@ def test_mosaic_uses_compact_grid_without_frame_number_header():
             bbox_xywh=(20, 20, 30, 30),
             image=image,
         )
-        for frame_id in (4, 8, 12, 16)
+        for frame_id in (16, 4, 12, 8)
     )
     result = builder.build_mosaic(image, records, "target")
 
     # 四帧按 2x2 排列；没有旧实现额外添加的 30px 帧号标题行。
     assert result.images[1].shape[:2] == (480, 768)
     assert result.reference_frames == (0, 4, 8, 12, 16)
+    assert result.history_layout_version == HISTORY_LAYOUT_COMPACT_GRID_V1
+
+
+def test_recent_history_strip_keeps_latest_three_and_pads_on_the_right():
+    assert arrange_history_items(
+        (4,), layout=HISTORY_LAYOUT_RECENT_STRIP_3_V2
+    ) == (4, 4, 4)
+    assert arrange_history_items(
+        (4, 8), layout=HISTORY_LAYOUT_RECENT_STRIP_3_V2
+    ) == (4, 8, 8)
+    assert arrange_history_items(
+        (4, 8, 12, 16), layout=HISTORY_LAYOUT_RECENT_STRIP_3_V2
+    ) == (8, 12, 16)
+
+    panels = tuple(
+        (np.full((100, 160, 3), value, dtype=np.uint8), (10, 10, 20, 20))
+        for value in (40, 80)
+    )
+    legacy_strip = build_history_mosaic(
+        panels,
+        panel_height=240,
+        layout=HISTORY_LAYOUT_RECENT_STRIP_3_V1,
+    )
+    assert legacy_strip.shape[:2] == (240, 1152)
+
+    strip = build_history_mosaic(
+        panels,
+        panel_height=240,
+        layout=HISTORY_LAYOUT_RECENT_STRIP_3_V2,
+    )
+    assert strip.shape[:2] == (240, 1166)
+    assert np.all(strip[180, 192] == 40)
+    assert np.all(strip[180, 583] == 80)
+    assert np.all(strip[180, 974] == 80)
+    assert np.all(strip[:, 384:391] == HISTORY_STRIP_SEPARATOR_COLOR_RGB)
+    assert np.all(strip[:, 775:782] == HISTORY_STRIP_SEPARATOR_COLOR_RGB)
+
+
+def test_vlt_history_strip_drops_old_records_and_preserves_order():
+    anchor = np.zeros((100, 160, 3), dtype=np.uint8)
+    builder = TrackingContextBuilder(
+        IdentityAnchor(0, (10, 10, 20, 30), image=anchor),
+        reference_mode=REFERENCE_MODE_VISUAL_BOX,
+        prompt_profile=PROMPT_PROFILE_VLT_V6,
+        force_history_image=True,
+    )
+    records = tuple(
+        MemoryRecord(
+            record_id=f"positive-{frame_id}",
+            kind=MemoryKind.POSITIVE,
+            frame_id=frame_id,
+            source=MemorySource.VLM_PREDICTION,
+            bbox_xywh=(20, 20, 30, 30),
+            image=np.full_like(anchor, frame_id),
+        )
+        for frame_id in (12, 4, 16, 8)
+    )
+
+    result = builder.build_mosaic(anchor, records)
+
+    assert result.reference_frames == (0, 8, 12, 16)
+    assert result.images[1].shape[:2] == (240, 1166)
+    assert result.history_layout_version == HISTORY_LAYOUT_RECENT_STRIP_3_V2
 
 
 def test_visual_box_pair_marks_only_past_anchor_and_has_no_coordinate_text():
@@ -103,3 +172,40 @@ def test_visual_box_online_mosaic_uses_shared_renderer():
     assert result.prompt.name == "cognitive_visual_mosaic"
     assert "accepted past observations" in result.prompt.user_prompt
     assert "may be imperfect" in result.prompt.user_prompt
+
+
+def test_vlt_v6_keeps_fixed_three_image_interface_before_dynamic_history():
+    anchor = np.zeros((100, 160, 3), dtype=np.uint8)
+    current = np.full((100, 160, 3), 23, dtype=np.uint8)
+    builder = TrackingContextBuilder(
+        IdentityAnchor(0, (10, 10, 20, 30), image=anchor),
+        reference_mode=REFERENCE_MODE_VISUAL_BOX,
+        prompt_profile=PROMPT_PROFILE_VLT_V6,
+        force_history_image=True,
+    )
+
+    result = builder.build_mosaic(
+        current,
+        (),
+        target_text="a small gray vehicle",
+        semantic_memory="rear view now exposes two white stripes",
+    )
+
+    assert result.effective_mode == "mosaic"
+    assert len(result.images) == 3
+    assert result.reference_frames == (0, 0, 0, 0)
+    assert result.prompt.name == "cognitive_vlt_mosaic"
+    assert result.prompt.version == "6.3.0"
+    assert result.prompt.expected_image_count == 3
+    assert "a small gray vehicle" in result.prompt.user_prompt
+    assert "rear view now exposes two white stripes" in result.prompt.user_prompt
+    assert "Decision order" not in result.prompt.user_prompt
+    assert "may overwrite the initialized identity" in result.prompt.system_prompt
+    assert "analyze its current state" in result.prompt.system_prompt
+    assert "With two images" not in result.prompt.system_prompt
+    assert "padding" not in result.prompt.system_prompt
+    assert "Return only" not in result.prompt.system_prompt
+    assert "bbox_norm1000_xyxy" not in result.prompt.system_prompt
+    assert result.images[1].shape[:2] == (240, 1166)
+    assert result.history_layout_version == HISTORY_LAYOUT_RECENT_STRIP_3_V2
+    assert np.array_equal(result.images[-1], current)

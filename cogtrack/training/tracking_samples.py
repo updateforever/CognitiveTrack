@@ -26,10 +26,17 @@ from typing import Sequence as TypingSequence
 import cv2
 import numpy as np
 
+from cogtrack.context.builder import (
+    PROMPT_PROFILE_VISUAL_V5,
+    PROMPT_PROFILE_VLT_V6,
+    history_layout_for_prompt_profile,
+    validate_prompt_profile,
+)
 from cogtrack.context.visual import (
     REFERENCE_MODE_BBOX_TEXT,
     REFERENCE_MODE_VISUAL_BOX,
     VISUAL_MARKER_VERSION,
+    arrange_history_items,
     build_history_mosaic,
     draw_reference_box,
     validate_reference_mode,
@@ -39,19 +46,27 @@ from cogtrack.prompts import (
     build_mosaic_prompt,
     build_pair_prompt,
     build_visual_tracking_prompt,
+    build_vlt_tracking_prompt,
 )
 from cogtrack.protocol import BoundingBoxError, clip_xywh, pixel_xywh_to_norm1000_xyxy
+from cogtrack.training.loss_mask import (
+    SFT_SUPERVISION_FULL,
+    SFT_SUPERVISION_TRACKING_CORE,
+)
 from pytracking.evaluation.data import Sequence
 
-SOURCE_SCHEMA_VERSION = "cogtrack.training.source.v5"
+SOURCE_SCHEMA_VERSION = "cogtrack.training.source.v6"
+SOURCE_SCHEMA_VERSION_V5 = "cogtrack.training.source.v5"
 MEMORY_SUPERVISION_DISABLED = "disabled"
 MEMORY_SUPERVISION_FEASIBILITY_NULL = "feasibility_null"
 MEMORY_SUPERVISION_EXPLICIT = "explicit"
+MEMORY_SUPERVISION_MASKED_NULL = "masked_null"
 MEMORY_SUPERVISION_MODES = frozenset(
     {
         MEMORY_SUPERVISION_DISABLED,
         MEMORY_SUPERVISION_FEASIBILITY_NULL,
         MEMORY_SUPERVISION_EXPLICIT,
+        MEMORY_SUPERVISION_MASKED_NULL,
     }
 )
 
@@ -98,6 +113,8 @@ class TrackingSampleConfig:
     history_corruption_ratio: float = 0.0
     reference_mode: str = REFERENCE_MODE_BBOX_TEXT
     memory_supervision: str = MEMORY_SUPERVISION_DISABLED
+    prompt_profile: str = PROMPT_PROFILE_VISUAL_V5
+    force_history_image: bool = False
 
     def __post_init__(self) -> None:
         if self.mode not in {"pair", "mosaic", "both"}:
@@ -129,6 +146,18 @@ class TrackingSampleConfig:
         if self.present_only and self.balance_presence:
             raise ValueError("present_only 与 balance_presence 不能同时启用")
         object.__setattr__(self, "reference_mode", validate_reference_mode(self.reference_mode))
+        object.__setattr__(self, "prompt_profile", validate_prompt_profile(self.prompt_profile))
+        if (
+            self.prompt_profile == PROMPT_PROFILE_VLT_V6
+            and self.reference_mode != REFERENCE_MODE_VISUAL_BOX
+        ):
+            raise ValueError("vlt_v6 训练样本必须使用 reference_mode=visual_box")
+        if not isinstance(self.force_history_image, bool):
+            raise TypeError("force_history_image 必须是 bool")
+        if self.force_history_image and self.mode not in {"mosaic", "both"}:
+            raise ValueError("force_history_image 需要 mode=mosaic 或 both")
+        if self.force_history_image and self.reference_mode != REFERENCE_MODE_VISUAL_BOX:
+            raise ValueError("force_history_image 只支持 visual_box")
         if self.memory_supervision not in MEMORY_SUPERVISION_MODES:
             raise ValueError(
                 f"memory_supervision 必须是 {sorted(MEMORY_SUPERVISION_MODES)} 之一"
@@ -152,6 +181,9 @@ class TrackingSampleBuildReport:
     max_image_side: int | None
     sampling_plan_applied: bool
     reference_mode: str
+    prompt_profile: str
+    force_history_image: bool
+    history_layout_version: str | None
     source_jsonl: str
     image_root: str
     sequence_count: int
@@ -168,6 +200,7 @@ class TrackingSampleBuildReport:
     memory_supervision: str
     memory_null_count: int
     memory_non_null_count: int
+    semantic_memory_input_count: int
     visual_marker_version: str | None
 
     def to_dict(self) -> dict[str, Any]:
@@ -188,6 +221,7 @@ class _MutableStats:
     corrupted_mosaic_count: int = 0
     memory_null_count: int = 0
     memory_non_null_count: int = 0
+    semantic_memory_input_count: int = 0
 
 
 def _safe_component(value: str) -> str:
@@ -198,6 +232,60 @@ def _safe_component(value: str) -> str:
         return normalized
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
     return f"{normalized}-{digest}"
+
+
+def _initial_target_text(
+    sequence: Sequence,
+    *,
+    enabled: bool,
+    prompt_profile: str,
+) -> tuple[str, str]:
+    """返回初始化时可用的 VLT 文本及来源，不读取整段视频叙事。"""
+
+    if not enabled:
+        return "", "disabled"
+    scope = str(sequence.metadata.get("language_scope") or "").strip().lower()
+    description = str(sequence.language_query or "").strip()
+    unsafe_story = scope == "full_video_story" or (
+        sequence.dataset == "mgit" and scope != "initial_target"
+    )
+    if description and not unsafe_story:
+        return description, "dataset_initial_language"
+    object_class = str(sequence.object_class or "").strip()
+    if object_class:
+        return object_class, "dataset_object_class"
+    if prompt_profile == PROMPT_PROFILE_VLT_V6:
+        return "the target marked by the red box in Image 1", "visual_anchor_fallback"
+    return "", "unavailable"
+
+
+def _latest_prior_semantic_memory(
+    *,
+    memory_supervision: str,
+    labels_by_sequence: Mapping[str, Mapping[int, Any]] | None,
+    sequence_key: str,
+    frame_id: int,
+) -> str:
+    """从严格早于 current 的已标注更新中选最近一条记忆。
+
+    Phase-1 ``masked_null`` 没有可靠记忆标签，因此输入明确为空；不会把当前标签或
+    未来确认帧泄漏进 Prompt。显式记忆阶段才启用这一回放路径。
+    """
+
+    if memory_supervision != MEMORY_SUPERVISION_EXPLICIT or labels_by_sequence is None:
+        return ""
+    frame_labels = labels_by_sequence.get(sequence_key, {})
+    candidates: list[tuple[int, MemoryUpdateLabel]] = []
+    for candidate_frame, raw_label in frame_labels.items():
+        candidate_id = int(candidate_frame)
+        if candidate_id >= frame_id:
+            continue
+        label = _coerce_memory_label(raw_label)
+        if label.value:
+            candidates.append((candidate_id, label))
+    if not candidates:
+        return ""
+    return max(candidates, key=lambda item: item[0])[1].value or ""
 
 
 def _read_rgb(path: str | Path) -> np.ndarray:
@@ -555,6 +643,11 @@ def _record(
     reference_mode: str,
     memory_supervision: str,
     memory_label: MemoryUpdateLabel | None,
+    target_text: str,
+    target_text_source: str,
+    semantic_memory: str,
+    prompt_profile: str,
+    force_history_image: bool,
 ) -> dict[str, Any]:
     images = [reference_path]
     if history_path is not None:
@@ -571,7 +664,11 @@ def _record(
         memory_label=memory_label,
     )
     row = {
-        "schema_version": SOURCE_SCHEMA_VERSION,
+        "schema_version": (
+            SOURCE_SCHEMA_VERSION
+            if prompt_profile == PROMPT_PROFILE_VLT_V6
+            else SOURCE_SCHEMA_VERSION_V5
+        ),
         "id": (
             f"{sequence.dataset}::{sequence.name}::{reference_frame_id:08d}::{frame_id:08d}::"
             f"{requested_mode}::{effective_mode}"
@@ -597,17 +694,38 @@ def _record(
                 VISUAL_MARKER_VERSION if reference_mode == REFERENCE_MODE_VISUAL_BOX else None
             ),
             "history_frame_ids": history_frame_ids,
+            "history_layout_version": (
+                history_layout_for_prompt_profile(prompt_profile)
+                if effective_mode == "mosaic"
+                else None
+            ),
             "requested_mode": requested_mode,
             "effective_mode": effective_mode,
             "prompt_name": prompt.name,
             "prompt_version": prompt.version,
+            "prompt_profile": prompt_profile,
             "bbox_format": "norm1000_xyxy",
             "memory_supervision": memory_supervision,
             "memory_label_source": memory_label.source if memory_label is not None else None,
             "memory_label_reviewed": memory_label.reviewed if memory_label is not None else None,
-            # 当前通用构造器只验证第三字段输出；论文版 memory case 还需显式回放更早
-            # 已接受语义记忆，并提升 schema 后再把此字段设为 true。
-            "uses_semantic_memory_input": False,
+            "memory_loss_masked": memory_supervision == MEMORY_SUPERVISION_MASKED_NULL,
+            "sft_supervision_profile": (
+                SFT_SUPERVISION_TRACKING_CORE
+                if memory_supervision == MEMORY_SUPERVISION_MASKED_NULL
+                else SFT_SUPERVISION_FULL
+            ),
+            "initial_target_text": target_text,
+            "initial_target_text_source": target_text_source,
+            "recent_semantic_memory": semantic_memory,
+            # VLT-v6.3 的正式命名。保留上面两个旧键，确保已经生成的 v6 数据仍可重放。
+            "initial_identity_description": target_text,
+            "initial_identity_description_source": target_text_source,
+            "current_target_state": semantic_memory or target_text,
+            "current_target_state_source": (
+                "accepted_memory" if semantic_memory else target_text_source
+            ),
+            "uses_semantic_memory_input": bool(semantic_memory),
+            "force_history_image": force_history_image,
         },
     }
     if "memory_update" in answer:
@@ -690,6 +808,12 @@ def _memory_label_for_frame(
         return MemoryUpdateLabel(
             value=None,
             source="feasibility_null_only_not_for_formal_training",
+            reviewed=False,
+        )
+    if memory_supervision == MEMORY_SUPERVISION_MASKED_NULL:
+        return MemoryUpdateLabel(
+            value=None,
+            source="masked_null_unsupervised_memory_v1",
             reviewed=False,
         )
     if labels_by_sequence is None or sequence_key not in labels_by_sequence:
@@ -817,11 +941,11 @@ def build_tracking_samples(
                 image_cache[anchor_frame_id] = anchor_image
                 written_assets.add(reference_asset)
                 anchor_reference_relative = reference_asset.relative_to(root).as_posix()
-                target_text = ""
-                if options.use_language_description:
-                    target_text = (
-                        sequence.language_query or sequence.object_class or "initialized target"
-                    ).strip()
+                target_text, target_text_source = _initial_target_text(
+                    sequence,
+                    enabled=options.use_language_description,
+                    prompt_profile=options.prompt_profile,
+                )
 
                 sequence_samples = 0
                 planned_frame_ids = None
@@ -932,14 +1056,26 @@ def build_tracking_samples(
                         sequence_key=plan_key,
                         frame_id=frame_id,
                     )
+                    semantic_memory = _latest_prior_semantic_memory(
+                        memory_supervision=options.memory_supervision,
+                        labels_by_sequence=memory_labels_by_sequence,
+                        sequence_key=plan_key,
+                        frame_id=frame_id,
+                    )
                     include_memory_update = options.memory_supervision != MEMORY_SUPERVISION_DISABLED
 
                     contexts: list[tuple[str, str, str | None, list[int], PromptSpec, str | None]] = []
                     if options.mode in {"pair", "both"}:
                         if options.reference_mode == REFERENCE_MODE_VISUAL_BOX:
-                            pair_prompt = build_visual_tracking_prompt(
+                            prompt_builder = (
+                                build_vlt_tracking_prompt
+                                if options.prompt_profile == PROMPT_PROFILE_VLT_V6
+                                else build_visual_tracking_prompt
+                            )
+                            pair_prompt = prompt_builder(
                                 history_count=0,
                                 target_text=target_text,
+                                semantic_memory=semantic_memory,
                                 include_memory_update=include_memory_update,
                             )
                         else:
@@ -973,10 +1109,26 @@ def build_tracking_samples(
                             source_size=source_size,
                         )
                         if panels:
+                            # 当前 VLT 主线固定为左到右的近期三帧。少于三帧时在右侧
+                            # 复制最近可用历史；visual-v5 继续保留旧紧凑网格。
+                            panels = list(
+                                arrange_history_items(
+                                    panels,
+                                    layout=history_layout_for_prompt_profile(
+                                        options.prompt_profile
+                                    ),
+                                )
+                            )
                             if options.reference_mode == REFERENCE_MODE_VISUAL_BOX:
-                                prompt = build_visual_tracking_prompt(
+                                prompt_builder = (
+                                    build_vlt_tracking_prompt
+                                    if options.prompt_profile == PROMPT_PROFILE_VLT_V6
+                                    else build_visual_tracking_prompt
+                                )
+                                prompt = prompt_builder(
                                     history_count=len(panels),
                                     target_text=target_text,
+                                    semantic_memory=semantic_memory,
                                     include_memory_update=include_memory_update,
                                 )
                             else:
@@ -1022,6 +1174,9 @@ def build_tracking_samples(
                                         build_history_mosaic(
                                             [(item[1], item[2]) for item in variant_panels],
                                             panel_height=options.mosaic_panel_height,
+                                            layout=history_layout_for_prompt_profile(
+                                                options.prompt_profile
+                                            ),
                                         ),
                                         options.max_image_side,
                                     ),
@@ -1042,13 +1197,66 @@ def build_tracking_samples(
                                     )
                                 )
                                 stats.corrupted_mosaic_count += int(corruption is not None)
+                        elif options.force_history_image:
+                            # 最早观测尚无动态历史时，用初始化锚点填满三格。它严格早于
+                            # current；重复格只是 padding，不伪造三次预测。
+                            fallback_panels = arrange_history_items(
+                                ((anchor_frame_id, anchor_image, anchor_bbox),),
+                                layout=history_layout_for_prompt_profile(
+                                    options.prompt_profile
+                                ),
+                            )
+                            history_asset = asset_dir / (
+                                f"history_{reference_frame_id:08d}_before_{frame_id:08d}"
+                                "_anchor_fallback.jpg"
+                            )
+                            _write_rgb(
+                                history_asset,
+                                _resize_long_side(
+                                    build_history_mosaic(
+                                        tuple(
+                                            (item[1], item[2]) for item in fallback_panels
+                                        ),
+                                        panel_height=options.mosaic_panel_height,
+                                        layout=history_layout_for_prompt_profile(
+                                            options.prompt_profile
+                                        ),
+                                    ),
+                                    options.max_image_side,
+                                ),
+                                jpeg_quality=options.jpeg_quality,
+                                overwrite=overwrite,
+                                reuse_existing=options.reuse_existing_assets,
+                            )
+                            prompt = build_vlt_tracking_prompt(
+                                history_count=len(fallback_panels),
+                                target_text=target_text,
+                                semantic_memory=semantic_memory,
+                                include_memory_update=include_memory_update,
+                            )
+                            contexts.append(
+                                (
+                                    "mosaic",
+                                    "mosaic",
+                                    history_asset.relative_to(root).as_posix(),
+                                    [item[0] for item in fallback_panels],
+                                    prompt,
+                                    None,
+                                )
+                            )
                         elif options.mode == "mosaic":
                             # 纯 mosaic 构建需要与在线推理保持一致：尚无可信历史时
                             # 退化为 pair。both 模式已经生成 pair，不再复制同一条样本。
                             if options.reference_mode == REFERENCE_MODE_VISUAL_BOX:
-                                fallback_prompt = build_visual_tracking_prompt(
+                                prompt_builder = (
+                                    build_vlt_tracking_prompt
+                                    if options.prompt_profile == PROMPT_PROFILE_VLT_V6
+                                    else build_visual_tracking_prompt
+                                )
+                                fallback_prompt = prompt_builder(
                                     history_count=0,
                                     target_text=target_text,
+                                    semantic_memory=semantic_memory,
                                     include_memory_update=include_memory_update,
                                 )
                             else:
@@ -1087,11 +1295,25 @@ def build_tracking_samples(
                             reference_mode=options.reference_mode,
                             memory_supervision=options.memory_supervision,
                             memory_label=memory_label,
+                            target_text=target_text,
+                            target_text_source=target_text_source,
+                            semantic_memory=semantic_memory,
+                            prompt_profile=options.prompt_profile,
+                            force_history_image=options.force_history_image,
                         )
                         row["metadata"]["source_split"] = sequence.metadata.get("split")
-                        row["metadata"]["used_language_description"] = bool(target_text)
+                        row["metadata"]["uses_initial_target_text"] = bool(target_text)
+                        row["metadata"]["used_language_description"] = (
+                            target_text_source == "dataset_initial_language"
+                        )
                         row["metadata"]["temporal_case"] = presence
                         row["metadata"]["history_corruption"] = corruption
+                        row["metadata"]["history_anchor_fallback"] = bool(
+                            options.force_history_image
+                            and effective_mode == "mosaic"
+                            and bool(history_ids)
+                            and set(history_ids) == {anchor_frame_id}
+                        )
                         if corruption is not None:
                             row["id"] = f"{row['id']}::{corruption}"
                         handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
@@ -1104,6 +1326,7 @@ def build_tracking_samples(
                         if memory_label is not None:
                             stats.memory_null_count += int(memory_label.value is None)
                             stats.memory_non_null_count += int(memory_label.value is not None)
+                        stats.semantic_memory_input_count += int(bool(semantic_memory))
                 stats.sequences_with_samples += int(sequence_samples > 0)
 
         if stats.sequence_count == 0:
@@ -1116,7 +1339,11 @@ def build_tracking_samples(
         raise
 
     report = TrackingSampleBuildReport(
-        schema_version=SOURCE_SCHEMA_VERSION,
+        schema_version=(
+            SOURCE_SCHEMA_VERSION
+            if options.prompt_profile == PROMPT_PROFILE_VLT_V6
+            else SOURCE_SCHEMA_VERSION_V5
+        ),
         requested_mode=options.mode,
         balance_presence=options.balance_presence,
         present_only=options.present_only,
@@ -1124,6 +1351,13 @@ def build_tracking_samples(
         max_image_side=options.max_image_side,
         sampling_plan_applied=frame_ids_by_sequence is not None,
         reference_mode=options.reference_mode,
+        prompt_profile=options.prompt_profile,
+        force_history_image=options.force_history_image,
+        history_layout_version=(
+            history_layout_for_prompt_profile(options.prompt_profile)
+            if options.mode in {"mosaic", "both"}
+            else None
+        ),
         source_jsonl=source_path.relative_to(root).as_posix(),
         image_root=".",
         sequence_count=stats.sequence_count,
@@ -1140,6 +1374,7 @@ def build_tracking_samples(
         memory_supervision=options.memory_supervision,
         memory_null_count=stats.memory_null_count,
         memory_non_null_count=stats.memory_non_null_count,
+        semantic_memory_input_count=stats.semantic_memory_input_count,
         visual_marker_version=(
             VISUAL_MARKER_VERSION if options.reference_mode == REFERENCE_MODE_VISUAL_BOX else None
         ),
@@ -1152,6 +1387,7 @@ __all__ = [
     "MEMORY_SUPERVISION_DISABLED",
     "MEMORY_SUPERVISION_EXPLICIT",
     "MEMORY_SUPERVISION_FEASIBILITY_NULL",
+    "MEMORY_SUPERVISION_MASKED_NULL",
     "MEMORY_SUPERVISION_MODES",
     "MemoryUpdateLabel",
     "SOURCE_SCHEMA_VERSION",

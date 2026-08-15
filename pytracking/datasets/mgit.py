@@ -102,10 +102,17 @@ class MGITDataset(BaseDataset):
                 "split": self.split,
                 "version": self.version,
                 "bbox_format": "xywh",
+                # 官方方案：从 action 层读取第一个 action 的 description，
+                # 包含 object_class + appearance + 初始动作，适合作为初始目标描述。
+                "language_scope": "first_action_description",
             },
         )
 
     def _load_description(self, name: str) -> str | None:
+        """官方方案：从 action 层读取第一个 action 的 description。
+
+        参考 SALTTrack/lib/test/evaluation/mgitdataset.py:53-66 的官方实现。
+        """
         path = self.base_path / "attribute" / "description" / f"{name}.json"
         if not path.is_file():
             return None
@@ -115,15 +122,17 @@ class MGITDataset(BaseDataset):
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"MGIT 描述文件损坏: {path}") from exc
 
-        story = payload.get("story", {})
-        if isinstance(story, dict):
-            # 优先使用官方 story_1；缺失时按键名顺序选择首个非空描述。
-            candidates = ["story_1", *sorted(key for key in story if key != "story_1")]
-            for key in candidates:
-                item = story.get(key)
-                if isinstance(item, dict) and item.get("description"):
-                    text = str(item["description"]).strip()
-                    if text:
-                        # 与旧实现一致：首字母大写。
-                        return text[0].upper() + text[1:]
+        # 官方方案：从 action 层读取第一个 action 的 description
+        actions = payload.get("action", {})
+        if not actions:
+            return None
+
+        # 取第一个 action（按 start_frame 排序）
+        first_action = sorted(actions.values(), key=lambda x: x.get("start_frame", 0))[0]
+        desc = first_action.get("description", "").strip()
+
+        if desc:
+            # 保持首字母大写的规范
+            return desc[0].upper() + desc[1:] if len(desc) > 1 else desc.upper()
+
         return None

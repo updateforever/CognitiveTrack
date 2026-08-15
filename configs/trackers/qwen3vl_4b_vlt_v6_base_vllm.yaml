@@ -1,0 +1,30 @@
+# VLT-v6.3 Qwen3-VL-4B 零样本基线；固定 recent_strip_3_v2，与 SFT 同协议。
+tracker_name: cognitive_vlm
+experiment_name: qwen3vl_4b_vlt_v6_base
+context_mode: mosaic
+reference_mode: visual_box
+prompt_profile: vlt_v6
+force_history_image: true
+use_init_language: true
+mosaic_panel_height: 240
+bbox_protocol: norm1000
+
+observation_policy:
+  type: keyframe
+
+memory:
+  enabled: true
+  model_output_enabled: true
+  semantic_enabled: true
+  max_positive_records: 3
+  max_semantic_records: 4
+  confirmations: 2
+  max_confirmation_gap: 30
+  min_positive_frame_gap: 5
+  min_semantic_frame_gap: 30
+  semantic_confirmations: 2
+  max_semantic_confirmation_gap: 300
+  min_semantic_text_similarity: 0.35
+
+model_config: ../models/qwen3vl_4b_vllm_base.yaml
+save_raw_response: true

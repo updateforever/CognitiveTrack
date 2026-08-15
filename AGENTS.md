@@ -1,375 +1,174 @@
-# CognitiveTrack AI 执行与进度恢复指南
+# CognitiveTrack AI 执行与恢复指南
 
-本文件是新服务器、新会话或新代码 AI 接手 CognitiveTrack 时的首要上下文。开始工作
-前必须完整阅读本文件；环境和数据的逐命令部署细节继续阅读
-[`docs/l40_setup.md`](docs/l40_setup.md)。不要要求用户重新讲述已经记录在这里的项目
-历史。
+本文件是新 AI、新会话和新训练服务器接手项目时的首要上下文。开始修改前完整阅读本
+文件，再按任务读取对应文档。不要要求用户重复已经记录的研究决策。
 
-## 1. 项目是什么
+## 1. 项目定位与隔离边界
 
-CognitiveTrack 是建立在 pytracking 标准生命周期上的视觉语言模型长时单目标跟踪
-研究框架：
+CognitiveTrack 是独立、可开源的 pytracking 长时单目标跟踪框架，研究纯 VLM 的全图
+搜索、目标存在性、同实例定位、时序状态记忆和稀疏执行。标准生命周期为：
 
 ```text
 Sequence -> Tracker.initialize -> Tracker.track -> ResultWriter -> Evaluator
 ```
 
-研究目标是让 VLM 在完整图像中完成目标判别与全局定位，并进一步研究稀疏执行、
-时序上下文和语义变化记忆。当前论文目标是先回答一个更基础的问题：纯 VLM 是否能
-从首帧身份参考出发，在长视频中判断目标是否存在，并在存在时定位同一实例。
+SUTrack 是传统强基线，Hybrid 是工程方向；当前论文主线是纯 VLM。SOIBench 属于另一个
+尚未发表项目，必须彻底隔离，禁止把其代码、数据、实验名或结论迁入本仓库。
 
-本仓库是独立项目，不依赖上层 `/data2/wyp/VLMTrack` 的运行时代码。SOIBench 是另一个
-尚未发表的项目，必须彻底隔离，禁止把其代码、数据、实验名称或结论迁入本仓库。
+## 2. 当前唯一论文主线
 
-## 2. 当前研究主线与已冻结决策
+当前协议是 VLT-v6.3，完整方案见 [`docs/research_plan.md`](docs/research_plan.md)：
 
-除非用户明确改变研究设计，后续 AI 必须遵守以下决策：
+1. VLT-v6.3 core SFT：只学习 presence 与 bbox；
+2. region-caption/ref 教师冷启动目标状态事件标签；
+3. memory SFT：学习何时更新及完整状态快照；
+4. TU-GRPO：优化状态更新对未来短轨迹的反事实收益；
+5. CognitiveBench-Tiny 迭代，配方冻结后运行 Full。
 
-- 当前优先级是纯 VLM 稀疏跟踪评测，不先做 SUTrack/VLM 工程融合。Hybrid 已有可用
-  实现，但不是现阶段论文主实验。
-- 主 baseline 是 `Qwen3-VL-4B-Instruct`；Qwen2.5-VL-3B 只作代际/成本
-  对照，Qwen3-VL-32B 只考虑 LoRA 对照。
-- 2026-08-13 起下一版正式训练不再按 Stage-1/2/3 顺序做三次 SFT，而是把单参考、
-  mosaic、长间隔、消失/重现、干净/扰动历史和记忆样本混合后做一次统一三字段 LoRA
-  SFT。旧 Stage-1/2 是已经完成的历史实验和初始化候选，不代表新范式已训练。
-- 统一训练监督 `present/absent`、存在时 bbox 和可空 `memory_update`；仍不监督旧六分类、
-  身份文字标签、解释文本、细粒度状态或数值置信度。
-- 负样本只能来自同一视频中真实的目标消失帧，禁止使用跨序列错配或人工抹除目标。
-- 输入图片保持完整、不做目标局部裁剪。下一版中所有过去的身份参考图和可信历史图
-  统一直接画框，不再向模型提供 reference bbox 坐标文本；当前待预测的完整搜索图
-  永远不画框。“所有图画框”只指过去的参考/历史图，不能给 current 画框造成泄漏。
-- visual-v5 主实验设置 `use_init_language: false`；数据集自然语言只允许作为显式消融，
-  不能因某些来源有描述、某些来源没有而混入主结果。
-- 正式在线输入保留永久首帧身份锚点，并显式提供最近可信 VLM 观测及更早历史；稀疏
-  推理中的“最近”不是字面上一视频帧。首帧不能被滚动预测替换，动态历史必须门控，
-  防止一次误跟踪自我强化。
-- 下一版 Qwen3 输出严格是三个字段。例如：
+旧 pair Stage-1、mosaic Stage-2、visual-v5 和 Qwen v4 probe 都已移入
+[`docs/archive/`](docs/archive/README.md)。旧结果是有效历史对照，但不能代表新主线已经
+训练或评测。真实完成度以 [`docs/project_status.md`](docs/project_status.md) 为准。
+
+## 3. 冻结的在线输入与输出
+
+所有 Base/Core/Memory/GRPO 主实验使用同一推理范式，不根据训练阶段切换：
+
+- Image 1：带红框的永久首帧完整图，身份锚点永不覆盖；
+- Image 2：近期三次可信观测组成的单行条带，从左到右由旧到新，panel 间使用白色竖向
+  分隔带；不足三帧时在右侧复制最近可用观测，尚无动态历史时将初始化观测复制三次；
+- Image 3：无框当前完整图，必须全图搜索；
+- `initial_identity_description`：首帧身份描述，不可变；
+- `current_target_state`：当前维护状态，可被稀疏替换，初值等于身份描述。
+
+训练模型的 System Prompt 固定为 `6.3.0` 极简任务定义：说明初始身份不可被历史或状态
+覆盖，要求结合历史轨迹在当前帧判断同一目标是否存在、分析当前状态、存在时定位，并仅在
+稳定且有助于未来跟踪的状态变化时更新记忆。它**不写**双图兼容、padding、JSON schema、
+坐标规则或格式惩罚；这些能力由 SFT 样本内化。Prompt 唯一来源是
+`cogtrack/prompts/vlt_tracking.py`，禁止复制到 tracker 或数据脚本。
+
+模型与运行时之间的输出协议仍严格为：
 
 ```json
 {"target_status":"present","bbox_norm1000_xyxy":[100,120,400,520],"memory_update":null}
 ```
 
-- `memory_update` 同时表示“是否更新”和短语义增量；`null` 表示不更新。非空标签只能
-  来自可靠现有标注、视觉/时间过滤和必要审核，普通 bbox 标签不得伪造记忆文本。
-- 正式 benchmark 推理不随训练阶段切换模式：固定使用首帧完整图身份锚点、在线可信
-  历史预测 mosaic、当前关键帧完整图，以及三字段输出。Stage-1/2 的阶段专用 pair
-  配置只作训练验证或消融。第三字段缺失/非法时拒绝记忆提议并留痕，但只要核心
-  `target_status+bbox` 合法，就不能把整帧降成 parse_error。
-- 记忆目标是模型自主学习“发生稳定重大外观变化时才更新”，不能从普通 bbox 标签
-  伪造记忆文本。
-- `parse_error`、`model_error`、`skipped` 和模型预测的 `absent` 必须严格分离；工程
-  失败不得伪装成目标消失。
-- 在线推理第一帧只用 GT 初始化并在身份锚点图上画框，后续帧禁止把当前或未来 GT
-  传入 tracker。训练 reference/history 只能来自同序列严格更早的 present 帧；GT 只能
-  在推理结束后用于评测。
-- 训练、验证、测试按完整序列划分，禁止帧级泄漏。
+`memory_update=null` 沿用当前状态。非空字符串必须是短小、自包含、保留身份线索的完整
+替换状态，不是只写变化量；`absent` 时必须为 null。目标消失不能清空记忆。字段固定放在
+最后，null 是快速生成路径，非空是慢路径。
 
-统一数据与 Prompt 的完整设计见
-[`docs/stage2_stage3_data.md`](docs/stage2_stage3_data.md)。截至 2026-08-13，共享绘框、
-v5 Prompt、tracker、三字段导出和 semantic gate 已实现并通过小样本 smoke；正式分桶
-数据、SFT 和聚合 benchmark 尚未完成。不要把工程可行性当成训练效果。
+对未经本任务训练的通用 VLM 做比较时，可以使用单独版本化的 strict comparison Prompt
+追加 JSON、坐标和格式说明以保证结果可解析；不得把这些约束写回训练模型的 native
+Prompt，也不得在实验记录中混淆两种 Prompt profile。该 comparison profile 尚未冻结，
+实现前需要先补配置、manifest 字段和公平性说明。
 
-## 3. Qwen 坐标协议：不可混用
+训练和在线推理不提供 reference bbox 坐标文本：过去参考/历史图直接画框，current 永远
+不画框。模型输出当前 bbox 仍遵循 Qwen 官方 grounding 形式。
 
-Qwen2.5-VL 与 Qwen3-VL 不是同一套官方 grounding 坐标：
+## 4. 监督边界
+
+- GT 只监督 `present/absent` 与 present bbox；负样本只来自同一真实视频的消失帧；
+- 不监督旧六分类、数值置信度、身份匹配文字、自由解释或公开 CoT；
+- Core SFT 保留三字段，但仅 mask `memory_update` 的 JSON 值；字段名和闭合仍受监督；
+- Core checkpoint 推理时关闭 semantic write，不能声称已经学会记忆；
+- Memory SFT 只使用有 provenance 的人工/银标事件，不能给普通样本机械追加 null；
+- 非空状态标签只来自 train split 的离线标注与验收；future 支持帧只能用于 annotator/
+  reward，导出学生输入前必须物理移除；
+- GRPO 只能从稳定 Memory SFT 初始化，未来 GT 只进入 reward 计算器。
+
+状态标注执行规范见 [`docs/state_annotation.md`](docs/state_annotation.md)，TU-GRPO 定义见
+[`docs/grpo.md`](docs/grpo.md)。
+
+## 5. 初始化文本与坐标安全
+
+LaSOT `nlp.txt` 和 TNL2K `language.txt` 可作初始化身份描述。MGIT 当前 story 可能包含
+未来事件，禁止直接作为在线文本；回退到 object class 或首帧红框视觉指代。
+
+两代 Qwen 坐标不可混用：
 
 | 模型族 | 数据视图 | 输出字段 | tracker 协议 |
 | --- | --- | --- | --- |
+| Qwen3-VL | 当前图 `[0,1000]` 相对 `xyxy` | `bbox_norm1000_xyxy` | `norm1000` |
 | Qwen2.5-VL | processor resize 后绝对像素 `xyxy` | `bbox_pixel_xyxy` | `qwen_abs_pixel` |
-| Qwen3-VL | `[0,1000]` 相对 `xyxy` | `bbox_norm1000_xyxy` | `norm1000` |
 
-训练 JSONL 使用 ms-swift 官方 `<bbox> + objects.bbox + image_id` 格式，并设置
-`QWENVL_BBOX_FORMAT=new`。不得手工发明新的坐标解析方式，也不得把
-`ms_swift/qwen2_5_vl/` 数据交给 Qwen3，反之亦然。训练脚本会在加载模型前检查模型
-族和数据视图；不要绕过检查。
+ms-swift 继续使用 `<bbox> + objects.bbox + image_id` 和 `QWENVL_BBOX_FORMAT=new`。Qwen3
+与 Qwen2.5 的 JSONL 目录不能互换，训练前必须用真实 processor 回放。
 
-## 4. 当前代码结构
+## 6. 代码结构与修改位置
 
-- `pytracking/`：数据集、tracker 生命周期、runner、结果写入和实验配置装配。
-- `pytracking/trackers/cognitive_vlm.py`：纯 VLM pair/mosaic tracker 编排。
-- `cogtrack/vlm/`：本地 Hugging Face Qwen 与 OpenAI-compatible API backend。
-- `cogtrack/prompts/`：所有长 prompt；禁止重新硬编码到 tracker。
-- `cogtrack/protocol/`：状态、bbox 和严格 JSON 协议。
-- `cogtrack/cognition/`、`cogtrack/memory/`：状态机与可审计记忆门控。
-- `cogtrack/training/`：数据构造、官方 Qwen grounding 导出、GRPO reward。
-- `cogtrack/models/sutrack/`：独立迁入且已做数值保真验证的 SUTrack runtime。
-- `tracking/`：命令行入口。
-- `configs/models/`、`configs/trackers/`、`configs/training/`：模型、实验与训练配方。
-- `scripts/train_qwen3vl_4b_stage1.sh`：当前主训练入口。
-- `docs/l40_setup.md`：换服务器恢复的完整操作手册。
+- `pytracking/`：dataset、tracker lifecycle、runner 和结果写入；
+- `pytracking/trackers/cognitive_vlm.py`：VLM 跟踪器编排；
+- `cogtrack/context/`：三图上下文、视觉画框和历史选择；
+- `cogtrack/prompts/`：版本化 prompt；
+- `cogtrack/protocol/`：状态、bbox 与严格 JSON；
+- `cogtrack/cognition/`、`cogtrack/memory/`：状态机与可审计更新门控；
+- `cogtrack/vlm/`：本地 Hugging Face 与 OpenAI-compatible/vLLM backend；
+- `cogtrack/training/`：样本、Qwen 导出、loss mask 与 reward；
+- `cogtrack/models/sutrack/`：已做数值保真的 SUTrack runtime；
+- `tracking/`：数据、训练、推理和评测 CLI；
+- `configs/`：模型、tracker、dataset 和训练配置。
 
-新增 tracker 时至少同步检查 tracker、parameter/config、prompt 三层。路径只放在
-`configs/env.local.yaml` 或环境变量中，禁止把本机绝对路径写入可提交配置。
+新增/修改 tracker 时同步核对 tracker、配置、Prompt、parser、结果 schema 和评测器。路径
+只写 `configs/env.local.yaml` 或环境变量，禁止向可提交文件写机器绝对路径。
 
-## 5. 截至 2026-08-13 的真实进度
+## 7. 数据和推理不可越过的边界
 
-### 工程与基线
+- 第一帧只用 GT 初始化，后续 tracker 禁止读取当前/future GT；
+- reference/history 必须是同序列、严格早于 current 的 accepted present 观测；
+- 训练、验证、测试按完整序列划分，禁止帧级泄漏；
+- 稀疏推理的“最近历史”是最近一次可信观测，不是字面上一帧；
+- 动态预测必须门控，不能让一次误跟踪立刻覆盖永久身份；
+- `parse_error`、`model_error`、`skipped` 与模型预测 `absent` 严格分开；
+- 结果 TXT/JSONL 帧数必须与序列一致，无框按协议写 `NaN`/`null`；
+- 同一训练模型系列的 benchmark 不因 checkpoint 改 prompt、历史数量、观察策略或评测
+  口径；通用 VLM 的 strict comparison profile 必须单独报告，不能混入 Base/Core 消融。
 
-- pytracking loader、tracker、结果 TXT/JSONL、评测闭环已完成。
-- SUTrack-B384 官方 epoch 180 checkpoint 已做严格键匹配和真实前向；迁入实现与原版
-  两条语言分支逐帧 bit 级一致。
-- 相同预测经原版和本项目指标聚合，15 条序列五项指标最大绝对差为 `0.00e+00`。
-- Qwen2.5/Qwen3 本地多图推理、pair/mosaic、二分类严格解析均已接通。
-- Qwen3-VL-4B 的零样本与 Stage-1 LoRA 双图推理均已真实跑通。单帧结果只能用于
-  工程和错误分析；是否提升必须以固定 CognitiveBench 协议的完整聚合指标判断。
-- 真实 Qwen processor 回放已经证明：Qwen2.5 使用 resize 后绝对像素，Qwen3 使用
-  norm1000，且多图 assistant bbox 正确绑定当前帧。
-- CognitiveBench v1 的 995 序列冻结标注已纳入
-  `benchmarks/cognitivebench/v1/`，共 1,408,438 帧和 343,616 个 0-based 关键帧；
-  benchmark 不含图像，运行时仍依赖 LaSOT-test、TNL2K-test 和 MGIT-val。
-- CognitiveBench-Tiny v1 已冻结为 24 条完整序列（MGIT/LaSOT/TNL2K=1/7/16），
-  共 39,251 帧、9,892 个关键帧和 9,868 次非初始化 VLM 请求。Tiny 先产正式初步
-  结果，Full 后补最终主表；二者只允许切换 dataset config，不得更改推理协议。
+## 8. 当前执行顺序
 
-### Stage-1 正式数据
+除非用户明确改变优先级，按以下顺序推进：
 
-- 来源：LaSOT train + TNL2K train + MGIT tiny/train。
-- 当前服务器可用来源为 LaSOT 1120、TNL2K 1300、MGIT tiny/train 95 条；MGIT
-  另有 10 条空帧目录被显式排除，不能声称使用完整 105 条 tiny/train。
-- 正式首版采用最多 64 个 `(reference,current)` pairs/序列；reference 是同序列中
-  严格更早的真实 present 帧，同一真实 current 可与不同 reference 组成不重复 pair。
-  present/absent 在每个数据来源内部均约为严格 70:30。
-- 固定 sampling plan 包含 2,511 条有效序列、160,049 pairs：present 112,034、
-  absent 48,015；LaSOT/TNL2K/MGIT 分别为 71,680/82,545/5,824 cases。
-- plan 中 16,213 个 case 复用 current 但使用不同 reference，精确重复 pair 为 0；
-  reference/current gap 中位数 161 帧、90% 分位 1,170 帧、最大 23,738 帧。
-- `sampling_plan.json` SHA-256：
-  `158372c68e82918d9460826d89f601d1278a3f97e6980e2069718755689c03a7`。
-- 新版本目录为
-  `data/releases/cogtrack_stage1_lasot_tnl2k_mgit_tiny_pair64_v1`。旧范式导出已完成：
-  train 152,039、val 8,010，完整序列划分。`source_samples.jsonl`、Qwen3 train/val
-  JSONL SHA-256 分别为
-  `e23c61307a132fee5d7ffc83d06bbaf072eda22292491815b21d432191cf9915`、
-  `f5db098150e950013dfefdf2db29be76fe65ca31a757e69aeaa607379d544dce`、
-  `e4b04c79acd6fffb422ac2fcdd3b1f3321c6707ba1977d8c45dd0089c2454543`。
-- 旧 LaSOT+TNL2K 48,400-case v1 从未用于实际训练，其统计和 sampling plan 不再作为
-  当前正式数据输入，只保留为历史记录。
-- 构造 CLI 已支持 `--sampling-plan` 严格重放，源数据验收工具为
-  `tools/verify_stage1_sources.py`。
+1. 训练服务器生成并冻结 VLT-v6.3 core plan；
+2. 渲染全量数据，运行监督审计与真实 Qwen processor mask 回放；
+3. 从 Qwen3-VL-4B-Instruct 做 core LoRA smoke、过拟合和正式训练；
+4. 用固定 VLT-v6.3 在 CognitiveBench-Tiny 比较 Base/Core；
+5. 实现 `mine → annotate → verify → export` 状态标签流水线，先建人工审核集；
+6. Memory SFT，并做 memory-on/forced-null 因果评测；
+7. 实现缓存版再到真实双分支的 TU-GRPO；
+8. 配方冻结后运行 CognitiveBench Full 与全部消融。
 
-数据和 outputs 被 `.gitignore` 排除，不会随 Git clone 出现。固定 sampling plan 应从
-私有 ModelScope 数据仓库或原服务器取得；如果文档中仍是 `<OWNER/...>` 占位符，先向
-用户询问一次实际 ModelScope dataset ID/revision，不要静默重新抽样。
+训练服务器从零恢复见 [`docs/l40_setup.md`](docs/l40_setup.md)，训练配置见
+[`docs/training.md`](docs/training.md)。
 
-### 已完成的旧范式 Stage-1/Stage-2 LoRA SFT
-
-- 正式训练环境为本服务器 2×L40；基座为 `Qwen3-VL-4B-Instruct`，BF16，LoRA rank
-  16、alpha 32、dropout 0.05，语言模型线性层注入，视觉塔和 aligner 冻结。
-- Stage-1 旧 pair64 数据共 160,049 cases。最终 checkpoint：
-  `outputs/qwen3vl_4b_stage1_lora_pair64_v2_2gpu/v0-20260812-010602/checkpoint-19005`；
-  19,005/19,005 steps，4h45m41s，train loss 0.29283377，token accuracy 0.882494。
-- Stage-2 旧 mosaic robust v2 数据共 181,969 cases，其中 train 172,915、val 9,054、
-  corrupted-history 21,920。`source_samples.jsonl`、Qwen3 train/val JSONL SHA-256 分别为
-  `08d1ad9c8591fba5924cfb749d172ee7fc86768f0a0bce93d29d3177058a6055`、
-  `758c4e8f04c9dec8df695874ef30f871cf66e9dcc837fa25503df32fb18b6204`、
-  `602241dc4c7cbf316b3904f30ba069339ea990c3cb428b983c929a2d99a7d309`。
-- Stage-2 从 Stage-1 `checkpoint-19005` 继续训练同一个 adapter，没有叠加第二个 LoRA。
-  最终 checkpoint：
-  `outputs/qwen3vl_4b_stage2_lora_mosaic_robust_v2_2gpu/v0-20260812-100910/checkpoint-28819`；
-  28,819/28,819 steps，7h15m14s，train loss 0.25926472，token accuracy 0.89407277，
-  峰值显存 38.13GiB/卡。
-- Stage-1 和 Stage-2 adapter 已发布到私有 ModelScope 模型仓库
-  `updateforever/CognitiveTrack-Qwen3VL-4B-Stage1-LoRA`。Stage-1 位于仓库根目录；
-  Stage-2 位于 `stage2-mosaic-robust-v2/`，权重 SHA-256 为
-  `7437dd2be3bae21070059ef5ce704da7bbd5008607f7e04eb18b3638f04930a1`，已做远端
-  回下载校验。
-- 上述两次训练使用旧范式：参考图框通过坐标文本/grounding 对象传入，Stage-1/2 输出
-  是二字段。Base/Stage-1/Stage-2 已在冻结的 CognitiveBench-Tiny 同协议完成一次初步
-  聚合评测：hold-last AUC 为 21.81/52.64/55.05，observation-only AUC 为
-  21.61/56.45/58.62。完整口径见
-  `docs/legacy_staged_tiny_results_20260813.md`；Full 尚未运行，且这些结果不等于新的
-  “历史图视觉画框 + 一次统一三字段混合训练”已经实现或训练。
-
-### visual-v5 工程状态与剩余差距
-
-- `TrackingContextBuilder` 已支持 `reference_mode: visual_box`：anchor/history 复用
-  `red_box_v1` 绘框，current 永远无框；旧 `bbox_text` 模式显式保留用于历史复现。
-- v5.0.0 Prompt、三字段 canonical/ms-swift 导出和 Base/Stage-2/new-SFT tracker 配置已
-  接入；输入不再创建 reference `<bbox>` object，输出框只绑定最后一张 current。
-- semantic proposal 默认跨帧相似确认两次后才落库。真实 4B 单 case 已验证首个提议只
-  停留在 `1/2`，没有立即写入长期记忆。
-- 本机只完成 2 条 TNL2K 序列的 `feasibility_null` 数据、Qwen3 processor 回放和真实
-  模型 smoke；正式 memory manifest、论文版 case 分桶、LoRA 与新 Tiny/Full 指标仍缺失。
-- 训练服务器入口是 `tracking/synthesize_visual_v5_dataset.py`，详细分工和命令见
-  `docs/visual_v5_iteration.md`。它强制 sampling plan 使用 `fixed_identity_anchor`；旧
-  Stage-1 的 `sampled_prior_present` plan 不能拿来生成 visual-v5。
-
-## 6. 新服务器最快恢复流程
-
-以下是摘要流程；路径、checksum、L40/NCCL 和故障处理以
-[`docs/l40_setup.md`](docs/l40_setup.md) 为准。
-
-### 6.1 拉取固定代码
+## 9. 常用验证命令
 
 ```bash
-git clone https://github.com/updateforever/CognitiveTrack.git /workspace/CognitiveTrack
-cd /workspace/CognitiveTrack
-git checkout <用户指定的 commit 或 tag>
-git status --short
-```
-
-如果服务器的 HTTPS/GnuTLS 被代理提前断开，可按 GitHub 支持的 SSH-over-443 使用：
-
-```bash
-git clone ssh://git@ssh.github.com:443/updateforever/CognitiveTrack.git /workspace/CognitiveTrack
-```
-
-这仍需要该服务器 SSH key 已加入 GitHub。不要关闭 SSL 校验规避网络问题。
-
-### 6.2 新建独立环境
-
-```bash
-cd /workspace/CognitiveTrack
-ENV_NAME=cogtrack-l40 bash scripts/setup_env.sh
-conda activate cogtrack-l40
 python scripts/verify_env.py --verbose
+python -m ruff check .
 python -m pytest -q
+python tools/verify_cognitivebench.py
+git diff --check
 ```
 
-测试数量随 commit 增长，以当前 commit 的完整测试集合为准，不能忽略失败项。
-
-### 6.3 配置机器路径
+涉及训练数据时额外执行：
 
 ```bash
-cp configs/env.example.yaml configs/env.local.yaml
+python tracking/validate_sft_supervision.py \
+  --profile tracking_core --dataset "$TRAIN_DATA" --dataset "$VAL_DATA"
+python tools/verify_qwen_grounding_templates.py \
+  --dataset-root "$DATASET_ROOT" --qwen3-model "$MODEL_PATH" \
+  --verify-tracking-core-mask
 ```
 
-编辑 `env.local.yaml`，至少设置 `project_root`、`model_root`、`output_root`、LaSOT、
-TNL2K 和 MGIT 路径。该文件禁止提交。
+修改后至少跑针对性测试，再跑完整 Ruff/pytest。benchmark 改动至少做单序列 smoke 和
+冻结标注验证。不要用单帧 case、训练 loss 或 reward 均值代替正式聚合指标。
 
-### 6.4 准备数据
+## 10. 文档与提交规则
 
-首选使用服务器已有的 LaSOT/TNL2K/MGIT tiny 和固定 plan 重建：
+README 只保留公开项目定位、快速安装、主协议和入口，不写内部讨论、机器账户、私有
+prompt 记录或阶段流水账。当前研究设计更新 `research_plan.md`；标签更新
+`state_annotation.md`；GRPO 更新 `grpo.md`；完成度更新 `project_status.md`；旧方案移动
+到 `docs/archive/`，不要删除历史证据。
 
-```bash
-python tools/verify_stage1_sources.py \
-  --lasot-root /datasets/raw/LaSOT \
-  --tnl2k-root /datasets/raw/TNL2K
-
-python tracking/synthesize_stage1_dataset.py \
-  --datasets lasot tnl2k mgit \
-  --mgit-version tiny \
-  --allow-missing-mgit-sequences \
-  --env-config configs/env.local.yaml \
-  --context-mode pair \
-  --frame-stride 1 \
-  --max-samples-per-sequence 64 \
-  --absent-ratio 0.3 \
-  --max-image-side 648 \
-  --jpeg-quality 95 \
-  --val-ratio 0.05 \
-  --seed 20260809 \
-  --sampling-plan /path/to/sampling_plan.json \
-  --qwen-model-families qwen2_5_vl qwen3_vl \
-  --output-dir /datasets/derived/cogtrack_stage1_lasot_tnl2k_mgit_tiny_pair64_v1
-```
-
-如果原始数据摘要不匹配，禁止继续沿用 v1 名称；改为下载 ModelScope 成品包并运行
-`sha256sum -c SHA256SUMS`。不要同时保留 unpacked 和 Hub 两份数据浪费空间。
-
-### 6.5 下载主模型
-
-```bash
-modelscope download Qwen/Qwen3-VL-4B-Instruct \
-  --local-dir /models/Qwen3-VL-4B-Instruct \
-  --max-workers 4
-```
-
-### 6.6 训练前验证
-
-```bash
-export DATASET_ROOT=/datasets/derived/cogtrack_stage1_lasot_tnl2k_mgit_tiny_pair64_v1
-
-python tracking/validate_qwen_training_view.py \
-  --model /models/Qwen3-VL-4B-Instruct \
-  --dataset "$DATASET_ROOT/ms_swift/qwen3_vl/train.jsonl" \
-  --dataset "$DATASET_ROOT/ms_swift/qwen3_vl/val.jsonl" \
-  --expected-family qwen3_vl
-```
-
-有 Qwen2.5 权重时再运行双代 processor 回放；没有 Qwen2.5 时不要为了这项审计阻塞
-Qwen3 smoke。
-
-### 6.7 两步 SFT smoke
-
-```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export NPROC_PER_NODE=8
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export TOKENIZERS_PARALLELISM=false
-unset NCCL_P2P_DISABLE NCCL_IB_DISABLE
-
-export SWIFT_BIN="$(command -v swift)"
-export MODEL_PATH=/models/Qwen3-VL-4B-Instruct
-export TRAIN_DATA="$DATASET_ROOT/ms_swift/qwen3_vl/train.jsonl"
-export VAL_DATA="$DATASET_ROOT/ms_swift/qwen3_vl/val.jsonl"
-export OUTPUT_DIR=/outputs/cogtrack/qwen3vl_4b_stage1_smoke
-export SAVE_STRATEGY=no EVAL_STRATEGY=no REPORT_TO=none
-
-bash scripts/train_qwen3vl_4b_stage1.sh \
-  --max_steps 2 --save_strategy no --eval_strategy no
-```
-
-L40 首轮不要照搬 4090 的 `NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1`；先根据
-`nvidia-smi topo -m` 和 NCCL 日志判断。smoke 必须确认模型族、冻结范围、可训练参数、
-有限 loss、显存和吞吐。
-
-### 6.8 正式 Stage-1
-
-只有 smoke 通过后才启动：
-
-```bash
-export OUTPUT_DIR=/outputs/cogtrack/qwen3vl_4b_stage1
-export SAVE_STRATEGY=steps SAVE_STEPS=250 SAVE_TOTAL_LIMIT=2
-export EVAL_STRATEGY=steps EVAL_STEPS=250 LOGGING_STEPS=5
-bash scripts/train_qwen3vl_4b_stage1.sh
-```
-
-恢复使用 `RESUME_FROM_CHECKPOINT=/path/to/checkpoint-N`。不要在 checkpoint 正在写入时
-同步。回传至少包含最终 checkpoint、`args.json`、`logging.jsonl`、trainer state、
-Git commit、数据/模型 revision 与 checksum、GPU 拓扑和 NCCL 环境。
-
-## 7. 接手后的正确工作顺序
-
-新 AI 必须先做只读确认，再执行改动：
-
-1. 阅读本文件、`README.md`、`docs/l40_setup.md`、`docs/training.md`。
-2. 运行 `git status -sb`，保护用户已有修改，不使用破坏性 reset/checkout。
-3. 确认当前 Git commit、GPU 型号/数量、数据根、模型根和输出根。
-4. 运行 `python tools/verify_cognitivebench.py`、`pytest -q` 和与任务相关的最小验证。
-5. 恢复任务时先检查现有 `logging.jsonl`、checkpoint 完整性和 GPU 残留进程，禁止
-   重复启动同一训练。
-6. 先完成两步 smoke，再开始昂贵实验；先纯 VLM，再讨论 hybrid。
-7. 结果汇报必须区分“工程链路已跑通”“零样本单 case 合理”“正式 benchmark 有提升”
-   三种不同证据等级。
-
-## 8. 下一阶段建议
-
-当前安全的推进顺序是：
-
-1. 在训练服务器生成并提交不含图片的 visual-v5 sampling plan 统计；本机不做全量数据。
-2. 构造带 provenance 的 memory manifest，并先跑两步 smoke 与小样本过拟合；禁止把
-   `feasibility_null` 数据用于正式训练。
-3. 用同一 visual-v5 probe 分别从基座和旧 Stage-2 初始化 LoRA，固定其他超参数。
-4. 在 CognitiveBench-Tiny 上同时评测基座、旧 Stage-2 兼容性对照和两个新 SFT，按
-   presence、bbox、消失/重现、长 gap、memory 和结构化错误选择方向。
-5. probe 有增益后再实现论文版五类 case 的精确配额和 rollout-history，生成正式统一
-   混合数据；Full 只切换 dataset config，不修改推理协议。
-6. 只有 SFT 与 memory reward 回放可靠后再做 GRPO；先纯 VLM，不转向 hybrid 主实验。
-
-## 9. 开发与提交约束
-
-- 根目录 `README.md` 是公开项目主页，只保留项目定位、安装、数据、模型、标准推理、
-  评测和训练入口。AI 接手提示、内部服务器路径、未整理的实验流水账和 prompt 探针
-  结论放在本文件或 `docs/`，不要重新写回公开 README。
-- Python 使用 4 空格、`snake_case` 函数/模块、`PascalCase` 类；中文注释说明研究
-  约束和易错逻辑，不为显然代码堆注释。
-- Prompt 集中在 `cogtrack/prompts/`；关键帧策略放 evaluation/observation policy，
-  不在 tracker 内重复实现。
-- 数据、模型、checkpoint、outputs、缓存和 `configs/env.local.yaml` 不进入 Git。
-- 修改 bbox、状态、NaN 填充或结果格式后，必须确认传统 TXT、逐帧 JSONL 和评测器
-  兼容。
-- 提交前至少运行 Ruff、完整测试和一个任务相关 smoke。
-- 使用明确提交信息，例如 `feat: replay fixed stage1 sampling plan`、
-  `docs: add L40 recovery guide`，不要使用含糊的 `add`。
-- 不要声称未运行的实验已经完成，不要根据两步 loss 推断正式精度提升。
+Python 使用 4 空格、函数/模块 `snake_case`、类 `PascalCase`，中文注释解释设计原因。
+提交信息使用明确祈使句，如 `feat: add state annotation verifier`、
+`docs: define trajectory-utility GRPO`。不要提交数据、权重、cache、大结果或
+`configs/env.local.yaml`。

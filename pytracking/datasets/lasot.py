@@ -71,5 +71,9 @@ class LaSOTDataset(BaseDataset):
             object_class=class_name,
             target_visible=target_visible,
             language_query=read_text(sequence_dir / "nlp.txt"),
-            metadata={"split": self.split, "bbox_format": "xywh"},
+            metadata={
+                "split": self.split,
+                "bbox_format": "xywh",
+                "language_scope": "initial_target",
+            },
         )

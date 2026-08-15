@@ -132,3 +132,45 @@ def test_visual_box_export_removes_input_bbox_object_and_keeps_current_output_bi
     assert "reference bbox" not in present["messages"][1]["content"].lower()
     assert not validate_ms_swift_record(present, image_root=tmp_path)
     assert not validate_ms_swift_record(absent, image_root=tmp_path)
+
+
+def test_vlt_v6_export_preserves_dynamic_text_and_fixed_three_images(tmp_path: Path) -> None:
+    _image(tmp_path / "images/ref.jpg", (200, 100))
+    _image(tmp_path / "images/history.jpg", (200, 100))
+    _image(tmp_path / "images/current.jpg", (400, 200))
+    row = _visual_row(status="present")
+    row["images"] = [
+        "images/ref.jpg",
+        "images/history.jpg",
+        "images/current.jpg",
+    ]
+    row["metadata"].update(
+        effective_mode="mosaic",
+        history_frame_ids=[0],
+        prompt_profile="vlt_v6",
+        initial_identity_description="a small gray vehicle",
+        current_target_state="rear view exposes two white stripes",
+        memory_loss_masked=True,
+        sft_supervision_profile="tracking_core",
+    )
+
+    record = to_qwen_grounding_record(
+        row,
+        image_root=tmp_path,
+        model_family="qwen3_vl",
+    )
+
+    assert record["messages"][0]["content"].startswith(
+        "You are a long-term vision-language single-object tracker."
+    )
+    user = record["messages"][1]["content"]
+    assert user.count("<image>") == 3
+    assert "a small gray vehicle" in user
+    assert "rear view exposes two white stripes" in user
+    assert "Initial target identity:" in user
+    assert "Current maintained target state:" in user
+    assert record["metadata"]["prompt_name"] == "cognitive_vlt_mosaic"
+    assert record["metadata"]["prompt_version"] == "6.3.0"
+    assert record["metadata"]["sft_supervision_profile"] == "tracking_core"
+    assert record["objects"]["image_id"] == [2]
+    assert not validate_ms_swift_record(record, image_root=tmp_path)

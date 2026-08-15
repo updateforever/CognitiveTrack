@@ -17,6 +17,7 @@ from cogtrack.prompts import (
     build_mosaic_prompt,
     build_pair_prompt,
     build_visual_tracking_prompt,
+    build_vlt_tracking_prompt,
 )
 from cogtrack.protocol import (
     BBOX_PROTOCOL_NORM1000,
@@ -25,13 +26,40 @@ from cogtrack.protocol import (
 )
 
 from .visual import (
+    HISTORY_LAYOUT_COMPACT_GRID_V1,
+    HISTORY_LAYOUT_RECENT_STRIP_3_V2,
     REFERENCE_MODE_BBOX_TEXT,
     REFERENCE_MODE_VISUAL_BOX,
     VISUAL_MARKER_VERSION,
+    arrange_history_items,
     build_history_mosaic,
     draw_reference_box,
     validate_reference_mode,
 )
+
+PROMPT_PROFILE_VISUAL_V5 = "visual_v5"
+PROMPT_PROFILE_VLT_V6 = "vlt_v6"
+PROMPT_PROFILES = frozenset({PROMPT_PROFILE_VISUAL_V5, PROMPT_PROFILE_VLT_V6})
+
+
+def validate_prompt_profile(value: str) -> str:
+    """规范化视觉指代 Prompt 版本，防止旧实验被静默升级。"""
+
+    normalized = str(value).strip().lower()
+    if normalized not in PROMPT_PROFILES:
+        raise ValueError(f"prompt_profile 必须是 {sorted(PROMPT_PROFILES)} 之一")
+    return normalized
+
+
+def history_layout_for_prompt_profile(value: str) -> str:
+    """返回指定 Prompt profile 的冻结历史布局版本。"""
+
+    profile = validate_prompt_profile(value)
+    return (
+        HISTORY_LAYOUT_RECENT_STRIP_3_V2
+        if profile == PROMPT_PROFILE_VLT_V6
+        else HISTORY_LAYOUT_COMPACT_GRID_V1
+    )
 
 
 @dataclass(frozen=True)
@@ -44,13 +72,14 @@ class ContextBuildResult:
     effective_mode: str
     reference_mode: str
     visual_marker_version: str | None
+    history_layout_version: str | None
 
 
 class TrackingContextBuilder:
     """从永久锚点和可信正记忆构造多图输入。
 
-    ``mosaic`` 在尚无可信历史时自动退化为 ``pair``。这不是静默改变实验：
-    ``effective_mode`` 和 Prompt 版本会写入逐帧结果，后续可以精确统计预热阶段。
+    默认情况下，``mosaic`` 在尚无可信历史时退化为 ``pair``。VLT-v6.3 可显式启用
+    ``force_history_image``，以初始化观测复制补齐三个历史 panel，保持固定三图接口。
     """
 
     def __init__(
@@ -60,6 +89,8 @@ class TrackingContextBuilder:
         mosaic_panel_height: int = 240,
         bbox_protocol: str = BBOX_PROTOCOL_NORM1000,
         reference_mode: str = REFERENCE_MODE_BBOX_TEXT,
+        prompt_profile: str = PROMPT_PROFILE_VISUAL_V5,
+        force_history_image: bool = False,
     ) -> None:
         if not isinstance(anchor, IdentityAnchor):
             raise TypeError("anchor 必须是 IdentityAnchor")
@@ -71,6 +102,15 @@ class TrackingContextBuilder:
         self.mosaic_panel_height = int(mosaic_panel_height)
         self.bbox_protocol = validate_bbox_protocol(bbox_protocol)
         self.reference_mode = validate_reference_mode(reference_mode)
+        self.prompt_profile = validate_prompt_profile(prompt_profile)
+        self.history_layout_version = history_layout_for_prompt_profile(self.prompt_profile)
+        if self.prompt_profile == PROMPT_PROFILE_VLT_V6 and self.reference_mode != REFERENCE_MODE_VISUAL_BOX:
+            raise ValueError("vlt_v6 只支持把目标框直接画入过去图像的 visual_box 模式")
+        if not isinstance(force_history_image, bool):
+            raise TypeError("force_history_image 必须是 bool")
+        if force_history_image and self.reference_mode != REFERENCE_MODE_VISUAL_BOX:
+            raise ValueError("force_history_image 只支持 visual_box 模式")
+        self.force_history_image = force_history_image
         anchor_height, anchor_width = anchor.image.shape[:2]
         self._anchor_bbox_norm1000 = pixel_xywh_to_norm1000_xyxy(
             anchor.bbox_xywh,
@@ -84,6 +124,27 @@ class TrackingContextBuilder:
             else np.ascontiguousarray(anchor.image.copy())
         )
 
+    def _visual_prompt(
+        self,
+        *,
+        history_count: int,
+        target_text: str,
+        semantic_memory: str,
+        include_memory_update: bool,
+    ) -> PromptSpec:
+        builder = (
+            build_vlt_tracking_prompt
+            if self.prompt_profile == PROMPT_PROFILE_VLT_V6
+            else build_visual_tracking_prompt
+        )
+        return builder(
+            history_count=history_count,
+            target_text=target_text,
+            semantic_memory=semantic_memory,
+            bbox_protocol=self.bbox_protocol,
+            include_memory_update=include_memory_update,
+        )
+
     def _mosaic(self, records: Sequence[MemoryRecord]) -> np.ndarray:
         panels: list[tuple[np.ndarray, Sequence[float]]] = []
         for record in records:
@@ -94,7 +155,11 @@ class TrackingContextBuilder:
 
         if not panels:
             raise ValueError("构造 mosaic 至少需要一条带图像和 bbox 的可信正记忆")
-        return build_history_mosaic(panels, panel_height=self.mosaic_panel_height)
+        return build_history_mosaic(
+            panels,
+            panel_height=self.mosaic_panel_height,
+            layout=self.history_layout_version,
+        )
 
     def build_pair(
         self,
@@ -104,11 +169,10 @@ class TrackingContextBuilder:
         include_memory_update: bool = True,
     ) -> ContextBuildResult:
         if self.reference_mode == REFERENCE_MODE_VISUAL_BOX:
-            prompt = build_visual_tracking_prompt(
+            prompt = self._visual_prompt(
                 history_count=0,
                 target_text=target_text,
                 semantic_memory=semantic_memory,
-                bbox_protocol=self.bbox_protocol,
                 include_memory_update=include_memory_update,
             )
         else:
@@ -129,6 +193,7 @@ class TrackingContextBuilder:
             visual_marker_version=(
                 VISUAL_MARKER_VERSION if self.reference_mode == REFERENCE_MODE_VISUAL_BOX else None
             ),
+            history_layout_version=None,
         )
 
     def build_mosaic(
@@ -139,26 +204,72 @@ class TrackingContextBuilder:
         semantic_memory: str = "",
         include_memory_update: bool = True,
     ) -> ContextBuildResult:
-        usable = tuple(record for record in records if record.image is not None and record.bbox_xywh is not None)
+        usable = tuple(
+            sorted(
+                (
+                    record
+                    for record in records
+                    if record.image is not None and record.bbox_xywh is not None
+                ),
+                key=lambda record: record.frame_id,
+            )
+        )
         if not usable:
+            if self.force_history_image:
+                # VLT-v6.3 的正式接口固定三图。尚无动态历史时，Image 2 以初始化
+                # 观测复制补齐三个 panel；它不是伪造预测，也不会读取 current GT。
+                padded_anchor = arrange_history_items(
+                    ((self.anchor.image, self.anchor.bbox_xywh),),
+                    layout=self.history_layout_version,
+                )
+                mosaic = build_history_mosaic(
+                    padded_anchor,
+                    panel_height=self.mosaic_panel_height,
+                    layout=self.history_layout_version,
+                )
+                prompt = self._visual_prompt(
+                    history_count=len(padded_anchor),
+                    target_text=target_text,
+                    semantic_memory=semantic_memory,
+                    include_memory_update=include_memory_update,
+                )
+                return ContextBuildResult(
+                    images=(
+                        self._anchor_image.copy(),
+                        mosaic,
+                        np.ascontiguousarray(current_image.copy()),
+                    ),
+                    prompt=prompt,
+                    reference_frames=(
+                        self.anchor.frame_id,
+                        *(self.anchor.frame_id for _ in padded_anchor),
+                    ),
+                    effective_mode="mosaic",
+                    reference_mode=self.reference_mode,
+                    visual_marker_version=VISUAL_MARKER_VERSION,
+                    history_layout_version=self.history_layout_version,
+                )
             return self.build_pair(
                 current_image,
                 target_text,
                 semantic_memory,
                 include_memory_update,
             )
-        mosaic = self._mosaic(usable)
+        arranged_usable = arrange_history_items(
+            usable,
+            layout=self.history_layout_version,
+        )
+        mosaic = self._mosaic(arranged_usable)
         if self.reference_mode == REFERENCE_MODE_VISUAL_BOX:
-            prompt = build_visual_tracking_prompt(
-                history_count=len(usable),
+            prompt = self._visual_prompt(
+                history_count=len(arranged_usable),
                 target_text=target_text,
                 semantic_memory=semantic_memory,
-                bbox_protocol=self.bbox_protocol,
                 include_memory_update=include_memory_update,
             )
         else:
             prompt = build_mosaic_prompt(
-                history_count=len(usable),
+                history_count=len(arranged_usable),
                 target_text=target_text,
                 semantic_memory=semantic_memory,
                 reference_bbox_norm1000_xyxy=self._anchor_bbox_norm1000,
@@ -168,10 +279,14 @@ class TrackingContextBuilder:
         return ContextBuildResult(
             images=(self._anchor_image.copy(), mosaic, np.ascontiguousarray(current_image.copy())),
             prompt=prompt,
-            reference_frames=(self.anchor.frame_id, *(record.frame_id for record in usable)),
+            reference_frames=(
+                self.anchor.frame_id,
+                *(record.frame_id for record in arranged_usable),
+            ),
             effective_mode="mosaic",
             reference_mode=self.reference_mode,
             visual_marker_version=(
                 VISUAL_MARKER_VERSION if self.reference_mode == REFERENCE_MODE_VISUAL_BOX else None
             ),
+            history_layout_version=self.history_layout_version,
         )

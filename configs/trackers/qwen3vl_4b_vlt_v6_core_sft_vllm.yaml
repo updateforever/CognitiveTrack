@@ -1,0 +1,31 @@
+# 只学习 target_status+bbox 的 VLT-v6.3 adapter。模型尚未学习记忆值，因此关闭语义写入；
+# 视觉历史仍按同一门控策略维护，推理输入/输出协议与未来完整模型保持一致。
+tracker_name: cognitive_vlm
+experiment_name: qwen3vl_4b_vlt_v6_core_sft
+context_mode: mosaic
+reference_mode: visual_box
+prompt_profile: vlt_v6
+force_history_image: true
+use_init_language: true
+mosaic_panel_height: 240
+bbox_protocol: norm1000
+
+observation_policy:
+  type: keyframe
+
+memory:
+  enabled: true
+  model_output_enabled: true
+  semantic_enabled: false
+  max_positive_records: 3
+  max_semantic_records: 4
+  confirmations: 2
+  max_confirmation_gap: 30
+  min_positive_frame_gap: 5
+  min_semantic_frame_gap: 30
+  semantic_confirmations: 2
+  max_semantic_confirmation_gap: 300
+  min_semantic_text_similarity: 0.35
+
+model_config: ../models/qwen3vl_4b_vllm_vlt_v6_core.yaml
+save_raw_response: true

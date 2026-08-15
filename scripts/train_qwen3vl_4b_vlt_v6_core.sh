@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Qwen3-VL-4B VLT-v6 核心跟踪 SFT：监督存在性与 bbox，屏蔽 memory_update 值。
+# 必填：MODEL_PATH、TRAIN_DATA、VAL_DATA、DATASET_ROOT。
+
+set -euo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+export TUNER_TYPE=${TUNER_TYPE:-lora}
+export SFT_SUPERVISION_PROFILE=tracking_core
+export FREEZE_VIT=${FREEZE_VIT:-true}
+export TORCH_DTYPE=${TORCH_DTYPE:-bfloat16}
+export ATTN_IMPL=${ATTN_IMPL:-flash_attn}
+export MAX_LENGTH=${MAX_LENGTH:-4096}
+export MAX_PIXELS=${MAX_PIXELS:-200704}
+export EPOCHS=${EPOCHS:-1}
+export BATCH_SIZE=${BATCH_SIZE:-1}
+export EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-1}
+export GRAD_ACC_STEPS=${GRAD_ACC_STEPS:-8}
+export LEARNING_RATE=${LEARNING_RATE:-5e-5}
+export WARMUP_RATIO=${WARMUP_RATIO:-0.05}
+export GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-true}
+export LOGGING_STEPS=${LOGGING_STEPS:-5}
+export SAVE_STRATEGY=${SAVE_STRATEGY:-epoch}
+export EVAL_STRATEGY=${EVAL_STRATEGY:-epoch}
+export SAVE_TOTAL_LIMIT=${SAVE_TOTAL_LIMIT:-1}
+export DATASET_NUM_PROC=${DATASET_NUM_PROC:-4}
+export DATALOADER_WORKERS=${DATALOADER_WORKERS:-2}
+export REPORT_TO=${REPORT_TO:-none}
+export QWEN_MODEL_FAMILY=${QWEN_MODEL_FAMILY:-qwen3_vl}
+
+exec bash "$SCRIPT_DIR/train_sft.sh" "$@"

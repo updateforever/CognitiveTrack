@@ -1,26 +1,33 @@
-# CognitiveTrack 讨论交接摘要（2026-08-13）
+# CognitiveTrack 讨论交接摘要（2026-08-13，归档）
 
 本文供研究讨论和其他 AI 快速接手。完整恢复约束见根目录 `AGENTS.md`，统一数据设计
-见 `docs/stage2_stage3_data.md`，本机/训练服务器分工见 `docs/visual_v5_iteration.md`。
-本页严格区分“旧实验”“visual-v5 工程可行性”和“尚未完成的正式训练/评测”。
+见 `docs/vlt_v6_core_sft.md`，历史混合训练设计见 `docs/stage2_stage3_data.md`。
+本页严格区分“旧实验”“协议工程可行性”和“尚未完成的正式训练/评测”。
 
 ## 1. 最新研究决策
 
-下一版不再把 tracking、temporal context、memory 拆成三次 SFT，而是构造一份统一混合
-数据，只训练一次三字段 Qwen3-VL-4B LoRA：
+当前先训练一次 VLT-v6 core LoRA，只监督目标存在性和 bbox；不要求 GRPO，也不为记忆
+伪造标签。三字段输出保持不变，但 `memory_update` 的值在首轮 SFT 中被 loss mask：
 
 ```json
 {"target_status":"present","bbox_norm1000_xyxy":[100,120,400,520],"memory_update":null}
 ```
 
-输入范式改为视觉指代：
+输入范式改为视觉语言跟踪：
 
+- 加入初始化目标文本；
 - 完整首帧身份锚点直接画目标框；
 - 过去可信历史帧或 mosaic 的每个 panel 直接画对应历史框；
+- 固定三图，最早无动态历史时用初始化观测构造单 panel Image 2；
 - 最近可信 VLM 观测必须进入历史，稀疏推理时不等于字面上一帧；
+- 只输入最近一条已接受目标状态记忆；
 - 当前完整搜索图绝不画框；
 - Prompt 不再提供 reference bbox 坐标文本；
 - 输出 bbox 仍是 Qwen3 官方 norm1000 xyxy，绑定最后一张当前图。
+
+LaSOT/TNL2K 的初始化目标描述可用；MGIT 当前 story 可能描述未来事件，在线输入会自动
+禁用并退回类别或首帧红框指代。core SFT 尚未学习记忆生成，评测时关闭 semantic memory
+写入；后续有可靠记忆事件标签后再做完整 memory SFT，GRPO 仅作为可选增强。
 
 永久首帧锚点与动态最近历史同时保留。只用首帧难以覆盖长时外观变化，只滚动上一
 预测又容易漂移自强化。
@@ -31,12 +38,16 @@
 
 - 本文随代码维护；恢复时以 `git rev-parse HEAD` 为准，不再引用讨论开始时的旧 HEAD；
 - CognitiveBench v1 冻结标注已纳入 Git：995 序列、1,408,438 帧、343,616 关键帧；
-- 最近一次代码验证：Ruff 通过、143 tests passed、CognitiveBench 冻结标注校验通过、
+- 最近一次代码验证：Ruff 通过、153 tests passed、CognitiveBench 冻结标注校验通过、
   `git diff --check` 通过。
 - visual-v5 的共享绘框、统一 Prompt、在线 context、三字段 canonical/ms-swift 导出、
   tracker 配置与跨帧 semantic gate 已实现；旧 `bbox_text` 路径显式保留用于复现。
 - 本机 TNL2K 小数据已完成真实图片生成和 Qwen3 processor 回放；Qwen3-VL-4B 基座已在
   CognitiveBench-Tiny 单 case 上完成真实推理、严格解析和坐标转换。
+- VLT-v6 已实现固定三图上下文、初始化文本安全路由、最近状态记忆、`masked_null`
+  数据档位、ms-swift 字段级 loss 插件、训练前审计和独立训练/评测配置。真实 Qwen3
+  processor 训练模板回放确认：bbox 展开坐标 token 保持监督，被 mask 的恰好只有
+  `memory_update` 的 `null` token。
 
 旧范式训练：
 
@@ -97,19 +108,17 @@ Base、Stage-1 与 Stage-2 已在冻结的 CognitiveBench-Tiny v1 上使用相�
 ## 4. 下一步执行边界
 
 1. 本机保持轻量：维护代码、生成 1–2 条序列、做像素审计/processor 回放/真实模型 smoke。
-2. 训练服务器先运行 `synthesize_visual_v5_dataset.py --plan-only`，冻结 7:3 同序列
-   present/absent sampling plan；新 plan 强制 `fixed_identity_anchor` 且 current 不重复。
-3. 对 plan 中 current frame 构造带 provenance 的 memory label manifest；不得机械地把
-   所有普通 bbox 样本补成 `null` 后声称已完成 memory 监督。
-4. 训练服务器重放 plan，生成 visual-v5 probe，先做两步 smoke 和小样本过拟合，再跑
-   一轮 LoRA。
-5. 对同一 probe 比较从基座初始化与从旧 Stage-2 初始化，随后在 CognitiveBench-Tiny
-   使用固定 visual-v5 推理配置聚合评测。
-6. probe 有明确增益后，再实现论文版 case-bucket planner、rollout history 与正式大包；
-   最终才运行 Full 和 GRPO。
+2. 训练服务器先运行 `synthesize_vlt_v6_dataset.py --plan-only`，冻结 7:3 同序列
+   present/absent sampling plan；新 plan 强制 `fixed_identity_anchor`。
+3. 重放 plan 生成 core 数据，执行 `validate_sft_supervision.py`、真实 processor mask 回放、
+   两步 smoke 和小样本过拟合，再跑一轮基座初始化 LoRA。
+4. 在 CognitiveBench-Tiny 使用固定 VLT-v6 推理协议比较 Base/core SFT；不启用未训练的
+   semantic memory 写入。
+5. core 有增益后，再构造带 provenance 的 memory event manifest、rollout history 与正式
+   分桶数据；最终才运行 Full 和可选 GRPO。
 
 完整命令、标签格式与验收边界见
-[`visual_v5_iteration.md`](visual_v5_iteration.md)。
+[当前 VLT-v6 core SFT](../vlt_v6_core_sft.md)。
 
 ## 5. 已冻结与仍待实验决定
 

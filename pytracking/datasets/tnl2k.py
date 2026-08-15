@@ -78,5 +78,9 @@ class TNL2KDataset(BaseDataset):
             ground_truth_rect=ground_truth,
             target_visible=target_visible,
             language_query=read_text(sequence_dir / "language.txt"),
-            metadata={"split": self.split, "bbox_format": "xywh"},
+            metadata={
+                "split": self.split,
+                "bbox_format": "xywh",
+                "language_scope": "initial_target",
+            },
         )

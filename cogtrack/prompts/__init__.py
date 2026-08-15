@@ -21,6 +21,12 @@ from .visual_tracking import (
     VISUAL_TRACKING_PROMPT_VERSION,
     build_visual_tracking_prompt,
 )
+from .vlt_tracking import (
+    VLT_MOSAIC_PROMPT_NAME,
+    VLT_PAIR_PROMPT_NAME,
+    VLT_TRACKING_PROMPT_VERSION,
+    build_vlt_tracking_prompt,
+)
 
 __all__ = [
     "CANDIDATE_IDENTITY_PROMPT_NAME",
@@ -35,9 +41,13 @@ __all__ = [
     "VISUAL_MOSAIC_PROMPT_NAME",
     "VISUAL_PAIR_PROMPT_NAME",
     "VISUAL_TRACKING_PROMPT_VERSION",
+    "VLT_MOSAIC_PROMPT_NAME",
+    "VLT_PAIR_PROMPT_NAME",
+    "VLT_TRACKING_PROMPT_VERSION",
     "build_candidate_identity_prompt",
     "build_identity_prompt",
     "build_mosaic_prompt",
     "build_pair_prompt",
     "build_visual_tracking_prompt",
+    "build_vlt_tracking_prompt",
 ]

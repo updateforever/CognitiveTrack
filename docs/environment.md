@@ -1,7 +1,7 @@
 # 独立环境指引
 
 面向 L40 训练服务器的完整自动部署、数据重建、NCCL 和训练验收流程见
-[L40 训练服务器部署与 Stage-1 复现](l40_setup.md)。该文档与
+[训练服务器恢复与当前主线执行](l40_setup.md)。该文档与
 `scripts/setup_env.sh` 是当前推荐入口；下面的 `environment.yml` 只提供通用最小
 环境，不承担 CUDA/flash-attn 的精确 ABI 复现。
 

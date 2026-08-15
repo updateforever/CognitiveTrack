@@ -18,6 +18,7 @@ OUTPUT_DIR=${OUTPUT_DIR:-"$PROJECT_ROOT/outputs/sft_qwen_vl"}
 VAL_DATA=${VAL_DATA:-}
 DATASET_ROOT=${DATASET_ROOT:-}
 TUNER_TYPE=${TUNER_TYPE:-lora}
+SFT_SUPERVISION_PROFILE=${SFT_SUPERVISION_PROFILE:-full}
 if [[ "$TUNER_TYPE" == "full" ]]; then
     DEFAULT_EPOCHS=1
     DEFAULT_LEARNING_RATE=1e-5
@@ -47,6 +48,22 @@ if [[ -n "$DATASET_ROOT" ]]; then
     (cd "$DATASET_ROOT" && "${FAMILY_CHECK[@]}")
 else
     "${FAMILY_CHECK[@]}"
+fi
+
+# 字段级 loss mask 必须与数据 metadata 成对启用。这样不会因为忘记传
+# --loss_scale 而把占位的 memory_update=null 错当作“永不更新记忆”监督。
+SUPERVISION_CHECK=(
+    python "$PROJECT_ROOT/tracking/validate_sft_supervision.py"
+    --profile "$SFT_SUPERVISION_PROFILE"
+    --dataset "$TRAIN_DATA"
+)
+if [[ -n "$VAL_DATA" ]]; then
+    SUPERVISION_CHECK+=(--dataset "$VAL_DATA")
+fi
+if [[ -n "$DATASET_ROOT" ]]; then
+    (cd "$DATASET_ROOT" && "${SUPERVISION_CHECK[@]}")
+else
+    "${SUPERVISION_CHECK[@]}"
 fi
 
 # 优先使用当前环境中的 swift；否则回退到项目开发时验证过的 Conda 环境。
@@ -88,6 +105,18 @@ ARGS=(
     --dataloader_num_workers "${DATALOADER_WORKERS:-4}"
     --report_to "${REPORT_TO:-none}"
 )
+
+if [[ "$SFT_SUPERVISION_PROFILE" == "tracking_core" ]]; then
+    ARGS+=(
+        --external_plugins "$PROJECT_ROOT/cogtrack/training/ms_swift_plugin.py"
+        --loss_scale cogtrack_tracking_core
+    )
+elif [[ "$SFT_SUPERVISION_PROFILE" == "full" ]]; then
+    ARGS+=(--loss_scale default)
+else
+    echo "错误：SFT_SUPERVISION_PROFILE 只支持 full 或 tracking_core。" >&2
+    exit 1
+fi
 
 if [[ "$TUNER_TYPE" == "lora" ]]; then
     ARGS+=(

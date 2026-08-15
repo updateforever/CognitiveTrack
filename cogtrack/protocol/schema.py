@@ -88,8 +88,8 @@ class ExecutionInfo:
 class Prediction:
     """模型/跟踪器的结构化认知预测，框始终为像素 ``xywh``。
 
-    v4 的 VLM 主决策仍是 ``target_status + bbox``，第三字段
-    ``memory_update`` 只是可空的语义记忆提议。``identity_match`` 和
+    VLT-v6.3 的 VLM 主决策仍是 ``target_status + bbox``，第三字段
+    ``memory_update`` 是可空的目标状态替换提议。``identity_match`` 和
     ``localizability`` 是由二分类状态确定性派生的内部兼容字段，不是模型输出，
     也不参与 SFT/GRPO 监督。
     """

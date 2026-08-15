@@ -1,5 +1,12 @@
 """CognitiveTrack 的 ms-swift 数据与训练辅助接口。"""
 
+from .loss_mask import (
+    SFT_SUPERVISION_FULL,
+    SFT_SUPERVISION_PROFILES,
+    SFT_SUPERVISION_TRACKING_CORE,
+    split_tracking_core_response,
+    validate_sft_supervision_profile,
+)
 from .model_family import (
     detect_qwen_model_family,
     detect_training_view_family,
@@ -40,6 +47,7 @@ from .tracking_samples import (
     MEMORY_SUPERVISION_DISABLED,
     MEMORY_SUPERVISION_EXPLICIT,
     MEMORY_SUPERVISION_FEASIBILITY_NULL,
+    MEMORY_SUPERVISION_MASKED_NULL,
     MEMORY_SUPERVISION_MODES,
     SOURCE_SCHEMA_VERSION,
     MemoryUpdateLabel,
@@ -56,6 +64,7 @@ __all__ = [
     "MEMORY_SUPERVISION_DISABLED",
     "MEMORY_SUPERVISION_EXPLICIT",
     "MEMORY_SUPERVISION_FEASIBILITY_NULL",
+    "MEMORY_SUPERVISION_MASKED_NULL",
     "MEMORY_SUPERVISION_MODES",
     "MemoryUpdateLabel",
     "TrackingSampleBuildReport",
@@ -90,4 +99,9 @@ __all__ = [
     "detect_qwen_model_family",
     "detect_training_view_family",
     "validate_model_dataset_family",
+    "SFT_SUPERVISION_FULL",
+    "SFT_SUPERVISION_PROFILES",
+    "SFT_SUPERVISION_TRACKING_CORE",
+    "split_tracking_core_response",
+    "validate_sft_supervision_profile",
 ]
