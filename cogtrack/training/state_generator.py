@@ -6,10 +6,8 @@
 from __future__ import annotations
 
 import base64
-import json
 from io import BytesIO
 from pathlib import Path
-from typing import Any
 
 import requests
 from PIL import Image

@@ -41,6 +41,33 @@ PROMPT_PROFILE_VISUAL_V5 = "visual_v5"
 PROMPT_PROFILE_VLT_V6 = "vlt_v6"
 PROMPT_PROFILES = frozenset({PROMPT_PROFILE_VISUAL_V5, PROMPT_PROFILE_VLT_V6})
 
+# 可以安全用作初始化文本的 ``language_scope``。判据是该文本必须只描述初始化时刻
+# 可见的目标，不能包含后续或整段视频的剧情。
+#
+# - ``initial_target``：LaSOT/TNL2K 的初始目标描述；
+# - ``first_action_description``：MGIT 官方 action 层的第一段描述。其
+#   ``start_frame`` 经全量核对为 0（91/91 序列），因此不泄漏未来信息。
+#
+# 训练导出与在线 tracker 必须共用本集合；两处若各自维护会导致同一序列在训练和
+# 推理时得到不同的初始文本。
+SAFE_INIT_LANGUAGE_SCOPES = frozenset({"initial_target", "first_action_description"})
+
+
+def is_unsafe_init_language_scope(scope: str, *, dataset: str = "") -> bool:
+    """判断某个 ``language_scope`` 能否作为在线可得的初始化文本。
+
+    未声明 scope 的数据集保持既有保守行为：只有 MGIT 会因为可能存在整段
+    ``story`` 描述而被拒绝，其余数据集沿用其 loader 提供的初始描述。
+    """
+
+    normalized = str(scope).strip().lower()
+    if normalized in SAFE_INIT_LANGUAGE_SCOPES:
+        return False
+    if normalized == "full_video_story":
+        return True
+    # MGIT 的描述文件同时含 action/activity/story 三层，scope 缺失时无法确认边界。
+    return str(dataset).strip().lower() == "mgit"
+
 
 def validate_prompt_profile(value: str) -> str:
     """规范化视觉指代 Prompt 版本，防止旧实验被静默升级。"""
@@ -78,7 +105,7 @@ class ContextBuildResult:
 class TrackingContextBuilder:
     """从永久锚点和可信正记忆构造多图输入。
 
-    默认情况下，``mosaic`` 在尚无可信历史时退化为 ``pair``。VLT-v6.3 可显式启用
+    默认情况下，``mosaic`` 在尚无可信历史时退化为 ``pair``。VLT-v6.4 可显式启用
     ``force_history_image``，以初始化观测复制补齐三个历史 panel，保持固定三图接口。
     """
 
@@ -204,6 +231,8 @@ class TrackingContextBuilder:
         semantic_memory: str = "",
         include_memory_update: bool = True,
     ) -> ContextBuildResult:
+        # records 已由 MemoryBank.select_positive 选过一次，这里再次过滤图像/bbox
+        # 完整性并按 frame_id 排序，防止坏记录或调用方乱序破坏时间方向。
         usable = tuple(
             sorted(
                 (
@@ -216,7 +245,7 @@ class TrackingContextBuilder:
         )
         if not usable:
             if self.force_history_image:
-                # VLT-v6.3 的正式接口固定三图。尚无动态历史时，Image 2 以初始化
+                # VLT-v6.4 的正式接口固定三图。尚无动态历史时，Image 2 以初始化
                 # 观测复制补齐三个 panel；它不是伪造预测，也不会读取 current GT。
                 padded_anchor = arrange_history_items(
                     ((self.anchor.image, self.anchor.bbox_xywh),),
@@ -276,6 +305,9 @@ class TrackingContextBuilder:
                 bbox_protocol=self.bbox_protocol,
                 include_memory_update=include_memory_update,
             )
+        # Prompt-6.4 图像槽位在这里冻结：Image 1=永久红框锚点，Image 2=按时间
+        # 从左到右的三条可信观测，Image 3=当前无框搜索帧。reference_frames 仅记录
+        # Image 1/2 的来源帧用于审计，整个元组都不包含当前帧或未来帧。
         return ContextBuildResult(
             images=(self._anchor_image.copy(), mosaic, np.ascontiguousarray(current_image.copy())),
             prompt=prompt,

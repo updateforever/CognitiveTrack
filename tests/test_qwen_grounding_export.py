@@ -20,6 +20,7 @@ def _row(*, status: str = "present") -> dict:
     return {
         "id": "unit::seq::1::pair::pair",
         "images": ["images/ref.jpg", "images/current.jpg"],
+        # canonical 行级审计列保留显式坐标系名，与模型可见的 bbox_2d/status 刻意不同名。
         "target_status": status,
         "bbox_norm1000_xyxy": bbox,
         "metadata": {
@@ -55,10 +56,10 @@ def test_qwen_families_use_different_official_coordinate_protocols(tmp_path: Pat
     assert "processor-resized pixel grid" in qwen25_user
     assert "normalized 0-to-1000" in qwen3_user
     assert qwen25["messages"][2]["content"] == (
-        '{"target_status":"present","bbox_pixel_xyxy":<bbox>}'
+        '{"bbox_pixel_xyxy":<bbox>,"status":"present"}'
     )
     assert qwen3["messages"][2]["content"] == (
-        '{"target_status":"present","bbox_norm1000_xyxy":<bbox>}'
+        '{"bbox_2d":<bbox>,"status":"present"}'
     )
     assert not validate_ms_swift_record(qwen25, image_root=tmp_path)
     assert not validate_ms_swift_record(qwen3, image_root=tmp_path)
@@ -74,18 +75,18 @@ def test_absent_record_has_only_reference_bbox_placeholder(tmp_path: Path) -> No
     assert record["objects"]["image_id"] == [0]
     assert len(record["objects"]["bbox"]) == 1
     assistant = record["messages"][2]["content"]
-    assert assistant == '{"target_status":"absent","bbox_pixel_xyxy":null}'
+    assert assistant == '{"bbox_pixel_xyxy":null,"status":"absent"}'
     assert sum(message["content"].count("<bbox>") for message in record["messages"]) == 1
     assert not validate_ms_swift_record(record, image_root=tmp_path)
 
 
 def test_materialized_assistant_remains_strict_json() -> None:
     payload = answer_with_materialized_bbox(
-        '{"target_status":"present","bbox_pixel_xyxy":<bbox>}',
+        '{"bbox_pixel_xyxy":<bbox>,"status":"present"}',
         [10, 20, 30, 40],
     )
     assert payload == {
-        "target_status": "present",
+        "status": "present",
         "bbox_pixel_xyxy": [10, 20, 30, 40],
     }
     assert json.loads(json.dumps(payload)) == payload
@@ -96,8 +97,8 @@ def _visual_row(*, status: str) -> dict:
     row["metadata"]["reference_mode"] = "visual_box"
     row["metadata"]["visual_marker_version"] = "red_box_v1"
     row["assistant"] = {
-        "target_status": status,
-        "bbox_norm1000_xyxy": row["bbox_norm1000_xyxy"],
+        "status": status,
+        "bbox_2d": row["bbox_norm1000_xyxy"],
         "memory_update": None,
     }
     return row
@@ -123,10 +124,10 @@ def test_visual_box_export_removes_input_bbox_object_and_keeps_current_output_bi
     }
     assert "objects" not in absent
     assert present["messages"][2]["content"] == (
-        '{"target_status":"present","bbox_norm1000_xyxy":<bbox>,"memory_update":null}'
+        '{"bbox_2d":<bbox>,"status":"present","memory_update":null}'
     )
     assert absent["messages"][2]["content"] == (
-        '{"target_status":"absent","bbox_norm1000_xyxy":null,"memory_update":null}'
+        '{"bbox_2d":null,"status":"absent","memory_update":null}'
     )
     assert present["messages"][1]["content"].count("<bbox>") == 0
     assert "reference bbox" not in present["messages"][1]["content"].lower()
@@ -151,7 +152,7 @@ def test_vlt_v6_export_preserves_dynamic_text_and_fixed_three_images(tmp_path: P
         initial_identity_description="a small gray vehicle",
         current_target_state="rear view exposes two white stripes",
         memory_loss_masked=True,
-        sft_supervision_profile="tracking_core",
+        sft_supervision_profile="tracking_sft",
     )
 
     record = to_qwen_grounding_record(
@@ -170,7 +171,35 @@ def test_vlt_v6_export_preserves_dynamic_text_and_fixed_three_images(tmp_path: P
     assert "Initial target identity:" in user
     assert "Current maintained target state:" in user
     assert record["metadata"]["prompt_name"] == "cognitive_vlt_mosaic"
-    assert record["metadata"]["prompt_version"] == "6.3.0"
-    assert record["metadata"]["sft_supervision_profile"] == "tracking_core"
+    assert record["metadata"]["prompt_version"] == "6.4.0"
+    assert record["metadata"]["sft_supervision_profile"] == "tracking_sft"
     assert record["objects"]["image_id"] == [2]
     assert not validate_ms_swift_record(record, image_root=tmp_path)
+
+
+def test_export_carries_verified_null_claim_into_loss_scale(tmp_path: Path) -> None:
+    """源层的 memory_verified_null 必须驱动训练视图的 loss_scale。
+
+    ms-swift 会丢弃 row 顶层 metadata，真正决定 loss 的只有
+    ``messages[assistant].loss_scale``。present + 已证明不更新 必须写 1.0，否则
+    审计声明"这个 null 参与 loss"而训练实际把它 mask 掉，且日志里看不出来。
+    """
+    _image(tmp_path / "images/ref.jpg", (200, 100))
+    _image(tmp_path / "images/current.jpg", (400, 200))
+
+    claimed = _visual_row(status="present")
+    claimed["metadata"]["memory_verified_null"] = True
+    record = to_qwen_grounding_record(claimed, image_root=tmp_path, model_family="qwen3_vl")
+
+    assert record["metadata"]["memory_supervision_state"] == "verified_hard_null"
+    assert record["metadata"]["memory_loss_masked"] is False
+    assert record["messages"][2]["loss_scale"] == 1.0
+    assert record["messages"][2]["content"].endswith('"memory_update":null}')
+    assert not validate_ms_swift_record(record, image_root=tmp_path)
+
+    # 未声明的同一行必须保持 masked：不写 loss_scale，交给插件 mask memory 值。
+    plain = to_qwen_grounding_record(
+        _visual_row(status="present"), image_root=tmp_path, model_family="qwen3_vl"
+    )
+    assert plain["metadata"]["memory_supervision_state"] == "masked_unknown"
+    assert "loss_scale" not in plain["messages"][2]

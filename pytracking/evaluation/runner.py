@@ -159,6 +159,9 @@ class SequenceRunner:
                     # 与常规 pytracking 一致，time 只统计 tracker 推理，不含磁盘读图。
                     started_at = time.perf_counter()
                     execution_stage = "tracker_initialize" if frame_id == 0 else "tracker_track"
+                    # 只有 frame 0 的 init_info 可以包含 init_bbox。后续 frame_info
+                    # 只提供在线可得的帧信息；当前/未来 GT 必须留在 runner 外层，
+                    # 这是排查数据泄漏时最重要的断点之一。
                     info = sequence.init_info() if frame_id == 0 else sequence.frame_info(frame_id)
                     info.update(
                         {
@@ -169,6 +172,9 @@ class SequenceRunner:
                             "previous_output": previous_output,
                         }
                     )
+                    # initialize 建立永久身份锚点；track 只能消费当前图像、已有状态和
+                    # 历史预测。调试 tracker 输入时应在此处检查 info，而不是检查随后
+                    # 为评测生成、必然包含 GT 的 FrameRunRecord。
                     output = tracker.initialize(image, info) if frame_id == 0 else tracker.track(image, info)
                     elapsed = time.perf_counter() - started_at
                     raw_output = _normalize_output(output)
@@ -190,6 +196,9 @@ class SequenceRunner:
                         "error_stage": execution_stage,
                     }
 
+                # GT 在 tracker 返回后才附加，唯一用途是落盘后离线评测。若在
+                # tracker.track() 的调用栈内看到 ground_truth_rect/target_visible，
+                # 就说明在线边界被破坏。
                 record = FrameRunRecord(
                     sequence=sequence.name,
                     dataset=sequence.dataset,

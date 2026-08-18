@@ -4,9 +4,11 @@ from .builder import (
     PROMPT_PROFILE_VISUAL_V5,
     PROMPT_PROFILE_VLT_V6,
     PROMPT_PROFILES,
+    SAFE_INIT_LANGUAGE_SCOPES,
     ContextBuildResult,
     TrackingContextBuilder,
     history_layout_for_prompt_profile,
+    is_unsafe_init_language_scope,
     validate_prompt_profile,
 )
 from .visual import (
@@ -40,6 +42,8 @@ __all__ = [
     "PROMPT_PROFILES",
     "PROMPT_PROFILE_VISUAL_V5",
     "PROMPT_PROFILE_VLT_V6",
+    "SAFE_INIT_LANGUAGE_SCOPES",
+    "is_unsafe_init_language_scope",
     "REFERENCE_MODE_BBOX_TEXT",
     "REFERENCE_MODE_VISUAL_BOX",
     "REFERENCE_MODES",

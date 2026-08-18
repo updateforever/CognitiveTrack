@@ -1,0 +1,89 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "CognitiveTrack: Base Qwen3-VL-4B 单序列 6 帧",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/.conda/envs/cogtrack-l40/bin/python",
+      "program": "${workspaceFolder}/tracking/test.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "subProcess": false,
+      "args": [
+        "--config",
+        "${workspaceFolder}/configs/env.local.yaml",
+        "--tracker-config",
+        "${workspaceFolder}/configs/trackers/qwen3vl_4b_vlt_v6_base.yaml",
+        "--dataset-config",
+        "${workspaceFolder}/configs/datasets/cognitivebench_tiny.yaml",
+        "--sequence",
+        "cat-3",
+        "--debug-frames",
+        "6",
+        "--observation",
+        "dense",
+        "--results-dir",
+        "${workspaceFolder}/outputs/debug/vscode_qwen3vl4b_base",
+        "--force"
+      ],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "COGTRACK_MODEL_ROOT": "/dev/shm",
+        "CUDA_VISIBLE_DEVICES": "0",
+        "TOKENIZERS_PARALLELISM": "false"
+      },
+      "presentation": {
+        "group": "CognitiveTrack",
+        "order": 1
+      }
+    },
+    {
+      "name": "CognitiveTrack: 训练后全参 SFT 单序列 6 帧",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/.conda/envs/cogtrack-l40/bin/python",
+      "program": "${workspaceFolder}/tracking/test.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "subProcess": false,
+      "args": [
+        "--config",
+        "${workspaceFolder}/configs/env.local.yaml",
+        "--tracker-config",
+        "${workspaceFolder}/configs/trackers/qwen3vl_4b_vlt_v640_sft.yaml",
+        "--dataset-config",
+        "${workspaceFolder}/configs/datasets/cognitivebench_tiny.yaml",
+        "--sequence",
+        "cat-3",
+        "--debug-frames",
+        "6",
+        "--observation",
+        "dense",
+        "--results-dir",
+        "${workspaceFolder}/outputs/debug/vscode_qwen3vl4b_v640_sft",
+        "--force"
+      ],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "COGTRACK_QWEN3_4B_SFT_MODEL": "${input:sftCheckpoint}",
+        "CUDA_VISIBLE_DEVICES": "0",
+        "TOKENIZERS_PARALLELISM": "false"
+      },
+      "presentation": {
+        "group": "CognitiveTrack",
+        "order": 2
+      }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "sftCheckpoint",
+      "type": "promptString",
+      "description": "请输入训练完成后的 Qwen3-VL-4B 全参 checkpoint 绝对路径",
+      "default": "${workspaceFolder}/outputs/sft/qwen3vl4b_full_v640_mixed_2xh100_bs16_v2"
+    }
+  ]
+}

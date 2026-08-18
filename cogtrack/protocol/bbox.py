@@ -31,12 +31,27 @@ BBOX_PROTOCOL_QWEN_ABS_PIXEL = "qwen_abs_pixel"
 
 BBOX_PROTOCOLS = (BBOX_PROTOCOL_NORM1000, BBOX_PROTOCOL_QWEN_ABS_PIXEL)
 
-#: 各协议在模型 JSON 里使用的字段名。字段名必须随协议改变，否则模型和读代码
-#: 的人都会被 ``norm1000`` 这个名字误导成需要归一化。
+#: 各协议在模型 JSON 里使用的字段名。
+#:
+#: ``norm1000`` 使用 Qwen-VL 家族官方 grounding 约定 ``bbox_2d``（JSON + [0,1000]
+#: 相对坐标，不使用 grounding 专用 special token）。Qwen2.5-VL 的绝对像素协议保留
+#: ``bbox_pixel_xyxy``，因为它与官方 norm1000 语义不同，必须在名字上区分。
+#:
+#: 注意：字段名本身不再编码归一化区间，因此不能再靠它防止 Qwen2.5/Qwen3 数据视图
+#: 交叉加载。该保护由 metadata 的 ``bbox_protocol`` / ``canonical_bbox_format`` 与
+#: 训练 preflight 承担。
 _BBOX_PROTOCOL_JSON_KEYS = {
-    BBOX_PROTOCOL_NORM1000: "bbox_norm1000_xyxy",
+    BBOX_PROTOCOL_NORM1000: "bbox_2d",
     BBOX_PROTOCOL_QWEN_ABS_PIXEL: "bbox_pixel_xyxy",
 }
+
+#: 模型输出中表示目标存在性的字段名。与 bbox 字段一同构成三字段输出协议：
+#: ``{"bbox_2d": ..., "status": ..., "memory_update": ...}``。
+TARGET_STATUS_JSON_KEY = "status"
+
+#: 语义记忆更新字段名。必须始终是 JSON 对象的最后一个字段，字段级 loss mask
+#: 依赖这一位置切分（见 ``cogtrack/training/loss_mask.py``）。
+MEMORY_UPDATE_JSON_KEY = "memory_update"
 
 
 def validate_bbox_protocol(protocol: str) -> str:
@@ -118,7 +133,7 @@ def validate_norm1000_xyxy(bbox: Sequence[float]) -> BBoxXYXY:
 
     normalized = validate_xyxy(bbox)
     if any(value < 0.0 or value > 1000.0 for value in normalized):
-        raise BoundingBoxError("bbox_norm1000_xyxy 的每个坐标都必须位于 [0, 1000]")
+        raise BoundingBoxError("norm1000 bbox 的每个坐标都必须位于 [0, 1000]")
     return normalized
 
 

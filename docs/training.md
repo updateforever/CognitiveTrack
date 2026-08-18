@@ -1,129 +1,124 @@
-# ms-swift 分阶段训练指引
+# Qwen3-VL-4B 全参 SFT 训练说明
 
-## 1. 当前训练顺序
+> 更新日期：2026-08-18。当前目标是冻结 ViT，全参训练 LLM 与视觉 merger/aligner，
+> 在一次训练中混合大规模跟踪监督与小规模状态更新监督。
 
-CognitiveTrack 不再按旧 pair/mosaic 的模型能力名称切换推理模式。所有当前 checkpoint
-共享 VLT-v6.3 三图输入和三字段输出，只改变哪些字段已有可靠监督：
+## 1. 两种逐样本监督
 
-| 阶段 | 初始化 | 监督 | 推理时 memory |
-| --- | --- | --- | --- |
-| Base | Qwen3-VL-4B-Instruct | 无 | 关闭写入 |
-| Core SFT | Base | presence + bbox；memory 值 mask | 关闭写入 |
-| Memory SFT | Core | core + update/null + 完整状态快照 | 开启并门控 |
-| TU-GRPO | Memory SFT | 当前 GT + 文本 groundedness + 轨迹效用 reward | 开启并门控 |
+| 数据档位 | `bbox_2d/status` | `memory_update` | 用途 |
+| --- | ---: | ---: | --- |
+| `tracking_sft` present | 1 | 未知占位 `null` 的值为 0 | 大规模定位、存在性和结构 |
+| `tracking_sft` absent | 1 | 未知占位 `null` 的值为 0 | 目标缺失时的 bbox/status/结构 |
+| `state_update_sft` update | 1 | verified 非空快照为 1 | 学何时、如何替换状态 |
+| `state_update_sft` hard-null | 1 | verified `null` 为 1 | 学何时保持状态 |
 
-旧 Stage-1/2 训练只作历史对照，配方和结果见 [`archive/`](archive/README.md)。
+`tracking_sft` 只 mask `memory_update` 的未知值；字段名、逗号、JSON 闭合和 EOS 仍监督。
+因此它不强制模型推理时永远输出 null。`state_update_sft` 不允许
+`masked_unknown`，每一行的状态值都必须有证据。
 
-## 2. Core SFT
+## 2. 坐标与数据视图
 
-VLT-v6.3 固定使用三张完整图：带框初始模板、按时间从左到右且由白色竖向分隔带隔开的
-近期三帧带框历史条带和无框当前图；不足三帧时复制最近可用历史进行右侧 padding。文本包含
-不可变 initial identity 和当前 maintained state。Core 数据没有记忆真值，因此答案仍
-带 `memory_update:null`，但训练只将该 JSON 值的 token loss 设为 0：
+- 当前只训练 Qwen3-VL-4B；
+- assistant 字段为 `bbox_2d`，值是 Image 3 上 `[0,1000] xyxy`；
+- source metadata 可继续使用明确的审计名 `bbox_norm1000_xyxy`，但它不是模型可见键；
+- ms-swift JSONL 使用官方 `<bbox> + objects.bbox + image_id` 与
+  `QWENVL_BBOX_FORMAT=new`；
+- Qwen2.5-VL 的 absolute-pixel 视图只作历史兼容，不能与 Qwen3 数据交叉加载。
 
-```json
-{"target_status":"present","bbox_norm1000_xyxy":[100,120,400,520],"memory_update":null}
-```
+## 3. 数据入口
 
-状态、bbox、字段名和 JSON 闭合继续受监督。实现和完整命令见
-[`vlt_v6_core_sft.md`](vlt_v6_core_sft.md)。标准入口：
-
-训练模型的 `6.3.0` native System Prompt 不重复 JSON、坐标或格式要求；三字段协议由
-assistant 监督内化。对通用未训练 VLM 的 strict comparison Prompt 必须使用独立 profile
-和 manifest 标记，不能拿它生成 native SFT 数据。
+大规模跟踪数据：
 
 ```bash
-export MODEL_PATH=/models/Qwen3-VL-4B-Instruct
-export DATASET_ROOT=/datasets/derived/cogtrack_vlt_v6_core
-export TRAIN_DATA="$DATASET_ROOT/ms_swift/qwen3_vl/train.jsonl"
-export VAL_DATA="$DATASET_ROOT/ms_swift/qwen3_vl/val.jsonl"
-export OUTPUT_DIR=/outputs/cogtrack/qwen3vl_4b_vlt_v6_core
-export QWEN_MODEL_FAMILY=qwen3_vl
-
-bash scripts/train_qwen3vl_4b_vlt_v6_core.sh
+bash scripts/generate_tracking_sft_data.sh \
+  cogtrack_vlt_v640_tracking_sft_r80_20_case20_mgit200_robust15_v1
 ```
 
-正式训练前必须执行 `tracking/validate_sft_supervision.py` 和真实 processor mask 回放；
-不能只检查字符串长度或假设 `<bbox>` 展开后仍受监督。
+状态数据由两部分组成，详见 [`data.md`](data.md)：
 
-## 3. Memory SFT
-
-Memory SFT 继续使用完全相同的在线输入和输出。差别是显式 memory 样本来自
-`memory_labels.v1`，其 `memory_update` 值参与 loss：
-
-```json
-{"target_status":"present","bbox_norm1000_xyxy":[100,120,400,520],"memory_update":"the same white dog, now seen from the rear; black ears and red collar remain visible"}
+```text
+MGIT 官方分段可用标签（734）
++ `qwen3-vl-plus` API/QC 合格标签（2,329）
+= 统一 state_update_sft release（3,063，已完成）
 ```
 
-`null` 是经过事件筛选的 hard-null，不是机械给所有普通 bbox 样本补空标签。非空内容是
-完整替换状态；`absent` 必须为 null。建议首轮 batch 混合 70% core 和 30% memory，
-memory 内约 25% update、75% hard-null，最终比例由 validation 选择。
+这两类数据先独立生成，不能把 API 状态标签回填进原始 `tracking_sft`。如果后续确实
+需要利用第一部分中少量明确的消失/重现样本，再单独生成 `tracking_sft` 的 memory
+overlay；overlay 只在最终训练打包时替换对应 masked 行，不改变原始 release，也不构成
+第三种数据类型。
 
-状态标签生成工具仍待实现；在 [`state_annotation.md`](state_annotation.md) 的审核集、
-provenance 和无未来泄漏校验完成前，不提供虚假的“一键全量训练”命令。
+## 4. 训练前预检
 
-## 4. TU-GRPO
-
-GRPO 只从已稳定的 Memory SFT 初始化。现有 reward 模块可复用格式、presence 和 bbox
-IoU；下一步新增 target/distractor groundedness、身份漂移惩罚和 accept/keep 双分支
-短轨迹效用。未来 GT 只进入 reward，不得进入模型输入。
-
-先做离线 reward replay，再按 `format/current → event/ground → cached trajectory → true
-trajectory` 逐级打开。完整定义、消融和成功标准见 [`grpo.md`](grpo.md)。在 trajectory
-reward 和 ms-swift 插件尚未落地前，不将现有 presence GRPO 入口称为完整方法。
-
-## 5. Qwen 坐标与数据视图
-
-两代模型的训练 JSONL 不能交叉使用：
-
-| 模型族 | JSONL | 坐标 | 输出字段 |
-| --- | --- | --- | --- |
-| Qwen3-VL | `ms_swift/qwen3_vl/` | 当前图 `[0,1000]` 相对 `xyxy` | `bbox_norm1000_xyxy` |
-| Qwen2.5-VL | `ms_swift/qwen2_5_vl/` | processor resize 后绝对像素 `xyxy` | `bbox_pixel_xyxy` |
-
-两者均保留 `QWENVL_BBOX_FORMAT=new`，并通过 ms-swift 的 `<bbox>` 与
-`objects.image_id` 将 assistant bbox 绑定最后一张 current 图。visual-box 输入不会为
-Image 1 创建 reference `<bbox>` object。
+每个数据视图先分别检查模型族与监督边界：
 
 ```bash
 python tracking/validate_qwen_training_view.py \
-  --model "$MODEL_PATH" \
-  --dataset "$TRAIN_DATA" --dataset "$VAL_DATA" \
-  --expected-family "$QWEN_MODEL_FAMILY"
+  --model /root/public/models/Qwen/Qwen3-VL-4B-Instruct \
+  --dataset /absolute/path/to/train.jsonl \
+  --dataset /absolute/path/to/val.jsonl \
+  --expected-family qwen3_vl
+
+python tracking/validate_sft_supervision.py \
+  --profile tracking_sft \
+  --dataset /absolute/path/to/tracking/train.jsonl \
+  --dataset /absolute/path/to/tracking/val.jsonl
+
+python tracking/validate_sft_supervision.py \
+  --profile state_update_sft \
+  --dataset /absolute/path/to/state/train.jsonl \
+  --dataset /absolute/path/to/state/val.jsonl
 ```
 
-## 6. LoRA 与常规全参 SFT
+`state_update_sft` 检查中出现一个 `masked_unknown` 都必须失败。真实 processor replay 还要
+确认 `<bbox>` 绑定 Image 3 并解码为原始 norm1000 坐标。
 
-主实验优先 LoRA，便于快速比较标签与 reward 设计。用户所说的“常规全参微调”定义为：
-语言模型和对齐层可训练、视觉编码器冻结。只有专门研究视觉表征适配时才解冻视觉侧，
-并在实验名中明确标记。
+## 5. 单次混合全参 SFT
 
-8×24GB GPU 做 3B/4B 全参对照时必须用 FSDP 或 ZeRO-3 分片参数、梯度和优化器状态：
+最终训练直接更新 Qwen3-VL-4B 的 LLM 与视觉 merger/aligner，ViT 保持冻结。
+tracking/state-update 两种行需要保留各自的
+per-message loss scale；不能先把所有 assistant 文本统一成 full loss，也不能把状态行
+统一套 tracking mask。
+
+两个独立 release 已统一打包为：
+
+```text
+data/releases/cogtrack_v640_mixed_sft_full_v1
+```
+
+正式训练使用其中的 `train.jsonl`（79,110 行，90/4/6）；发布统计使用
+`train_unique.jsonl`，验证使用 `val.jsonl`。目录完全自包含，不依赖原始 release 路径。
+可重放入口是 `scripts/build_mixed_sft_release.sh`。
+
+两卡 smoke（正式混合数据路径冻结后替换下列变量）使用：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC_PER_NODE=8 \
-TUNER_TYPE=full FSDP_MODE=fsdp2 \
-FREEZE_LLM=false FREEZE_VIT=true FREEZE_ALIGNER=false \
-LEARNING_RATE=1e-5 EPOCHS=1 BATCH_SIZE=1 GRAD_ACC_STEPS=4 \
-MODEL_PATH="$MODEL_PATH" TRAIN_DATA="$TRAIN_DATA" VAL_DATA="$VAL_DATA" \
-DATASET_ROOT="$DATASET_ROOT" OUTPUT_DIR="$OUTPUT_DIR" \
-bash scripts/train_sft.sh
+export MODEL_PATH=/root/public/models/Qwen/Qwen3-VL-4B-Instruct
+export DATASET_ROOT=/absolute/path/to/cogtrack_v640_mixed_sft_full_v1
+export TRAIN_DATA="$DATASET_ROOT/train.jsonl"
+export VAL_DATA="$DATASET_ROOT/val.jsonl"
+export OUTPUT_DIR=/absolute/path/to/outputs/qwen3vl_4b_v640_tracking_smoke
+export CUDA_VISIBLE_DEVICES=0,1
+export NPROC_PER_NODE=2
+export TUNER_TYPE=full
+export FREEZE_VIT=true FREEZE_LLM=false FREEZE_ALIGNER=false
+export DEEPSPEED=zero2
+export SFT_SUPERVISION_PROFILE=mixed_sft
+export SAVE_STRATEGY=no EVAL_STRATEGY=no REPORT_TO=none
+
+bash scripts/train_qwen3vl_4b_tracking_sft.sh \
+  --max_steps 2 --save_strategy no --eval_strategy no
 ```
 
-LoRA 与 full 不是两个不同推理协议，不能因训练方式改变测试 prompt、历史长度或观察策略。
+默认使用 BF16、FlashAttention 2、DeepSpeed ZeRO-2 和 activation/gradient checkpointing。
+模型共 44.38 亿参数，其中冻结 ViT 后 41.32 亿可训练。训练图片导出长边 648，ms-swift
+`max_pixels=200704` 控制每张图视觉 token 上限。1×L40S 实测会在首次 AdamW 状态创建时
+达到 45,449 MiB 并 OOM；推荐 4×L40S 或 2×H100 80GB，2×L40S 可先测 ZeRO-2，必要时
+退回 ZeRO-3。smoke 必须记录每卡峰值显存、tokens/sample、steps/s、有限 loss 和 ETA。
 
-## 7. 数据与训练验收
+## 6. 评测边界
 
-每次训练前后至少保存：
+训练后至少在同一 Prompt 6.4.0 / CognitiveBench-Tiny 配置比较 Base、旧 Stage-2 和新
+全参 SFT 模型，并报告 tracking 指标、presence、reappearance、memory update rate、over-update 与
+forced-null 对照。两步 loss 只证明链路可训练，不能证明跟踪提升。
 
-- 完整序列 train/validation split 和 sampling/annotation plan；
-- JSONL、图片 manifest、模型权重的 SHA-256；
-- model family、prompt name/version、supervision profile；
-- ms-swift/transformers/torch revision 与 Git commit；
-- 两步 smoke、小样本过拟合、正式 loss 和 validation 记录；
-- 可训练参数量、world size、global batch、学习率、显存和吞吐；
-- 最终 adapter、trainer state 和恢复命令。
-
-训练 loss 只证明优化过程运行，效果结论必须来自固定 CognitiveBench-Tiny/Full。Core
-checkpoint 关闭 semantic write；Memory/TU-GRPO checkpoint 同时报告 memory-on 与
-forced-null，证明提升确实来自状态维护而非其他训练差异。
+TU-GRPO 必须在混合 SFT 和状态更新评测之后，详见 [`grpo.md`](grpo.md)。

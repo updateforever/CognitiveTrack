@@ -15,6 +15,7 @@ set -euo pipefail
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(dirname -- "$SCRIPT_DIR")
 OUTPUT_DIR=${OUTPUT_DIR:-"$PROJECT_ROOT/outputs/sft_qwen_vl"}
+PYTHON_BIN=${PYTHON_BIN:-python}
 VAL_DATA=${VAL_DATA:-}
 DATASET_ROOT=${DATASET_ROOT:-}
 TUNER_TYPE=${TUNER_TYPE:-lora}
@@ -34,7 +35,7 @@ export QWENVL_BBOX_FORMAT=${QWENVL_BBOX_FORMAT:-new}
 # 在加载模型、占用 GPU 之前检查模型代际与数据坐标视图。Qwen2.5-VL 和
 # Qwen3-VL 的坐标协议不同，二者 JSONL 不能交叉使用。
 FAMILY_CHECK=(
-    python "$PROJECT_ROOT/tracking/validate_qwen_training_view.py"
+    "$PYTHON_BIN" "$PROJECT_ROOT/tracking/validate_qwen_training_view.py"
     --model "$MODEL_PATH"
     --dataset "$TRAIN_DATA"
 )
@@ -53,7 +54,7 @@ fi
 # 字段级 loss mask 必须与数据 metadata 成对启用。这样不会因为忘记传
 # --loss_scale 而把占位的 memory_update=null 错当作“永不更新记忆”监督。
 SUPERVISION_CHECK=(
-    python "$PROJECT_ROOT/tracking/validate_sft_supervision.py"
+    "$PYTHON_BIN" "$PROJECT_ROOT/tracking/validate_sft_supervision.py"
     --profile "$SFT_SUPERVISION_PROFILE"
     --dataset "$TRAIN_DATA"
 )
@@ -87,7 +88,7 @@ ARGS=(
     --torch_dtype "${TORCH_DTYPE:-bfloat16}"
     --attn_impl "${ATTN_IMPL:-flash_attn}"
     --max_length "${MAX_LENGTH:-4096}"
-    # 两图训练必须显式限制每张图的视觉 token；否则原始高清视频会造成显存
+    # 多图训练必须显式限制每张图的视觉 token；否则原始高清视频会造成显存
     # 波动，且与在线 max_image_side=648 的量级差异过大。
     --max_pixels "${MAX_PIXELS:-200704}"
     --num_train_epochs "${EPOCHS:-$DEFAULT_EPOCHS}"
@@ -106,15 +107,33 @@ ARGS=(
     --report_to "${REPORT_TO:-none}"
 )
 
-if [[ "$SFT_SUPERVISION_PROFILE" == "tracking_core" ]]; then
+if [[ "$SFT_SUPERVISION_PROFILE" == "tracking_sft" ]]; then
     ARGS+=(
         --external_plugins "$PROJECT_ROOT/cogtrack/training/ms_swift_plugin.py"
-        --loss_scale cogtrack_tracking_core
+        --loss_scale cogtrack_tracking_sft
+    )
+elif [[ "$SFT_SUPERVISION_PROFILE" == "tracking_core" ]]; then
+    echo "警告：tracking_core 是历史别名；请改用 tracking_sft。" >&2
+    ARGS+=(
+        --external_plugins "$PROJECT_ROOT/cogtrack/training/ms_swift_plugin.py"
+        --loss_scale cogtrack_tracking_sft
+    )
+elif [[ "$SFT_SUPERVISION_PROFILE" == "state_update_sft" ]]; then
+    # 该数据集中的每一条状态更新/null 都已通过来源规则或 verifier，整条 response
+    # 全量监督；真正的逐行 loss_scale=1.0 由导出器写入并由 preflight 核对。
+    ARGS+=(--loss_scale default)
+elif [[ "$SFT_SUPERVISION_PROFILE" == "mixed_sft" ]]; then
+    # mixed_sft 同时包含 masked_unknown 与全监督 state 行。没有 per-message
+    # loss_scale 的 tracking 行由插件切成 [1,0,1]；state 行的 loss_scale=1.0
+    # 通过 ms-swift 原生旁路保持整条 response 全监督。
+    ARGS+=(
+        --external_plugins "$PROJECT_ROOT/cogtrack/training/ms_swift_plugin.py"
+        --loss_scale cogtrack_tracking_sft
     )
 elif [[ "$SFT_SUPERVISION_PROFILE" == "full" ]]; then
     ARGS+=(--loss_scale default)
 else
-    echo "错误：SFT_SUPERVISION_PROFILE 只支持 full 或 tracking_core。" >&2
+    echo "错误：SFT_SUPERVISION_PROFILE 只支持 full、tracking_sft、state_update_sft 或 mixed_sft。" >&2
     exit 1
 fi
 
@@ -134,7 +153,8 @@ if [[ "$TUNER_TYPE" == "lora" ]]; then
 elif [[ "$TUNER_TYPE" == "full" ]]; then
     # VLM 常规全参 SFT：语言模型与对齐层全参训练，默认冻结视觉编码器，保护其
     # 既有视觉/grounding 能力。若要连视觉塔一起训练，再显式设 FREEZE_VIT=false。
-    # 8×24GB 仍需设置 DEEPSPEED=zero3 或 FSDP_MODE=fsdp2 之一。
+    # 多卡全参训练需设置 DeepSpeed ZeRO-2/3 或 FSDP2。当前正式配方优先
+    # ZeRO-2；显存紧张的 2×L40 可用 ZeRO-3 兜底。
     ARGS+=(
         --freeze_llm "${FREEZE_LLM:-false}"
         --freeze_vit "${FREEZE_VIT:-true}"
@@ -152,7 +172,7 @@ elif [[ "$TUNER_TYPE" == "full" ]]; then
             ARGS+=(--fsdp_config "$FSDP_CONFIG")
         fi
     else
-        echo "错误：全量微调必须设置 DEEPSPEED=zero3 或 FSDP_MODE=fsdp2。" >&2
+        echo "错误：全量微调必须设置 DEEPSPEED=zero2/zero3 或 FSDP_MODE=fsdp2。" >&2
         exit 1
     fi
 else

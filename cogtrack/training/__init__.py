@@ -2,9 +2,13 @@
 
 from .loss_mask import (
     SFT_SUPERVISION_FULL,
+    SFT_SUPERVISION_MIXED_SFT,
     SFT_SUPERVISION_PROFILES,
+    SFT_SUPERVISION_STATE_UPDATE_SFT,
     SFT_SUPERVISION_TRACKING_CORE,
+    SFT_SUPERVISION_TRACKING_SFT,
     split_tracking_core_response,
+    split_tracking_sft_response,
     validate_sft_supervision_profile,
 )
 from .model_family import (
@@ -47,8 +51,10 @@ from .tracking_samples import (
     MEMORY_SUPERVISION_DISABLED,
     MEMORY_SUPERVISION_EXPLICIT,
     MEMORY_SUPERVISION_FEASIBILITY_NULL,
+    MEMORY_SUPERVISION_LABELLED_MODES,
     MEMORY_SUPERVISION_MASKED_NULL,
     MEMORY_SUPERVISION_MODES,
+    MEMORY_SUPERVISION_THREE_STATE,
     SOURCE_SCHEMA_VERSION,
     MemoryUpdateLabel,
     TrackingSampleBuildReport,
@@ -64,8 +70,10 @@ __all__ = [
     "MEMORY_SUPERVISION_DISABLED",
     "MEMORY_SUPERVISION_EXPLICIT",
     "MEMORY_SUPERVISION_FEASIBILITY_NULL",
+    "MEMORY_SUPERVISION_LABELLED_MODES",
     "MEMORY_SUPERVISION_MASKED_NULL",
     "MEMORY_SUPERVISION_MODES",
+    "MEMORY_SUPERVISION_THREE_STATE",
     "MemoryUpdateLabel",
     "TrackingSampleBuildReport",
     "TrackingSampleConfig",
@@ -101,7 +109,11 @@ __all__ = [
     "validate_model_dataset_family",
     "SFT_SUPERVISION_FULL",
     "SFT_SUPERVISION_PROFILES",
+    "SFT_SUPERVISION_MIXED_SFT",
+    "SFT_SUPERVISION_STATE_UPDATE_SFT",
     "SFT_SUPERVISION_TRACKING_CORE",
+    "SFT_SUPERVISION_TRACKING_SFT",
     "split_tracking_core_response",
+    "split_tracking_sft_response",
     "validate_sft_supervision_profile",
 ]

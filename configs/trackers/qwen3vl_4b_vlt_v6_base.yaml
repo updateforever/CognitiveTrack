@@ -1,4 +1,4 @@
-# VLT-v6.3 本地 HF：初始化文本 + 固定三图 + 左到右近期三帧条带 + 最近状态记忆。
+# VLT-v6.4 本地 HF Base：固定三图 + 左到右近期三帧条带 + replacement 状态记忆。
 tracker_name: cognitive_vlm
 experiment_name: qwen3vl_4b_vlt_v6_base_hf_smoke
 context_mode: mosaic

@@ -60,16 +60,20 @@ MemoryUpdatePolicy（visual / semantic 双通道）
 
 初始 GT 目标锚点永久保存。预测历史只有在状态为 `present`、bbox 合法且满足
 连续确认（可选几何一致性）时，才允许进入长期正记忆。
-VLT-v6.3 的 Image 2 固定为 `recent_strip_3_v2`：最近三次可信观测按时间从左到右排列，
+VLT-v6.4 的 Image 2 固定为 `recent_strip_3_v2`：最近三次可信观测按时间从左到右排列，
 相邻 panel 由高度约 3% 的白色竖向分隔带隔开；少于三次时在右侧复制最近可用观测，
-尚无动态历史时复制初始化观测。visual-v5 仍使用冻结的 `compact_grid_v1`，旧的无分隔
-条带保留为 `recent_strip_3_v1`，三种布局不会静默共用实验结果。
+尚无动态历史时复制初始化观测。`compact_grid_v1`、`recent_strip_3_v1` 和 visual-v5
+只为历史兼容保留，不是当前实验入口，也不会与 v6.4 静默共用结果。
 模型把 `memory_update` 放在输出末尾：`null` 直接走快路径，非空状态快照走慢路径；
-后者还必须经过 present、合法 bbox、去重、最小帧间隔和容量门控，才进入语义记忆。
-初始身份文本和模板图永久不覆盖；已接受状态只替换可变的 `current_target_state`，并在
-下一次 pair/mosaic 推理中作为辅助证据回读。初始化身份始终具有最高优先级。
+后者还必须经过状态相关门控、去重、最小帧间隔和容量检查：present 更新要求合法 bbox，
+absent 更新只接受消失转折快照；持续缺失不重复改写。
+初始身份文本原文和模板图永久保留，作为可审计的初始化 provenance；但文本可能粗糙或
+与 Image 1 的真实视觉类别不完全一致。Image 1 红框视觉目标才是永久身份锚点。已接受
+状态只替换可变的 `current_target_state`，允许在视觉证据充分时完整纠正初始文本，而不把
+同一物理目标的类别纠正误判为 identity drift，并在下一次 pair/mosaic 推理中作为辅助
+证据回读。初始化视觉锚点始终具有最高优先级。
 模型输出的候选框和 benchmark 的最终跟踪框是两个概念：只有
-`target_status=present` 且 bbox 合法的候选才能写入 `target_bbox`。
+`status=present` 且 bbox 合法的候选才能写入 `target_bbox`。
 
 Qwen backend 按完整模型配置做进程级共享，序列切换只重置锚点、状态机和记忆，
 不重复加载大模型权重。

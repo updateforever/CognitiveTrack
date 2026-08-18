@@ -376,6 +376,8 @@ class HuggingFaceQwenVLBackend(VLMBackend):
     ) -> VLMResponse:
         """执行 Qwen-VL 多图生成，返回纯新增 token 对应的文本。"""
 
+        # max_image_side 在进入 processor 前限制原始大图尺寸；processor 仍会按
+        # Qwen 自身 patch/grid 规则再次 resize。这里的顺序直接决定视觉 token 数。
         rgb_images = prepare_rgb_images(images, self.config.max_image_side)
         messages = build_qwen_messages(rgb_images, prompt, system_prompt)
         generation = generation_config or self.config.generation
@@ -426,6 +428,8 @@ class HuggingFaceQwenVLBackend(VLMBackend):
                     )
                 if hasattr(generated_ids, "sequences"):
                     generated_ids = generated_ids.sequences
+                # generate 返回“输入 + 新增 token”，必须按输入长度裁掉 Prompt；
+                # 否则 parser 会收到整段 chat template 而不是三字段 JSON。
                 input_length = int(inputs.input_ids.shape[1])
                 trimmed_ids = generated_ids[:, input_length:]
                 decoded = runtime.processor.batch_decode(

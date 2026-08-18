@@ -1,4 +1,4 @@
-# VLT-v6.3 Qwen3-VL-4B 零样本基线；固定 recent_strip_3_v2，与 SFT 同协议。
+# VLT-v6.4 Qwen3-VL-4B Base；固定 recent_strip_3_v2，与 SFT 使用同一在线协议。
 tracker_name: cognitive_vlm
 experiment_name: qwen3vl_4b_vlt_v6_base
 context_mode: mosaic

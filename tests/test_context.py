@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from cogtrack.context import (
     HISTORY_LAYOUT_COMPACT_GRID_V1,
@@ -7,11 +8,13 @@ from cogtrack.context import (
     HISTORY_STRIP_SEPARATOR_COLOR_RGB,
     PROMPT_PROFILE_VLT_V6,
     REFERENCE_MODE_VISUAL_BOX,
+    SAFE_INIT_LANGUAGE_SCOPES,
     VISUAL_MARKER_VERSION,
     TrackingContextBuilder,
     arrange_history_items,
     build_history_mosaic,
     draw_reference_box,
+    is_unsafe_init_language_scope,
 )
 from cogtrack.memory import IdentityAnchor, MemoryKind, MemoryRecord, MemorySource
 
@@ -195,13 +198,13 @@ def test_vlt_v6_keeps_fixed_three_image_interface_before_dynamic_history():
     assert len(result.images) == 3
     assert result.reference_frames == (0, 0, 0, 0)
     assert result.prompt.name == "cognitive_vlt_mosaic"
-    assert result.prompt.version == "6.3.0"
+    assert result.prompt.version == "6.4.0"
     assert result.prompt.expected_image_count == 3
     assert "a small gray vehicle" in result.prompt.user_prompt
     assert "rear view now exposes two white stripes" in result.prompt.user_prompt
     assert "Decision order" not in result.prompt.user_prompt
-    assert "may overwrite the initialized identity" in result.prompt.system_prompt
-    assert "analyze its current state" in result.prompt.system_prompt
+    assert "permanent anchor" in result.prompt.system_prompt
+    assert "significant state changes" in result.prompt.system_prompt
     assert "With two images" not in result.prompt.system_prompt
     assert "padding" not in result.prompt.system_prompt
     assert "Return only" not in result.prompt.system_prompt
@@ -209,3 +212,48 @@ def test_vlt_v6_keeps_fixed_three_image_interface_before_dynamic_history():
     assert result.images[1].shape[:2] == (240, 1166)
     assert result.history_layout_version == HISTORY_LAYOUT_RECENT_STRIP_3_V2
     assert np.array_equal(result.images[-1], current)
+
+
+@pytest.mark.parametrize(
+    ("scope", "dataset"),
+    [
+        ("initial_target", "lasot"),
+        ("initial_target", "tnl2k"),
+        # MGIT 官方 action 层首段：start_frame 经 91/91 序列核对均为 0，不泄漏未来。
+        ("first_action_description", "mgit"),
+        ("FIRST_ACTION_DESCRIPTION", "mgit"),
+        ("  initial_target  ", "lasot"),
+    ],
+)
+def test_safe_init_language_scopes_are_accepted(scope, dataset):
+    assert is_unsafe_init_language_scope(scope, dataset=dataset) is False
+
+
+@pytest.mark.parametrize(
+    ("scope", "dataset"),
+    [
+        ("full_video_story", "mgit"),
+        ("full_video_story", "lasot"),
+        # MGIT 描述文件含 action/activity/story 三层；scope 缺失或未知时无法确认边界。
+        ("", "mgit"),
+        ("story", "mgit"),
+        ("activity", "mgit"),
+    ],
+)
+def test_unsafe_init_language_scopes_are_rejected(scope, dataset):
+    assert is_unsafe_init_language_scope(scope, dataset=dataset) is True
+
+
+def test_missing_scope_keeps_non_mgit_loader_description():
+    """非 MGIT 数据集未声明 scope 时不应被误判为整段剧情。"""
+
+    assert is_unsafe_init_language_scope("", dataset="lasot") is False
+    assert is_unsafe_init_language_scope("", dataset="") is False
+
+
+def test_safe_scope_set_is_explicit():
+    """冻结安全集合，避免未来新增 scope 时被静默放行。"""
+
+    assert SAFE_INIT_LANGUAGE_SCOPES == frozenset(
+        {"initial_target", "first_action_description"}
+    )

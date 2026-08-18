@@ -1,6 +1,9 @@
 import numpy as np
 
 from cogtrack.memory import (
+    SEMANTIC_EVENT_CONTINUED_ABSENCE,
+    SEMANTIC_EVENT_DISAPPEARANCE,
+    SEMANTIC_EVENT_REAPPEARANCE,
     GatedMemoryUpdatePolicy,
     IdentityAnchor,
     MemoryBank,
@@ -46,16 +49,27 @@ def test_execution_error_cannot_enter_memory():
     assert not decision.accepted
 
 
-def _semantic_candidate(frame_id: int, text: str) -> MemoryCandidate:
+def _semantic_candidate(
+    frame_id: int,
+    text: str,
+    *,
+    presence: TargetPresence = TargetPresence.PRESENT,
+    temporal_event: str | None = None,
+) -> MemoryCandidate:
     return MemoryCandidate(
         kind=MemoryKind.SEMANTIC,
         frame_id=frame_id,
         source=MemorySource.VLM_PREDICTION,
         execution_status=ExecutionStatus.OK,
-        target_presence=TargetPresence.PRESENT,
-        identity_match=IdentityMatch.SAME,
-        bbox_xywh=(10, 10, 20, 20),
+        target_presence=presence,
+        identity_match=(
+            IdentityMatch.SAME
+            if presence is TargetPresence.PRESENT
+            else IdentityMatch.NOT_APPLICABLE
+        ),
+        bbox_xywh=(10, 10, 20, 20) if presence is TargetPresence.PRESENT else None,
         text=text,
+        metadata={"temporal_event": temporal_event} if temporal_event else {},
     )
 
 
@@ -141,4 +155,57 @@ def test_no_change_text_is_treated_as_null_instead_of_polluting_memory():
         decision = policy.process(bank, _semantic_candidate(frame_id, text))
         assert decision.accepted is False
         assert "memory_update=null" in decision.reason
+    assert bank.records(MemoryKind.SEMANTIC) == ()
+
+
+def test_semantic_presence_transitions_are_immediate_and_bypass_cooldown():
+    anchor = IdentityAnchor(0, (10, 10, 20, 20), image=np.zeros((40, 40, 3), dtype=np.uint8))
+    bank = MemoryBank(anchor)
+    policy = GatedMemoryUpdatePolicy(
+        MemoryUpdatePolicyConfig(min_semantic_frame_gap=30, semantic_confirmations=2)
+    )
+
+    disappeared = policy.process(
+        bank,
+        _semantic_candidate(
+            1,
+            "The initialized target is currently absent.",
+            presence=TargetPresence.ABSENT,
+            temporal_event=SEMANTIC_EVENT_DISAPPEARANCE,
+        ),
+    )
+    reappeared = policy.process(
+        bank,
+        _semantic_candidate(
+            2,
+            "The initialized target has reappeared with its rear stripes visible.",
+            temporal_event=SEMANTIC_EVENT_REAPPEARANCE,
+        ),
+    )
+
+    assert disappeared.accepted is True
+    assert reappeared.accepted is True
+    assert [record.metadata["target_presence"] for record in bank.records(MemoryKind.SEMANTIC)] == [
+        "absent",
+        "present",
+    ]
+
+
+def test_continued_absence_semantic_proposal_is_rejected():
+    anchor = IdentityAnchor(0, (10, 10, 20, 20), image=np.zeros((40, 40, 3), dtype=np.uint8))
+    bank = MemoryBank(anchor)
+    policy = GatedMemoryUpdatePolicy()
+
+    decision = policy.process(
+        bank,
+        _semantic_candidate(
+            2,
+            "The initialized target remains absent.",
+            presence=TargetPresence.ABSENT,
+            temporal_event=SEMANTIC_EVENT_CONTINUED_ABSENCE,
+        ),
+    )
+
+    assert decision.accepted is False
+    assert "首次消失" in decision.reason
     assert bank.records(MemoryKind.SEMANTIC) == ()

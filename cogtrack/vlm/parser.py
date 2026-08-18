@@ -13,6 +13,8 @@ from typing import Any, Dict, Mapping, Optional, Set, Tuple
 from ..protocol.bbox import (
     BBOX_PROTOCOL_NORM1000,
     BBOX_PROTOCOL_QWEN_ABS_PIXEL,
+    MEMORY_UPDATE_JSON_KEY,
+    TARGET_STATUS_JSON_KEY,
     BBoxXYXY,
     bbox_protocol_json_key,
     model_pixel_xyxy_to_pixel_xywh,
@@ -148,12 +150,12 @@ def parse_tracking_output(
     bbox_key = bbox_protocol_json_key(bbox_protocol)
     data = _load_json_object(raw_text)
     core_keys = {
-        "target_status",
+        TARGET_STATUS_JSON_KEY,
         bbox_key,
     }
     expected = set(core_keys)
     if require_memory_update:
-        expected.add("memory_update")
+        expected.add(MEMORY_UPDATE_JSON_KEY)
     # target_status/bbox 是核心跟踪协议，必须严格存在。memory_update 是独立的
     # 可选慢路径：缺失或非法时拒绝更新并留痕，但不抹掉合法核心预测。
     missing_core = sorted(core_keys - set(data))
@@ -166,9 +168,13 @@ def parse_tracking_output(
             details.append(f"未知字段 {unknown}")
         raise ModelOutputParseError(f"tracking 输出字段不符合 v4 协议：{'；'.join(details)}")
 
-    presence = _enum(data["target_status"], TargetPresence, "target_status")
+    presence = _enum(
+        data[TARGET_STATUS_JSON_KEY], TargetPresence, TARGET_STATUS_JSON_KEY
+    )
     if presence is TargetPresence.UNCERTAIN:
-        raise ModelOutputParseError("v4 主跟踪任务的 target_status 只允许 present/absent")
+        raise ModelOutputParseError(
+            f"v4 主跟踪任务的 {TARGET_STATUS_JSON_KEY} 只允许 present/absent"
+        )
     normalized_bbox: Optional[BBoxXYXY]
     bbox_value = data[bbox_key]
     if bbox_value is None:
@@ -205,10 +211,10 @@ def parse_tracking_output(
     memory_update: Optional[str] = None
     memory_update_error: Optional[str] = None
     if require_memory_update:
-        if "memory_update" not in data:
+        if MEMORY_UPDATE_JSON_KEY not in data:
             memory_update_error = "缺少 memory_update；已按 null 拒绝记忆更新"
         else:
-            raw_memory = data["memory_update"]
+            raw_memory = data[MEMORY_UPDATE_JSON_KEY]
             if raw_memory is not None:
                 if not isinstance(raw_memory, str):
                     memory_update_error = "memory_update 必须是 null 或字符串；已按 null 处理"
@@ -227,9 +233,6 @@ def parse_tracking_output(
             raise ModelOutputParseError("absent 时 bbox 必须为 null")
         identity = IdentityMatch.NOT_APPLICABLE
         localizability = Localizability.NOT_APPLICABLE
-        if memory_update is not None:
-            memory_update = None
-            memory_update_error = "absent 时 memory_update 必须为 null；已拒绝记忆更新"
     elif normalized_bbox is None:
         raise ModelOutputParseError(f"present + localizable 时必须输出 {bbox_key}")
     else:

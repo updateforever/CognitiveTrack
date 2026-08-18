@@ -9,10 +9,11 @@ CognitiveTrack 是一个建立在 [pytracking](https://github.com/visionml/pytra
 GRPO。所有实验遵循：第一帧仅用 GT 初始化，后续推理不读取当前或未来 GT；训练、
 验证和测试按完整序列划分。
 
-当前 VLT-v6.3 基线使用固定三图输入：带框首帧身份锚点、从左到右排列的近期三帧带框
+当前 VLT-v6.4 基线使用固定三图输入：带框早期身份锚点、从左到右排列的近期三帧带框
 历史条带和无框当前全图。历史 panel 由白色竖向分隔带隔开；不足三帧时复制最近可用
 历史进行右侧 padding。文本状态分为不可变初始身份与可替换当前目标状态，输出目标
-存在性、当前框和可空状态更新。首轮 SFT 只监督存在性与 bbox；完整研究路线见
+存在性、当前框和可空状态更新。训练数据分为大规模 `tracking_sft` 与小规模全监督
+`state_update_sft`；完整研究路线见
 [docs/research_plan.md](docs/research_plan.md)。
 
 ## 主要特性
@@ -26,7 +27,7 @@ GRPO。所有实验遵循：第一帧仅用 GT 初始化，后续推理不读取
 - TXT bbox 与逐帧 JSONL 双结果格式；
 - pytracking 定位指标、稀疏执行指标和目标存在性诊断；
 - 基于 LaSOT、TNL2K、MGIT 的确定性训练数据构造；
-- ms-swift LoRA/全参 SFT，以及可扩展的 GRPO reward 接口。
+- ms-swift 冻结 ViT 的全参 SFT，以及可扩展的 GRPO reward 接口。
 
 ## CognitiveBench
 
@@ -59,7 +60,7 @@ pip install -e '.[train]'
 ```
 
 环境兼容矩阵、CUDA 和 FlashAttention 检查见
-[docs/environment.md](docs/environment.md)。安装后运行：
+[docs/setup.md](docs/setup.md)。安装后运行：
 
 ```bash
 python scripts/verify_env.py --verbose
@@ -115,8 +116,8 @@ python tracking/smoke_test_qwen.py \
   --env-config configs/env.local.yaml
 ```
 
-正式 VLT-v6.3 推理固定使用初始化文本、首帧身份锚点、三帧可信历史条带、最近状态
-记忆、当前关键帧全图，以及 `target_status + bbox + memory_update` 三字段协议。先在
+正式 VLT-v6.4 推理固定使用初始化文本、带框身份锚点、三帧可信历史条带、最近状态
+记忆、当前关键帧全图，以及 `bbox_2d + status + memory_update` 三字段协议。先在
 Tiny 上评测：
 
 ```bash
@@ -127,7 +128,7 @@ python tracking/test.py \
 ```
 
 确认协议和性能趋势后，仅将数据配置换成 `configs/datasets/cognitivebench.yaml` 即可
-运行 Full。核心 SFT adapter 使用 `qwen3vl_4b_vlt_v6_core_sft_vllm.yaml`；旧坐标文本、pair、
+运行 Full。旧坐标文本、pair、
 无历史和无语义记忆配置只用于历史复现或消融。SUTrack 与 Hybrid 配置位于
 `configs/trackers/`；SUTrack checkpoint 通过
 `COGTRACK_SUTRACK_CHECKPOINT` 注入，不在 YAML 中写绝对路径。
@@ -158,40 +159,40 @@ rate、present miss rate 和 decision coverage。
 
 ## 数据与训练
 
-VLT-v6.3 使用 LaSOT train、TNL2K train 和 MGIT train 中同一序列的真实
+VLT-v6.4 使用 LaSOT train、TNL2K train 和 MGIT train 中同一序列的真实
 present/absent 帧。所有 reference/history 严格早于 current；负样本只来自原视频的
-真实目标消失帧。下面命令先生成可重放的采样计划：
+真实目标消失帧。大规模跟踪数据由统一脚本生成：
 
 ```bash
-python tracking/synthesize_vlt_v6_dataset.py \
-  --datasets lasot tnl2k mgit \
-  --mgit-version tiny --allow-missing-mgit-sequences \
-  --env-config configs/env.local.yaml \
-  --history-size 3 \
-  --max-samples-per-sequence 20 \
-  --absent-ratio 0.3 \
-  --output-dir data/plans/cogtrack_vlt_v6_core \
-  --plan-only
+bash scripts/generate_tracking_sft_data.sh \
+  cogtrack_vlt_v640_tracking_sft_r80_20_case20_mgit200_robust15_v1
 ```
 
-首轮三字段数据无需伪造 memory label；训练时只屏蔽 `memory_update` 的值。完整渲染、
-字段级 loss 校验与训练命令见 [docs/vlt_v6_core_sft.md](docs/vlt_v6_core_sft.md)。
-Qwen3-VL 使用 `[0,1000]` 相对 `xyxy`；
+当前生成器覆盖 27 种合法时间事件/历史质量/完整度组合。`tracking_sft` 的 present 和
+absent 行都只把 `memory_update:null` 当作 masked placeholder；bbox、status 和 JSON 结构
+仍完整监督。MGIT action 分段尽量全量用于独立状态数据，再额外生成约 1,500 条闭源
+Qwen3.6 OpenAI-compatible API 标签；详见
+[docs/data.md](docs/data.md)。两类 release 独立生成，并已打包为一次冻结 ViT 的
+Qwen3-VL-4B 全参 SFT。第一部分若需扩充 memory 监督，只在主数据完成后做可选的
+选择性 overlay 补标，不覆盖原始 `tracking_sft`。Qwen3-VL 使用 `[0,1000]` 相对 `xyxy`；
 Qwen2.5-VL 使用 processor resize 后绝对像素 `xyxy`，两代 JSONL 不能交叉使用。
 
 ```bash
 export MODEL_PATH=/models/Qwen3-VL-4B-Instruct
-export DATASET_ROOT=/datasets/cogtrack_vlt_v6_core
-export TRAIN_DATA="$DATASET_ROOT/ms_swift/qwen3_vl/train.jsonl"
-export VAL_DATA="$DATASET_ROOT/ms_swift/qwen3_vl/val.jsonl"
-export OUTPUT_DIR=/outputs/cogtrack/qwen3vl_4b_vlt_v6_core
+export DATASET_ROOT=/datasets/cogtrack_v640_mixed_sft_full_v1
+export TRAIN_DATA="$DATASET_ROOT/train.jsonl"
+export VAL_DATA="$DATASET_ROOT/val.jsonl"
+export OUTPUT_DIR=/outputs/cogtrack/qwen3vl_4b_vlt_v640_mixed_full
 export QWEN_MODEL_FAMILY=qwen3_vl
+export TUNER_TYPE=full SFT_SUPERVISION_PROFILE=mixed_sft
+export FREEZE_VIT=true FREEZE_LLM=false FREEZE_ALIGNER=false
+export DEEPSPEED=zero2
 
-bash scripts/train_qwen3vl_4b_vlt_v6_core.sh
+bash scripts/train_qwen3vl_4b_tracking_sft.sh
 ```
 
 详细监督边界、数据格式和训练说明见 [docs/training.md](docs/training.md)。状态标签冷启动
-与轨迹效用 GRPO 分别见 [docs/state_annotation.md](docs/state_annotation.md) 和
+与轨迹效用 GRPO 分别见 [docs/data.md](docs/data.md) 和
 [docs/grpo.md](docs/grpo.md)。当前完成度见 [docs/project_status.md](docs/project_status.md)，
 旧尝试统一保存在 [docs/archive/](docs/archive/README.md)。
 

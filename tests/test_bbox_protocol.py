@@ -32,16 +32,17 @@ MODEL_SIZE = (644, 364)
 def _payload(bbox, bbox_key):
     return json.dumps(
         {
-            "target_status": "present",
             bbox_key: bbox,
+            "status": "present",
             "memory_update": None,
         }
     )
 
 
 def test_json_key_differs_per_protocol() -> None:
-    # 字段名必须随协议变化，否则模型会被 norm1000 这个名字带向归一化。
-    assert bbox_protocol_json_key(BBOX_PROTOCOL_NORM1000) == "bbox_norm1000_xyxy"
+    # norm1000 使用 Qwen-VL 官方 grounding 约定 bbox_2d；绝对像素协议必须换名，
+    # 否则模型会把输入图像素坐标误当成 [0,1000] 相对坐标。
+    assert bbox_protocol_json_key(BBOX_PROTOCOL_NORM1000) == "bbox_2d"
     assert bbox_protocol_json_key(BBOX_PROTOCOL_QWEN_ABS_PIXEL) == "bbox_pixel_xyxy"
 
 
@@ -56,7 +57,7 @@ def test_prompt_carries_protocol_and_matching_key() -> None:
         prompt = builder(bbox_protocol=BBOX_PROTOCOL_QWEN_ABS_PIXEL, **kwargs)
         assert prompt.bbox_protocol == BBOX_PROTOCOL_QWEN_ABS_PIXEL
         assert "bbox_pixel_xyxy" in prompt.user_prompt
-        assert "bbox_norm1000_xyxy" not in prompt.user_prompt
+        assert "bbox_2d" not in prompt.user_prompt
         # 绝对像素协议下绝不能再要求模型归一化。
         assert "[0,1000]" not in prompt.user_prompt
         assert 'Never write a string such as\n  "no change"' in prompt.user_prompt
@@ -65,7 +66,7 @@ def test_prompt_carries_protocol_and_matching_key() -> None:
 def test_prompt_default_stays_norm1000_for_training_compatibility() -> None:
     # 通用 builder 默认保持 Qwen3/Qwen2-VL 的 norm1000；Qwen2.5 导出器会显式覆盖。
     assert build_pair_prompt().bbox_protocol == BBOX_PROTOCOL_NORM1000
-    assert "bbox_norm1000_xyxy" in build_pair_prompt().user_prompt
+    assert "bbox_2d" in build_pair_prompt().user_prompt
 
 
 def test_presence_only_training_prompt_and_runtime_schema_are_explicitly_versioned() -> None:
@@ -110,7 +111,7 @@ def test_qwen_abs_pixel_recovers_the_box_that_norm1000_destroys() -> None:
     model_numbers = [588, 240, 778, 386]
 
     norm_parsed = parse_tracking_output(
-        _payload(model_numbers, "bbox_norm1000_xyxy"),
+        _payload(model_numbers, "bbox_2d"),
         *ORIGINAL_SIZE,
         bbox_protocol=BBOX_PROTOCOL_NORM1000,
     )
@@ -139,7 +140,7 @@ def test_missing_model_image_size_is_a_parse_error_not_a_silent_fallback() -> No
 def test_wrong_key_for_protocol_is_rejected() -> None:
     with pytest.raises(ModelOutputParseError):
         parse_tracking_output(
-            _payload([588, 240, 778, 386], "bbox_norm1000_xyxy"),
+            _payload([588, 240, 778, 386], "bbox_2d"),
             *ORIGINAL_SIZE,
             bbox_protocol=BBOX_PROTOCOL_QWEN_ABS_PIXEL,
             model_image_size=MODEL_SIZE,

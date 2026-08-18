@@ -130,6 +130,9 @@ def _resolve_configs(
 def main() -> int:
     args = _parser().parse_args()
     try:
+        # 调试入口的高层顺序固定为：解析实验配置 → 构造数据集 → 选择观察策略 →
+        # DatasetRunner 逐序列执行。模型加载、Prompt 构造和 memory 更新都发生在
+        # tracker 内部，CLI 不应提前读取或加工模型输入。
         (
             tracker_spec,
             dataset_name,
@@ -162,6 +165,9 @@ def main() -> int:
         else:
             raise ValueError(f"未知 observation policy: {policy_kind}")
 
+        # DatasetRunner 会为每个序列创建全新的 tracker 状态，但同一进程中的
+        # Qwen backend 会复用已加载权重。单序列 debug 建议同时使用
+        # --sequence 与 --debug-frames，避免先跑完整 benchmark 才发现协议问题。
         runner = DatasetRunner(
             tracker_spec,
             environment,

@@ -1,4 +1,4 @@
-# CognitiveTrack VLT-v6.3 Presence + State Memory 协议
+# CognitiveTrack VLT-v6.4 Presence + State Memory 协议
 
 ## 1. 标注状态
 
@@ -11,19 +11,20 @@
 
 ## 2. 模型输出
 
-在线推理严格输出三个 JSON 字段。bbox 字段名随模型族变化，以下是 Qwen3-VL：
+当前 Qwen3-VL 在线推理严格输出三个 JSON 字段，顺序固定为 bbox、status、memory：
 
 ```json
-{"target_status":"present","bbox_norm1000_xyxy":[x1,y1,x2,y2],"memory_update":null}
+{"bbox_2d":[x1,y1,x2,y2],"status":"present","memory_update":null}
 ```
 
 `present` 已定义为“初始化指定的那个目标可见且可定位”，因此不再额外输出
 `identity_match` 或 `localizability`。`absent` 时 bbox 必须为 `null`。模型也不
 输出 `uncertain`、reasoning、target_text 或数值置信度。
 
-Qwen2.5-VL 的等价字段为 `bbox_pixel_xyxy`；同一响应只能出现其中一种 bbox 字段。
+`bbox_2d` 在 Qwen3-VL 主线中是 `[0,1000]` 归一化 `xyxy`。Qwen2.5-VL 的旧
+absolute-pixel 输出只作历史兼容，不能与当前训练视图交叉使用。
 
-以上是模型与运行时之间的输出协议，不等于训练模型的 System Prompt 文本。VLT-v6.3
+以上是模型与运行时之间的输出协议，不等于训练模型的 System Prompt 文本。VLT-v6.4
 native Prompt 不重复 JSON schema、坐标规则或格式惩罚，输出结构通过 SFT assistant
 答案学习。未经跟踪训练的通用 VLM 可以使用独立的 strict comparison Prompt 补充这些
 说明，但必须记录单独的 prompt profile/version。
@@ -32,8 +33,10 @@ native Prompt 不重复 JSON schema、坐标规则或格式惩罚，输出结构
 
 - `null`：沿用当前维护状态；普通位移、尺度变化、短时模糊或重复信息不得触发更新；
 - 非空短字符串：用完整、自包含的新状态替换旧状态，保留必要身份线索，并描述视觉可
-  核验、稳定且有助于后续判别的视角、构型或可见属性；
-- `absent` 时必须为 `null`，字符串不得写推理过程、坐标、置信度或背景瞬时关系。
+  核验、稳定且有助于后续判别的视角、构型、可见属性或可见状态；
+- GT 能确认“刚刚消失”时，`status=absent` 可以携带完整的消失状态快照；持续 absent
+  通常输出 `null`，避免每帧重复改写；重新出现时再用带重现语义的当前指代表达替换；
+- 字符串不得写推理过程、坐标、置信度或背景瞬时关系。
 
 初始化身份描述是不可变的永久锚点；当前状态初值等于初始化身份。非空更新只替换当前
 状态，不会改写身份。使用替换快照而非增量日志，可以避免多次拼接产生矛盾，并允许
@@ -42,7 +45,8 @@ native Prompt 不重复 JSON schema、坐标规则或格式惩罚，输出结构
 该字段固定放在 JSON 最后。`null` 路径生成更少 token，是当前的快路径；非空
 记忆自然延长生成，是慢路径。逐帧结果记录 `generated_tokens`，可直接量化二者开销。
 本地门控还会把 `"no change"`/`"无需更新"` 等误写字符串按 `null` 处理，并拒绝
-执行失败、重复文本、过密更新和容量溢出；初始化锚点永不覆盖。
+执行失败、重复文本、过密更新和容量溢出。present 更新要求合法 bbox；absent 更新只
+接受符合消失转折策略的状态快照。初始化锚点永不覆盖。
 
 ## 3. 执行状态
 
@@ -64,7 +68,7 @@ native Prompt 不重复 JSON schema、坐标规则或格式惩罚，输出结构
 - JSON 中无框为 `null`。
 - TXT 中无框为 `NaN NaN NaN NaN`。
 
-模型原始候选框不等于最终跟踪框。只有 `target_status=present` 且 bbox 合法时，
+模型原始候选框不等于最终跟踪框。只有 `status=present` 且 bbox 合法时，
 才将候选发布为 `target_bbox`。视觉正记忆还必须通过连续观测和可选几何一致性门控；
 语义记忆必须同时满足模型非空提议和本地安全门控。
 

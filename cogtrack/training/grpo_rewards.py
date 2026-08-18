@@ -19,6 +19,11 @@ import math
 import re
 from typing import Any, Mapping, Optional, Sequence
 
+from cogtrack.protocol import (
+    BBOX_PROTOCOL_NORM1000,
+    TARGET_STATUS_JSON_KEY,
+    bbox_protocol_json_key,
+)
 from cogtrack.training.swift_dataset import parse_training_tracking_answer
 
 try:  # 独立单元测试环境可以不安装 ms-swift。
@@ -86,7 +91,11 @@ def _parse_payload(value: Any) -> tuple[Optional[dict[str, Any]], bool]:
 def _presence(payload: Optional[Mapping[str, Any]]) -> Optional[str]:
     if not payload:
         return None
-    value = payload.get("target_presence", payload.get("target_status"))
+    # 依次接受：reward 侧派生列、模型输出字段名、canonical 审计列。
+    value = payload.get(
+        "target_presence",
+        payload.get(TARGET_STATUS_JSON_KEY, payload.get("target_status")),
+    )
     value = str(value).strip().lower() if value is not None else None
     return value if value in PRESENCE_VALUES else None
 
@@ -98,6 +107,10 @@ def _bbox_value(payload: Optional[Mapping[str, Any]]) -> tuple[Any, str]:
         return payload["bbox_xywh"], "xywh"
     if "bbox_xyxy" in payload:
         return payload["bbox_xyxy"], "xyxy"
+    norm1000_key = bbox_protocol_json_key(BBOX_PROTOCOL_NORM1000)
+    if norm1000_key in payload:
+        return payload[norm1000_key], "norm1000_xyxy"
+    # 兼容 canonical 审计列：行级仍保留 ``bbox_norm1000_xyxy`` 作为坐标系显式名。
     if "bbox_norm1000_xyxy" in payload:
         return payload["bbox_norm1000_xyxy"], "norm1000_xyxy"
     return payload.get("bbox"), str(payload.get("bbox_format", "norm1000_xyxy"))
@@ -165,8 +178,10 @@ def _reference_payload(
     # solution 未保留，也可以由独立监督列恢复参考答案。
     for key in (
         "target_presence",
+        TARGET_STATUS_JSON_KEY,
         "target_status",
         "bbox",
+        bbox_protocol_json_key(BBOX_PROTOCOL_NORM1000),
         "bbox_norm1000_xyxy",
         "bbox_format",
     ):

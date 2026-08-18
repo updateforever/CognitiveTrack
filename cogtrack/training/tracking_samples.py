@@ -18,7 +18,8 @@ import os
 import random
 import re
 import tempfile
-from dataclasses import asdict, dataclass
+from collections import Counter
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from typing import Sequence as TypingSequence
@@ -30,6 +31,7 @@ from cogtrack.context.builder import (
     PROMPT_PROFILE_VISUAL_V5,
     PROMPT_PROFILE_VLT_V6,
     history_layout_for_prompt_profile,
+    is_unsafe_init_language_scope,
     validate_prompt_profile,
 )
 from cogtrack.context.visual import (
@@ -48,27 +50,114 @@ from cogtrack.prompts import (
     build_visual_tracking_prompt,
     build_vlt_tracking_prompt,
 )
-from cogtrack.protocol import BoundingBoxError, clip_xywh, pixel_xywh_to_norm1000_xyxy
-from cogtrack.training.loss_mask import (
-    SFT_SUPERVISION_FULL,
-    SFT_SUPERVISION_TRACKING_CORE,
+from cogtrack.protocol import (
+    BBOX_PROTOCOL_NORM1000,
+    MEMORY_UPDATE_JSON_KEY,
+    TARGET_STATUS_JSON_KEY,
+    BoundingBoxError,
+    bbox_protocol_json_key,
+    clip_xywh,
+    pixel_xywh_to_norm1000_xyxy,
 )
+from cogtrack.training.loss_mask import (
+    MEMORY_STATE_MASKED_UNKNOWN,
+    SFT_SUPERVISION_FULL,
+    SFT_SUPERVISION_STATE_UPDATE_SFT,
+    SFT_SUPERVISION_TRACKING_SFT,
+    decide_memory_supervision_state,
+    validate_sft_supervision_profile,
+)
+from cogtrack.training.mgit_state_labels import load_action_segments
+from cogtrack.training.mgit_state_labels import state_text_at as mgit_state_at
 from pytracking.evaluation.data import Sequence
 
-SOURCE_SCHEMA_VERSION = "cogtrack.training.source.v6"
+SOURCE_SCHEMA_VERSION = "cogtrack.training.source.v7"
 SOURCE_SCHEMA_VERSION_V5 = "cogtrack.training.source.v5"
 MEMORY_SUPERVISION_DISABLED = "disabled"
 MEMORY_SUPERVISION_FEASIBILITY_NULL = "feasibility_null"
 MEMORY_SUPERVISION_EXPLICIT = "explicit"
 MEMORY_SUPERVISION_MASKED_NULL = "masked_null"
+#: 记忆监督三态的正式模式：标签文件**允许部分覆盖**。
+#:
+#: 与 ``explicit`` 的唯一区别是缺标签的帧退化为占位 ``null``（``masked_unknown``）而
+#: 不是报错。这是混合语料的必要条件：只有 MGIT 有逐帧 action 文本，LaSOT/TNL2K
+#: 天然没有任何记忆标签，但它们仍要提供 bbox 与存在性监督。
+#:
+#: 代价是拼错序列名不再报错，只会静默少监督。因此构建报告必须逐数据集给出标签
+#: 命中率，让覆盖率异常在报告里看得见。
+MEMORY_SUPERVISION_THREE_STATE = "three_state"
 MEMORY_SUPERVISION_MODES = frozenset(
     {
         MEMORY_SUPERVISION_DISABLED,
         MEMORY_SUPERVISION_FEASIBILITY_NULL,
         MEMORY_SUPERVISION_EXPLICIT,
         MEMORY_SUPERVISION_MASKED_NULL,
+        MEMORY_SUPERVISION_THREE_STATE,
     }
 )
+#: 会从标签文件回放逐帧记忆快照的模式。
+MEMORY_SUPERVISION_LABELLED_MODES = frozenset(
+    {MEMORY_SUPERVISION_EXPLICIT, MEMORY_SUPERVISION_THREE_STATE}
+)
+
+# 三图跟踪数据的可审计场景标签。模型输出仍然只有 present/absent；这里把长时跟踪中
+# 语义不同的连续可见、当前缺失和消失后重现拆开，保证采样报告不会把 reappearance
+# 悄悄淹没在普通 present 中。
+TRACKING_EVENT_CONTINUOUS_PRESENT = "continuous_present"
+TRACKING_EVENT_ABSENT = "absent"
+TRACKING_EVENT_REAPPEARANCE = "reappearance"
+TRACKING_EVENTS = frozenset(
+    {
+        TRACKING_EVENT_CONTINUOUS_PRESENT,
+        TRACKING_EVENT_ABSENT,
+        TRACKING_EVENT_REAPPEARANCE,
+    }
+)
+
+HISTORY_QUALITY_CLEAN = "clean"
+HISTORY_QUALITY_JITTER = "jitter_box"
+HISTORY_QUALITY_STALE = "stale_box"
+HISTORY_QUALITIES = frozenset(
+    {HISTORY_QUALITY_CLEAN, HISTORY_QUALITY_JITTER, HISTORY_QUALITY_STALE}
+)
+
+HISTORY_COMPLETENESS_H0 = "h0_reference_only"
+HISTORY_COMPLETENESS_H1 = "h1_one_observation"
+HISTORY_COMPLETENESS_H2 = "h2_two_observations"
+HISTORY_COMPLETENESS_H3 = "h3_three_observations"
+HISTORY_COMPLETENESS_LEVELS = frozenset(
+    {
+        HISTORY_COMPLETENESS_H0,
+        HISTORY_COMPLETENESS_H1,
+        HISTORY_COMPLETENESS_H2,
+        HISTORY_COMPLETENESS_H3,
+    }
+)
+
+# 固定三格历史中允许出现的 9 种 ``quality × completeness`` 形式。与三个时序事件
+# 做笛卡尔积后，就是 tracking SFT 需要审计的 27 种有效视觉组合。这里作为生成器的
+# 可执行约束，而不只是一段文档：任何越界组合都会在写 JSONL 前直接失败。
+VALID_HISTORY_QUALITIES_BY_COMPLETENESS = {
+    HISTORY_COMPLETENESS_H0: frozenset({HISTORY_QUALITY_CLEAN}),
+    HISTORY_COMPLETENESS_H1: frozenset(
+        {HISTORY_QUALITY_CLEAN, HISTORY_QUALITY_JITTER}
+    ),
+    HISTORY_COMPLETENESS_H2: HISTORY_QUALITIES,
+    HISTORY_COMPLETENESS_H3: HISTORY_QUALITIES,
+}
+TRACKING_SCENARIOS = frozenset(
+    f"{event}__{quality}"
+    for event in TRACKING_EVENTS
+    for quality in HISTORY_QUALITIES
+)
+VALID_VISUAL_COMBINATIONS = frozenset(
+    f"{event}__{quality}__{completeness}"
+    for event in TRACKING_EVENTS
+    for completeness, qualities in VALID_HISTORY_QUALITIES_BY_COMPLETENESS.items()
+    for quality in qualities
+)
+ABSENT_PHASES = frozenset({"start", "middle", "end", "single"})
+REFERENCE_SOURCES = frozenset({"sequence_anchor", "sampled_prior_present"})
 
 
 @dataclass(frozen=True)
@@ -78,19 +167,29 @@ class MemoryUpdateLabel:
     value: str | None
     source: str
     reviewed: bool = False
+    # True 表示"标注已证明这一帧不需要更新"，于是 null 是真负标签、参与 loss。
+    # 只有 value is None 时才有意义；默认 False，即缺标签的占位 null 仍被 mask。
+    verified_null: bool = False
 
     def __post_init__(self) -> None:
         if self.value is not None:
             if not isinstance(self.value, str) or not self.value.strip():
                 raise ValueError("非空 memory_update 标签必须是非空字符串")
             normalized = " ".join(self.value.split())
-            if len(normalized) > 256 or len(normalized.split()) > 30:
-                raise ValueError("memory_update 标签必须不超过 256 字符且不超过 30 个词")
+            # 30 words remains the generation target and API quality-gate default.  The
+            # renderer accepts a small number of reviewed frontier labels above that target
+            # so a completed annotation release does not need lossy post-hoc truncation.
+            if len(normalized) > 384 or len(normalized.split()) > 64:
+                raise ValueError("memory_update 标签必须不超过 384 字符且不超过 64 个词")
             object.__setattr__(self, "value", normalized)
         if not isinstance(self.source, str) or not self.source.strip():
             raise ValueError("memory label source 必须是非空字符串")
         if not isinstance(self.reviewed, bool):
             raise TypeError("memory label reviewed 必须是 bool")
+        if not isinstance(self.verified_null, bool):
+            raise TypeError("memory label verified_null 必须是 bool")
+        if self.verified_null and self.value is not None:
+            raise ValueError("verified_null=True 的标签不能同时带更新文本")
 
 
 @dataclass(frozen=True)
@@ -115,6 +214,7 @@ class TrackingSampleConfig:
     memory_supervision: str = MEMORY_SUPERVISION_DISABLED
     prompt_profile: str = PROMPT_PROFILE_VISUAL_V5
     force_history_image: bool = False
+    sft_supervision_profile: str | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in {"pair", "mosaic", "both"}:
@@ -154,6 +254,20 @@ class TrackingSampleConfig:
             raise ValueError("vlt_v6 训练样本必须使用 reference_mode=visual_box")
         if not isinstance(self.force_history_image, bool):
             raise TypeError("force_history_image 必须是 bool")
+        if self.sft_supervision_profile is not None:
+            object.__setattr__(
+                self,
+                "sft_supervision_profile",
+                validate_sft_supervision_profile(self.sft_supervision_profile),
+            )
+        if (
+            self.sft_supervision_profile == SFT_SUPERVISION_STATE_UPDATE_SFT
+            and self.memory_supervision
+            not in {MEMORY_SUPERVISION_EXPLICIT, MEMORY_SUPERVISION_THREE_STATE}
+        ):
+            raise ValueError(
+                "state_update_sft 必须使用 explicit/three_state 状态更新标签"
+            )
         if self.force_history_image and self.mode not in {"mosaic", "both"}:
             raise ValueError("force_history_image 需要 mode=mosaic 或 both")
         if self.force_history_image and self.reference_mode != REFERENCE_MODE_VISUAL_BOX:
@@ -183,6 +297,7 @@ class TrackingSampleBuildReport:
     reference_mode: str
     prompt_profile: str
     force_history_image: bool
+    sft_supervision_profile: str
     history_layout_version: str | None
     source_jsonl: str
     image_root: str
@@ -202,6 +317,13 @@ class TrackingSampleBuildReport:
     memory_non_null_count: int
     semantic_memory_input_count: int
     visual_marker_version: str | None
+    temporal_event_counts: dict[str, int]
+    absent_phase_counts: dict[str, int]
+    history_quality_counts: dict[str, int]
+    history_completeness_counts: dict[str, int]
+    tracking_scenario_counts: dict[str, int]
+    visual_combination_counts: dict[str, int]
+    reference_source_counts: dict[str, int]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -222,6 +344,13 @@ class _MutableStats:
     memory_null_count: int = 0
     memory_non_null_count: int = 0
     semantic_memory_input_count: int = 0
+    temporal_event_counts: Counter[str] = field(default_factory=Counter)
+    absent_phase_counts: Counter[str] = field(default_factory=Counter)
+    history_quality_counts: Counter[str] = field(default_factory=Counter)
+    history_completeness_counts: Counter[str] = field(default_factory=Counter)
+    tracking_scenario_counts: Counter[str] = field(default_factory=Counter)
+    visual_combination_counts: Counter[str] = field(default_factory=Counter)
+    reference_source_counts: Counter[str] = field(default_factory=Counter)
 
 
 def _safe_component(value: str) -> str:
@@ -246,9 +375,7 @@ def _initial_target_text(
         return "", "disabled"
     scope = str(sequence.metadata.get("language_scope") or "").strip().lower()
     description = str(sequence.language_query or "").strip()
-    unsafe_story = scope == "full_video_story" or (
-        sequence.dataset == "mgit" and scope != "initial_target"
-    )
+    unsafe_story = is_unsafe_init_language_scope(scope, dataset=sequence.dataset)
     if description and not unsafe_story:
         return description, "dataset_initial_language"
     object_class = str(sequence.object_class or "").strip()
@@ -259,26 +386,71 @@ def _initial_target_text(
     return "", "unavailable"
 
 
+def _reference_anchored_target_text(
+    sequence: Sequence,
+    *,
+    reference_frame_id: int,
+    fallback_text: str,
+    fallback_source: str,
+    segment_cache: dict[str, list[Any]],
+) -> tuple[str, str]:
+    """把身份文本重锚到模板帧真正所在的标注段。
+
+    只对 MGIT 生效：它的 ``language_scope=first_action_description`` 是**序列开头**那
+    一段动作的文本，而逐 case 随机模板会把 Image 1 挪到中段。此时沿用开头文本等于给
+    模型一张与描述不符的模板图，是凭空造出的图文矛盾。其余数据集的 ``initial_target``
+    是静态物体短语（"a white car"），任何一帧都成立，原样返回。
+
+    找不到覆盖模板帧的段、或段文本因重叠歧义时，退回序列级文本而不是编造：宁可让身份
+    文本略旧，也不能写一句没有标注依据的描述。
+    """
+
+    if str(sequence.dataset).strip().lower() != "mgit":
+        return fallback_text, fallback_source
+    description_path = str(sequence.metadata.get("description_path") or "").strip()
+    if not description_path:
+        return fallback_text, fallback_source
+    segments = segment_cache.get(description_path)
+    if segments is None:
+        try:
+            segments = list(load_action_segments(description_path))
+        except (OSError, ValueError):
+            # 标注缺失或损坏不该让整批数据生成失败；退回序列级文本即可。
+            segments = []
+        segment_cache[description_path] = segments
+    if not segments:
+        return fallback_text, fallback_source
+    text, ambiguous = mgit_state_at(segments, reference_frame_id)
+    if ambiguous or not text:
+        return fallback_text, fallback_source
+    return text, "mgit_reference_action_description"
+
+
 def _latest_prior_semantic_memory(
     *,
     memory_supervision: str,
     labels_by_sequence: Mapping[str, Mapping[int, Any]] | None,
     sequence_key: str,
     frame_id: int,
+    min_frame_id: int = 0,
 ) -> str:
-    """从严格早于 current 的已标注更新中选最近一条记忆。
+    """从 ``[min_frame_id, frame_id)`` 内的已标注更新中选最近一条记忆。
 
     Phase-1 ``masked_null`` 没有可靠记忆标签，因此输入明确为空；不会把当前标签或
     未来确认帧泄漏进 Prompt。显式记忆阶段才启用这一回放路径。
+
+    ``min_frame_id`` 是模板帧：每个 case 都是"从模板帧开始跟踪"的伪 episode，模板帧
+    之前的更新在这条 episode 里根本没被观测过，回放它等于给模型一段它无从得知的记忆。
     """
 
-    if memory_supervision != MEMORY_SUPERVISION_EXPLICIT or labels_by_sequence is None:
+    if memory_supervision not in MEMORY_SUPERVISION_LABELLED_MODES or labels_by_sequence is None:
         return ""
     frame_labels = labels_by_sequence.get(sequence_key, {})
     candidates: list[tuple[int, MemoryUpdateLabel]] = []
+    lower_bound = int(min_frame_id)
     for candidate_frame, raw_label in frame_labels.items():
         candidate_id = int(candidate_frame)
-        if candidate_id >= frame_id:
+        if candidate_id >= frame_id or candidate_id < lower_bound:
             continue
         label = _coerce_memory_label(raw_label)
         if label.value:
@@ -329,6 +501,146 @@ def _presence(sequence: Sequence, frame_id: int) -> str | None:
     if sequence.target_visible is not None:
         return "present" if bool(sequence.target_visible[frame_id]) else "absent"
     return "present" if _raw_bbox(sequence, frame_id) is not None else None
+
+
+def _presence_timeline(sequence: Sequence) -> tuple[str | None, ...]:
+    """一次性缓存整条序列的 presence，供场景分类确定性重放。
+
+    场景标签只进入 metadata 和构建报告，不进入模型 Prompt。使用完整 GT 时序来标记
+    ``reappearance`` 是合法的离线采样/审计信息；模型实际看到的仍然只有严格早于
+    current 的三图输入。
+    """
+
+    return tuple(_presence(sequence, frame_id) for frame_id in range(len(sequence)))
+
+
+def _history_completeness(
+    history_frame_ids: TypingSequence[int],
+    *,
+    reference_frame_id: int,
+) -> str:
+    """把固定三格历史还原成 H0/H1/H2/H3 的真实观测数量。
+
+    H0 的三格都是 reference padding；H1/H2 会在右侧复制最近观测，因此不能直接用
+    列数判断，只能统计不同帧号。动态历史严格晚于 reference，所以 H0 与 H1 不会混淆。
+    """
+
+    unique_ids = set(int(frame_id) for frame_id in history_frame_ids)
+    if not unique_ids or unique_ids == {int(reference_frame_id)}:
+        return HISTORY_COMPLETENESS_H0
+    observation_count = len(unique_ids)
+    if observation_count == 1:
+        return HISTORY_COMPLETENESS_H1
+    if observation_count == 2:
+        return HISTORY_COMPLETENESS_H2
+    return HISTORY_COMPLETENESS_H3
+
+
+def _temporal_tracking_event(
+    timeline: TypingSequence[str | None],
+    *,
+    current_frame_id: int,
+    reference_frame_id: int,
+    history_frame_ids: TypingSequence[int],
+) -> str:
+    """区分连续 present、当前 absent 与消失后重现。
+
+    ``reappearance`` 相对于模型真正收到的最近可信观测定义：若该观测之后、current
+    之前至少出现过一个 GT absent 帧，而 current 又恢复 present，就属于重现。这样
+    即使视频更早处发生过消失，只要 Image 2 已包含重现后的可信观测，当前仍会正确
+    归为 ``continuous_present``。
+    """
+
+    current = timeline[current_frame_id]
+    if current == "absent":
+        return TRACKING_EVENT_ABSENT
+    if current != "present":
+        raise ValueError(f"current frame {current_frame_id} 缺少可验证 presence")
+    trusted_ids = [
+        int(frame_id)
+        for frame_id in history_frame_ids
+        if int(reference_frame_id) < int(frame_id) < int(current_frame_id)
+    ]
+    last_trusted = max(trusted_ids, default=int(reference_frame_id))
+    if any(state == "absent" for state in timeline[last_trusted + 1 : current_frame_id]):
+        return TRACKING_EVENT_REAPPEARANCE
+    return TRACKING_EVENT_CONTINUOUS_PRESENT
+
+
+def _absent_phase(
+    timeline: TypingSequence[str | None], current_frame_id: int
+) -> str | None:
+    """标记 absent 帧位于连续缺失区间的 start/middle/end/single。"""
+
+    if timeline[current_frame_id] != "absent":
+        return None
+    previous_absent = (
+        current_frame_id > 0 and timeline[current_frame_id - 1] == "absent"
+    )
+    next_absent = (
+        current_frame_id + 1 < len(timeline)
+        and timeline[current_frame_id + 1] == "absent"
+    )
+    if not previous_absent and not next_absent:
+        return "single"
+    if not previous_absent:
+        return "start"
+    if not next_absent:
+        return "end"
+    return "middle"
+
+
+def _annotate_tracking_scenario(
+    row: dict[str, Any],
+    *,
+    timeline: TypingSequence[str | None],
+    sequence_anchor_frame_id: int,
+    reference_frame_id: int,
+    current_frame_id: int,
+    history_frame_ids: TypingSequence[int],
+    corruption: str | None,
+) -> None:
+    """把 9 个主场景和 27 个有效视觉组合写入行级 metadata。"""
+
+    quality = corruption or HISTORY_QUALITY_CLEAN
+    if quality not in HISTORY_QUALITIES:
+        raise ValueError(f"未知 history quality: {quality}")
+    completeness = _history_completeness(
+        history_frame_ids, reference_frame_id=reference_frame_id
+    )
+    event = _temporal_tracking_event(
+        timeline,
+        current_frame_id=current_frame_id,
+        reference_frame_id=reference_frame_id,
+        history_frame_ids=history_frame_ids,
+    )
+    allowed_qualities = VALID_HISTORY_QUALITIES_BY_COMPLETENESS[completeness]
+    if quality not in allowed_qualities:
+        raise ValueError(
+            f"{completeness} 不允许 history_quality={quality}；"
+            f"允许值为 {sorted(allowed_qualities)}"
+        )
+    metadata = row["metadata"]
+    metadata["temporal_event"] = event
+    metadata["absent_phase"] = _absent_phase(timeline, current_frame_id)
+    metadata["history_quality"] = quality
+    metadata["history_completeness"] = completeness
+    metadata["tracking_scenario"] = f"{event}__{quality}"
+    metadata["visual_combination"] = f"{event}__{quality}__{completeness}"
+    metadata["reference_source"] = (
+        "sequence_anchor"
+        if reference_frame_id == sequence_anchor_frame_id
+        else "sampled_prior_present"
+    )
+    metadata["reference_current_gap"] = current_frame_id - reference_frame_id
+
+
+def _counter_with_all_keys(
+    counter: Mapping[str, int], keys: Iterable[str]
+) -> dict[str, int]:
+    """稳定输出完整分类表；未采到的合法类别显式记为 0。"""
+
+    return {key: int(counter.get(key, 0)) for key in sorted(keys)}
 
 
 def _clip_bbox_to_image(
@@ -397,15 +709,37 @@ def _corrupt_history_panels(
         raise ValueError("corrupted history requires at least one panel")
     digest = hashlib.sha256(seed_key.encode("utf-8")).digest()
     panel_index = digest[0] % len(panels)
-    mode = "stale_box" if digest[1] % 3 == 0 and len(panels) > 1 else "jitter_box"
+    # padding 后始终有三格，不能用 len(panels)>1 判断 stale 是否可用。H1 会变成
+    # [h1,h1,h1]；从另一格复制框只是名义上的 corruption，像素一个都没变。
+    # stale 必须来自不同历史帧且 bbox 确实不同，否则确定性降级为 jitter。
+    distinct_frame_ids = {int(item[0]) for item in panels}
+    mode = (
+        HISTORY_QUALITY_STALE
+        if digest[1] % 3 == 0 and len(distinct_frame_ids) >= 2
+        else HISTORY_QUALITY_JITTER
+    )
     corrupted = list(panels)
     frame_id, image, bbox = corrupted[panel_index]
     x, y, width, height = bbox
-    if mode == "stale_box":
-        source_index = (panel_index - 1) if panel_index > 0 else 1
-        stale_bbox = corrupted[source_index][2]
-        bbox = stale_bbox
-    else:
+    if mode == HISTORY_QUALITY_STALE:
+        candidates = [
+            index
+            for index, item in enumerate(corrupted)
+            if int(item[0]) != int(frame_id)
+            and not np.allclose(item[2], bbox, rtol=0.0, atol=1e-6)
+        ]
+        if candidates:
+            source_index = candidates[digest[2] % len(candidates)]
+            stale_bbox = _clip_bbox_to_image(corrupted[source_index][2], image)
+            if stale_bbox is not None and not np.allclose(
+                stale_bbox, bbox, rtol=0.0, atol=1e-6
+            ):
+                bbox = stale_bbox
+            else:
+                mode = HISTORY_QUALITY_JITTER
+        else:
+            mode = HISTORY_QUALITY_JITTER
+    if mode == HISTORY_QUALITY_JITTER:
         direction_x = -1.0 if digest[2] & 1 else 1.0
         direction_y = -1.0 if digest[3] & 1 else 1.0
         image_height, image_width = image.shape[:2]
@@ -423,6 +757,8 @@ def _corrupt_history_panels(
         if clipped is None:
             raise ValueError(f"无法构造有效 corrupted history bbox: frame={frame_id}")
         bbox = clipped
+    if np.allclose(bbox, corrupted[panel_index][2], rtol=0.0, atol=1e-6):
+        raise ValueError(f"history corruption 未实际改变 bbox: frame={frame_id} mode={mode}")
     corrupted[panel_index] = (frame_id, image, bbox)
     return corrupted, mode
 
@@ -600,17 +936,19 @@ def _answer(
     memory_supervision: str,
     memory_label: MemoryUpdateLabel | None,
 ) -> dict[str, Any]:
+    # 字段顺序与模型可见协议一致：bbox -> status -> memory_update（最后）。
+    bbox_key = bbox_protocol_json_key(BBOX_PROTOCOL_NORM1000)
     if presence == "present":
         if bbox_norm1000_xyxy is None:
             raise ValueError("present 训练样本必须包含有效的 norm1000 bbox")
         answer: dict[str, Any] = {
-            "target_status": "present",
-            "bbox_norm1000_xyxy": list(bbox_norm1000_xyxy) if bbox_norm1000_xyxy else None,
+            bbox_key: list(bbox_norm1000_xyxy) if bbox_norm1000_xyxy else None,
+            TARGET_STATUS_JSON_KEY: "present",
         }
     else:
         answer = {
-            "target_status": "absent",
-            "bbox_norm1000_xyxy": None,
+            bbox_key: None,
+            TARGET_STATUS_JSON_KEY: "absent",
         }
 
     if memory_supervision == MEMORY_SUPERVISION_DISABLED:
@@ -619,9 +957,8 @@ def _answer(
         return answer
     if memory_label is None:
         raise ValueError("三字段样本必须有显式 MemoryUpdateLabel")
-    if presence == "absent" and memory_label.value is not None:
-        raise ValueError("absent 样本的 memory_update 必须为 null")
-    answer["memory_update"] = memory_label.value
+    value = memory_label.value
+    answer[MEMORY_UPDATE_JSON_KEY] = value
     return answer
 
 
@@ -648,6 +985,7 @@ def _record(
     semantic_memory: str,
     prompt_profile: str,
     force_history_image: bool,
+    sft_supervision_profile: str | None,
 ) -> dict[str, Any]:
     images = [reference_path]
     if history_path is not None:
@@ -678,8 +1016,10 @@ def _record(
         "user_prompt": "<image>" * len(images) + "\n" + prompt.user_prompt,
         "assistant": answer,
         "images": images,
-        "target_status": answer["target_status"],
-        "bbox_norm1000_xyxy": answer["bbox_norm1000_xyxy"],
+        # 行级审计列保留显式坐标系名 ``bbox_norm1000_xyxy``；模型可见字段名由
+        # answer 决定（当前为 ``bbox_2d``）。两者刻意不同名，便于排查混用。
+        "target_status": answer[TARGET_STATUS_JSON_KEY],
+        "bbox_norm1000_xyxy": answer[bbox_protocol_json_key(BBOX_PROTOCOL_NORM1000)],
         "bbox_format": "norm1000_xyxy",
         "metadata": {
             "dataset": sequence.dataset,
@@ -708,11 +1048,18 @@ def _record(
             "memory_supervision": memory_supervision,
             "memory_label_source": memory_label.source if memory_label is not None else None,
             "memory_label_reviewed": memory_label.reviewed if memory_label is not None else None,
-            "memory_loss_masked": memory_supervision == MEMORY_SUPERVISION_MASKED_NULL,
+            # tracking_sft 表示"本行可能带 masked 状态更新值，需要 loss mask 插件"。
+            # 三态模式必然含 masked_unknown 行，因此同样使用该档位；具体某行
+            # 是否真的被 mask 由下面的 memory_supervision_state 决定。
             "sft_supervision_profile": (
-                SFT_SUPERVISION_TRACKING_CORE
-                if memory_supervision == MEMORY_SUPERVISION_MASKED_NULL
-                else SFT_SUPERVISION_FULL
+                validate_sft_supervision_profile(sft_supervision_profile)
+                if sft_supervision_profile is not None
+                else (
+                    SFT_SUPERVISION_TRACKING_SFT
+                    if memory_supervision
+                    in {MEMORY_SUPERVISION_MASKED_NULL, MEMORY_SUPERVISION_THREE_STATE}
+                    else SFT_SUPERVISION_FULL
+                )
             ),
             "initial_target_text": target_text,
             "initial_target_text_source": target_text_source,
@@ -730,6 +1077,23 @@ def _record(
     }
     if "memory_update" in answer:
         row["memory_update"] = answer["memory_update"]
+        # 记忆监督三态：absent/hard-null、present+文本/verified-update、
+        # present+null/masked-unknown。源层与训练视图共用同一判定函数。
+        #
+        # present + 已证明无需更新（verified_null）也是 hard-null。这一位只能由标签
+        # 文件显式声明，不能由 present+null 反推，否则"缺标签"会被静默当成负标签。
+        # absent 行不看这一位：absent 本身已经蕴含 hard-null。
+        verified_null = bool(memory_label is not None and memory_label.verified_null)
+        memory_state = decide_memory_supervision_state(
+            status=presence,
+            memory_update=answer["memory_update"],
+            verified_null=verified_null,
+        )
+        row["metadata"]["memory_supervision_state"] = memory_state
+        row["metadata"]["memory_loss_masked"] = memory_state == MEMORY_STATE_MASKED_UNKNOWN
+        # 导出层会 dict(metadata) 全量复制，因此该键能跨越 source->训练视图边界，
+        # 让两侧用同一输入复算出同一状态，而不是各自猜。
+        row["metadata"]["memory_verified_null"] = verified_null
     return row
 
 
@@ -744,6 +1108,7 @@ def _coerce_memory_label(value: Any) -> MemoryUpdateLabel:
         value=value.get("memory_update"),
         source=str(value.get("source", "")),
         reviewed=value.get("reviewed", False),
+        verified_null=bool(value.get("verified_null", False)),
     )
 
 
@@ -753,7 +1118,9 @@ def load_memory_labels_jsonl(
     """读取可审计的逐帧 ``memory_update`` 标签。
 
     JSONL 每行对应一个 current frame，必须包含 ``dataset``、``sequence``、
-    ``frame_id``、``memory_update`` 和非空 ``source``。把读取逻辑放在训练模块而非
+    ``frame_id``、``memory_update`` 和非空 ``source``。可选布尔字段
+    ``verified_null`` 表示 ``memory_update=null`` 是**已证明**的负标签（present 帧
+    也会因此变成 ``verified_hard_null`` 并参与 loss）；缺省为 ``False``，即占位 null。把读取逻辑放在训练模块而非
     某个 CLI 中，保证单数据集 dry-run 与多数据集正式构建执行完全相同的校验。
     """
 
@@ -789,6 +1156,7 @@ def load_memory_labels_jsonl(
                 value=row["memory_update"],
                 source=str(row.get("source", "")),
                 reviewed=row.get("reviewed", False),
+                verified_null=bool(row.get("verified_null", False)),
             )
     if not labels:
         raise ValueError(f"memory label 文件为空：{label_path}")
@@ -816,12 +1184,31 @@ def _memory_label_for_frame(
             source="masked_null_unsupervised_memory_v1",
             reviewed=False,
         )
+    partial_ok = memory_supervision == MEMORY_SUPERVISION_THREE_STATE
     if labels_by_sequence is None or sequence_key not in labels_by_sequence:
+        if partial_ok:
+            return _unlabelled_memory_label()
         raise ValueError(f"显式 memory 监督缺少序列标签：{sequence_key}")
     frame_labels = labels_by_sequence[sequence_key]
     if frame_id not in frame_labels:
+        if partial_ok:
+            return _unlabelled_memory_label()
         raise ValueError(f"显式 memory 监督缺少帧标签：{sequence_key} frame={frame_id}")
     return _coerce_memory_label(frame_labels[frame_id])
+
+
+def _unlabelled_memory_label() -> MemoryUpdateLabel:
+    """三态模式下没有标签的帧：占位 ``null``，其值不参与 loss。
+
+    来源串刻意与 ``masked_null`` 模式不同，这样构建报告能区分"整个数据集都没有
+    标签"和"这一帧在有标签的语料里没命中"。
+    """
+
+    return MemoryUpdateLabel(
+        value=None,
+        source="three_state_unlabelled_frame_v1",
+        reviewed=False,
+    )
 
 
 def build_tracking_samples(
@@ -854,10 +1241,20 @@ def build_tracking_samples(
     """
 
     options = config or TrackingSampleConfig()
-    if options.memory_supervision == MEMORY_SUPERVISION_EXPLICIT and memory_labels_by_sequence is None:
-        raise ValueError("memory_supervision=explicit 必须提供 memory_labels_by_sequence")
-    if options.memory_supervision != MEMORY_SUPERVISION_EXPLICIT and memory_labels_by_sequence is not None:
-        raise ValueError("只有 memory_supervision=explicit 才能提供 memory_labels_by_sequence")
+    if (
+        options.memory_supervision in MEMORY_SUPERVISION_LABELLED_MODES
+        and memory_labels_by_sequence is None
+    ):
+        raise ValueError(
+            f"memory_supervision={options.memory_supervision} 必须提供 memory_labels_by_sequence"
+        )
+    if (
+        options.memory_supervision not in MEMORY_SUPERVISION_LABELLED_MODES
+        and memory_labels_by_sequence is not None
+    ):
+        raise ValueError(
+            f"memory_supervision={options.memory_supervision} 不接受 memory_labels_by_sequence"
+        )
     root = Path(output_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     source_path = root / "source_samples.jsonl"
@@ -946,6 +1343,10 @@ def build_tracking_samples(
                     enabled=options.use_language_description,
                     prompt_profile=options.prompt_profile,
                 )
+                # 只计算一次完整 presence 时序。它只用于离线场景审计，不进入 Prompt。
+                presence_timeline = _presence_timeline(sequence)
+                # 每条序列只解析一次 action 标注；随机模板下同一序列会反复查询不同帧。
+                segment_cache: dict[str, list[Any]] = {}
 
                 sequence_samples = 0
                 planned_frame_ids = None
@@ -968,6 +1369,8 @@ def build_tracking_samples(
                     reference_frame_id = anchor_frame_id
                     reference_bbox_norm = anchor_bbox_norm
                     reference_relative = anchor_reference_relative
+                    reference_image = anchor_image
+                    reference_bbox = anchor_bbox
                     if planned_reference_frame_ids is not None:
                         reference_frame_id = int(planned_reference_frame_ids[planned_index])
                         planned_index += 1
@@ -1016,6 +1419,19 @@ def build_tracking_samples(
                                 )
                                 written_assets.add(reference_asset_for_case)
                             reference_relative = reference_asset_for_case.relative_to(root).as_posix()
+                    # 模板帧一旦离开序列锚点，身份文本必须跟着重锚，否则 Image 1 与
+                    # initial_identity_description 描述的是同一目标的两个不同时刻。
+                    case_target_text, case_target_text_source = (
+                        (target_text, target_text_source)
+                        if reference_frame_id == anchor_frame_id
+                        else _reference_anchored_target_text(
+                            sequence,
+                            reference_frame_id=reference_frame_id,
+                            fallback_text=target_text,
+                            fallback_source=target_text_source,
+                            segment_cache=segment_cache,
+                        )
+                    )
                     current_asset = asset_dir / f"current_{frame_id:08d}.jpg"
                     current_source = (
                         current_asset
@@ -1061,6 +1477,7 @@ def build_tracking_samples(
                         labels_by_sequence=memory_labels_by_sequence,
                         sequence_key=plan_key,
                         frame_id=frame_id,
+                        min_frame_id=reference_frame_id,
                     )
                     include_memory_update = options.memory_supervision != MEMORY_SUPERVISION_DISABLED
 
@@ -1074,13 +1491,13 @@ def build_tracking_samples(
                             )
                             pair_prompt = prompt_builder(
                                 history_count=0,
-                                target_text=target_text,
+                                target_text=case_target_text,
                                 semantic_memory=semantic_memory,
                                 include_memory_update=include_memory_update,
                             )
                         else:
                             pair_prompt = build_pair_prompt(
-                                target_text=target_text,
+                                target_text=case_target_text,
                                 reference_has_box=False,
                                 reference_bbox_norm1000_xyxy=reference_bbox_norm,
                                 include_memory_update=include_memory_update,
@@ -1127,14 +1544,14 @@ def build_tracking_samples(
                                 )
                                 prompt = prompt_builder(
                                     history_count=len(panels),
-                                    target_text=target_text,
+                                    target_text=case_target_text,
                                     semantic_memory=semantic_memory,
                                     include_memory_update=include_memory_update,
                                 )
                             else:
                                 prompt = build_mosaic_prompt(
                                     len(panels),
-                                    target_text=target_text,
+                                    target_text=case_target_text,
                                     reference_bbox_norm1000_xyxy=reference_bbox_norm,
                                     include_memory_update=include_memory_update,
                                 )
@@ -1198,17 +1615,18 @@ def build_tracking_samples(
                                 )
                                 stats.corrupted_mosaic_count += int(corruption is not None)
                         elif options.force_history_image:
-                            # 最早观测尚无动态历史时，用初始化锚点填满三格。它严格早于
-                            # current；重复格只是 padding，不伪造三次预测。
+                            # 最早观测尚无动态历史时，用本 case 的 Image 1 reference
+                            # 填满三格。reference 可以是任意更早 present 帧，不能偷偷
+                            # 回退到序列 frame 0；重复格只是 padding，不伪造三次预测。
                             fallback_panels = arrange_history_items(
-                                ((anchor_frame_id, anchor_image, anchor_bbox),),
+                                ((reference_frame_id, reference_image, reference_bbox),),
                                 layout=history_layout_for_prompt_profile(
                                     options.prompt_profile
                                 ),
                             )
                             history_asset = asset_dir / (
                                 f"history_{reference_frame_id:08d}_before_{frame_id:08d}"
-                                "_anchor_fallback.jpg"
+                                "_reference_fallback.jpg"
                             )
                             _write_rgb(
                                 history_asset,
@@ -1230,7 +1648,7 @@ def build_tracking_samples(
                             )
                             prompt = build_vlt_tracking_prompt(
                                 history_count=len(fallback_panels),
-                                target_text=target_text,
+                                target_text=case_target_text,
                                 semantic_memory=semantic_memory,
                                 include_memory_update=include_memory_update,
                             )
@@ -1255,13 +1673,13 @@ def build_tracking_samples(
                                 )
                                 fallback_prompt = prompt_builder(
                                     history_count=0,
-                                    target_text=target_text,
+                                    target_text=case_target_text,
                                     semantic_memory=semantic_memory,
                                     include_memory_update=include_memory_update,
                                 )
                             else:
                                 fallback_prompt = build_pair_prompt(
-                                    target_text=target_text,
+                                    target_text=case_target_text,
                                     reference_has_box=False,
                                     reference_bbox_norm1000_xyxy=reference_bbox_norm,
                                     include_memory_update=include_memory_update,
@@ -1295,24 +1713,40 @@ def build_tracking_samples(
                             reference_mode=options.reference_mode,
                             memory_supervision=options.memory_supervision,
                             memory_label=memory_label,
-                            target_text=target_text,
-                            target_text_source=target_text_source,
+                            target_text=case_target_text,
+                            target_text_source=case_target_text_source,
                             semantic_memory=semantic_memory,
                             prompt_profile=options.prompt_profile,
                             force_history_image=options.force_history_image,
+                            sft_supervision_profile=options.sft_supervision_profile,
                         )
                         row["metadata"]["source_split"] = sequence.metadata.get("split")
-                        row["metadata"]["uses_initial_target_text"] = bool(target_text)
+                        row["metadata"]["uses_initial_target_text"] = bool(case_target_text)
                         row["metadata"]["used_language_description"] = (
-                            target_text_source == "dataset_initial_language"
+                            case_target_text_source == "dataset_initial_language"
                         )
                         row["metadata"]["temporal_case"] = presence
                         row["metadata"]["history_corruption"] = corruption
+                        _annotate_tracking_scenario(
+                            row,
+                            timeline=presence_timeline,
+                            sequence_anchor_frame_id=anchor_frame_id,
+                            reference_frame_id=reference_frame_id,
+                            current_frame_id=frame_id,
+                            history_frame_ids=history_ids,
+                            corruption=corruption,
+                        )
                         row["metadata"]["history_anchor_fallback"] = bool(
                             options.force_history_image
                             and effective_mode == "mosaic"
                             and bool(history_ids)
                             and set(history_ids) == {anchor_frame_id}
+                        )
+                        row["metadata"]["history_reference_fallback"] = bool(
+                            options.force_history_image
+                            and effective_mode == "mosaic"
+                            and bool(history_ids)
+                            and set(history_ids) == {reference_frame_id}
                         )
                         if corruption is not None:
                             row["id"] = f"{row['id']}::{corruption}"
@@ -1327,6 +1761,19 @@ def build_tracking_samples(
                             stats.memory_null_count += int(memory_label.value is None)
                             stats.memory_non_null_count += int(memory_label.value is not None)
                         stats.semantic_memory_input_count += int(bool(semantic_memory))
+                        metadata = row["metadata"]
+                        stats.temporal_event_counts[metadata["temporal_event"]] += 1
+                        if metadata["absent_phase"] is not None:
+                            stats.absent_phase_counts[metadata["absent_phase"]] += 1
+                        stats.history_quality_counts[metadata["history_quality"]] += 1
+                        stats.history_completeness_counts[
+                            metadata["history_completeness"]
+                        ] += 1
+                        stats.tracking_scenario_counts[metadata["tracking_scenario"]] += 1
+                        stats.visual_combination_counts[
+                            metadata["visual_combination"]
+                        ] += 1
+                        stats.reference_source_counts[metadata["reference_source"]] += 1
                 stats.sequences_with_samples += int(sequence_samples > 0)
 
         if stats.sequence_count == 0:
@@ -1353,6 +1800,16 @@ def build_tracking_samples(
         reference_mode=options.reference_mode,
         prompt_profile=options.prompt_profile,
         force_history_image=options.force_history_image,
+        sft_supervision_profile=(
+            validate_sft_supervision_profile(options.sft_supervision_profile)
+            if options.sft_supervision_profile is not None
+            else (
+                SFT_SUPERVISION_TRACKING_SFT
+                if options.memory_supervision
+                in {MEMORY_SUPERVISION_MASKED_NULL, MEMORY_SUPERVISION_THREE_STATE}
+                else SFT_SUPERVISION_FULL
+            )
+        ),
         history_layout_version=(
             history_layout_for_prompt_profile(options.prompt_profile)
             if options.mode in {"mosaic", "both"}
@@ -1378,6 +1835,27 @@ def build_tracking_samples(
         visual_marker_version=(
             VISUAL_MARKER_VERSION if options.reference_mode == REFERENCE_MODE_VISUAL_BOX else None
         ),
+        temporal_event_counts=_counter_with_all_keys(
+            stats.temporal_event_counts, TRACKING_EVENTS
+        ),
+        absent_phase_counts=_counter_with_all_keys(
+            stats.absent_phase_counts, ABSENT_PHASES
+        ),
+        history_quality_counts=_counter_with_all_keys(
+            stats.history_quality_counts, HISTORY_QUALITIES
+        ),
+        history_completeness_counts=_counter_with_all_keys(
+            stats.history_completeness_counts, HISTORY_COMPLETENESS_LEVELS
+        ),
+        tracking_scenario_counts=_counter_with_all_keys(
+            stats.tracking_scenario_counts, TRACKING_SCENARIOS
+        ),
+        visual_combination_counts=_counter_with_all_keys(
+            stats.visual_combination_counts, VALID_VISUAL_COMBINATIONS
+        ),
+        reference_source_counts=_counter_with_all_keys(
+            stats.reference_source_counts, REFERENCE_SOURCES
+        ),
     )
     report_path.write_text(json.dumps(report.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return report
@@ -1386,13 +1864,33 @@ def build_tracking_samples(
 __all__ = [
     "MEMORY_SUPERVISION_DISABLED",
     "MEMORY_SUPERVISION_EXPLICIT",
+    "MEMORY_SUPERVISION_LABELLED_MODES",
     "MEMORY_SUPERVISION_FEASIBILITY_NULL",
     "MEMORY_SUPERVISION_MASKED_NULL",
+    "MEMORY_SUPERVISION_THREE_STATE",
     "MEMORY_SUPERVISION_MODES",
+    "ABSENT_PHASES",
+    "HISTORY_COMPLETENESS_H0",
+    "HISTORY_COMPLETENESS_H1",
+    "HISTORY_COMPLETENESS_H2",
+    "HISTORY_COMPLETENESS_H3",
+    "HISTORY_COMPLETENESS_LEVELS",
+    "HISTORY_QUALITIES",
+    "HISTORY_QUALITY_CLEAN",
+    "HISTORY_QUALITY_JITTER",
+    "HISTORY_QUALITY_STALE",
     "MemoryUpdateLabel",
+    "REFERENCE_SOURCES",
     "SOURCE_SCHEMA_VERSION",
+    "TRACKING_EVENT_ABSENT",
+    "TRACKING_EVENT_CONTINUOUS_PRESENT",
+    "TRACKING_EVENT_REAPPEARANCE",
+    "TRACKING_EVENTS",
+    "TRACKING_SCENARIOS",
     "TrackingSampleBuildReport",
     "TrackingSampleConfig",
+    "VALID_HISTORY_QUALITIES_BY_COMPLETENESS",
+    "VALID_VISUAL_COMBINATIONS",
     "build_tracking_samples",
     "load_memory_labels_jsonl",
 ]

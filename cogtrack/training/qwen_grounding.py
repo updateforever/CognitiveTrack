@@ -36,8 +36,16 @@ from cogtrack.prompts import (
 from cogtrack.protocol import (
     BBOX_PROTOCOL_NORM1000,
     BBOX_PROTOCOL_QWEN_ABS_PIXEL,
+    MEMORY_UPDATE_JSON_KEY,
+    TARGET_STATUS_JSON_KEY,
+    bbox_protocol_json_key,
     norm1000_xyxy_to_pixel_xywh,
     xywh_to_xyxy,
+)
+from cogtrack.training.loss_mask import (
+    MEMORY_STATE_MASKED_UNKNOWN,
+    assistant_loss_scale_for_state,
+    decide_memory_supervision_state,
 )
 
 QWEN_MODEL_FAMILIES = ("qwen2_5_vl", "qwen3_vl")
@@ -194,15 +202,21 @@ def _answer_text(
     include_memory_update: bool,
     memory_update: str | None,
 ) -> str:
-    bbox_key = (
-        "bbox_norm1000_xyxy"
-        if bbox_protocol == BBOX_PROTOCOL_NORM1000
-        else "bbox_pixel_xyxy"
-    )
+    bbox_key = bbox_protocol_json_key(bbox_protocol)
+    # absent 使用 JSON ``null`` 而不是 [0,0,0,0]：后者是语法合法的零面积框，模型
+    # 少吐一位数字就会被 parser 当成真实检测（静默错误）；``null`` 只有一个 token，
+    # 任何偏差都会直接暴露为解析失败。
     bbox_value = "<bbox>" if status == "present" else "null"
-    payload = f'{{"target_status":"{status}","{bbox_key}":{bbox_value}'
+    payload = (
+        f'{{"{bbox_key}":{bbox_value}'
+        f',"{TARGET_STATUS_JSON_KEY}":"{status}"'
+    )
     if include_memory_update:
-        payload += f',"memory_update":{json.dumps(memory_update, ensure_ascii=False)}'
+        # memory_update 必须是最后一个字段；字段级 loss mask 依赖该位置切分。
+        payload += (
+            f',"{MEMORY_UPDATE_JSON_KEY}":'
+            f'{json.dumps(memory_update, ensure_ascii=False)}'
+        )
     return payload + "}"
 
 
@@ -273,8 +287,6 @@ def to_qwen_grounding_record(
         raise ValueError("memory_update 必须是字符串或 null")
     if reference_mode == REFERENCE_MODE_VISUAL_BOX and not include_memory_update:
         raise ValueError("visual_box 样本必须包含 memory_update")
-    if status == "absent" and memory_update is not None:
-        raise ValueError("absent 样本的 memory_update 必须为 null")
 
     prompt = _build_prompt(row, model_family=family)
     if prompt.expected_image_count != len(images):
@@ -297,11 +309,32 @@ def to_qwen_grounding_record(
         canonical_bbox_format="norm1000_xyxy",
         reference_mode=reference_mode,
     )
+
+    # 记忆监督三态判定。
+    #
+    # tracking_sft 的 absent null 与 present null 一样可以只是未知占位；state_update_sft
+    # 则允许显式消失文本。是否全监督只由行级 memory state 决定，不再从 status 猜测。
+    assistant_message: dict[str, Any] = {"role": "assistant", "content": assistant}
+    if include_memory_update:
+        # present + 已证明无需更新：由 source 层写入的 memory_verified_null 携带。
+        # 这里不重新推断，只复用同一个判定函数，保证 source 与训练视图逐行一致。
+        verified_null = bool(metadata.get("memory_verified_null", False))
+        memory_state = decide_memory_supervision_state(
+            status=status, memory_update=memory_update, verified_null=verified_null
+        )
+        metadata["memory_supervision_state"] = memory_state
+        metadata["memory_loss_masked"] = memory_state == MEMORY_STATE_MASKED_UNKNOWN
+        loss_scale = assistant_loss_scale_for_state(memory_state)
+        if loss_scale is not None:
+            # ms-swift 原生 per-message 通道：带该 key 会绕过 LossScale 插件的
+            # 分段，对整条 response 全量监督。不带则由插件 mask memory 值。
+            assistant_message["loss_scale"] = loss_scale
+
     record = {
         "messages": [
             {"role": "system", "content": prompt.system_prompt},
             {"role": "user", "content": "<image>" * len(images) + "\n" + prompt.user_prompt},
-            {"role": "assistant", "content": assistant},
+            assistant_message,
         ],
         "images": images,
         "metadata": metadata,

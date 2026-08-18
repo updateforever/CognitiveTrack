@@ -1,4 +1,4 @@
-"""VLT-v6.3 统一长时跟踪 Prompt。
+"""VLT-v6.4 统一长时跟踪 Prompt。
 
 训练版模型通过 SFT 内化输出字段和坐标协议，因此 system prompt 只定义跟踪任务本身：
 身份不可覆盖、利用历史轨迹、分析当前目标状态和按需更新状态记忆。user prompt 只携带
@@ -13,7 +13,7 @@ from ..protocol.bbox import (
 )
 from .common import PromptSpec
 
-VLT_TRACKING_PROMPT_VERSION = "6.3.1"
+VLT_TRACKING_PROMPT_VERSION = "6.4.0"
 VLT_PAIR_PROMPT_NAME = "cognitive_vlt_pair"
 VLT_MOSAIC_PROMPT_NAME = "cognitive_vlt_mosaic"
 
@@ -43,10 +43,10 @@ def build_vlt_tracking_prompt(
     bbox_protocol: str = BBOX_PROTOCOL_NORM1000,
     include_memory_update: bool = True,
 ) -> PromptSpec:
-    """构造 VLT-v6.3 的极简动态输入。
+    """构造 VLT-v6.4 的极简动态输入。
 
     ``history_count`` 只用于核对图片数量和兼容旧 pair/mosaic 调用，不把帧数、决策步骤
-    等重复写进每条 user 消息，也不会向 System Prompt 暴露双图分支。正式 v6.3 配置会
+    等重复写进每条 user 消息，也不会向 System Prompt 暴露双图分支。正式 v6.4 配置会
     复制锚点补齐三个历史 panel，从而始终保持三图接口。
     """
 

@@ -111,6 +111,9 @@ class TemporalCaseSamplingPlan:
     absent_run_count: int
     sequences: tuple[SequenceCasePlan, ...]
     reference_policy: str = REFERENCE_POLICY_SAMPLED_PRIOR
+    # 已解析的分数据源上限，按 dataset 名升序的 (name, cap) 对。用 tuple 而非 dict
+    # 是为了让 frozen dataclass 保持可哈希，也让 JSON 序列化顺序确定。
+    max_cases_by_dataset: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self) -> None:
         if self.reference_policy not in REFERENCE_POLICIES:
@@ -128,6 +131,23 @@ class TemporalCaseSamplingPlan:
                     raise ValueError(
                         "fixed_identity_anchor plan 的所有 reference 必须等于永久 anchor"
                     )
+        seen_caps: set[str] = set()
+        for name, cap in self.max_cases_by_dataset:
+            if name != str(name).strip().lower() or not name:
+                raise ValueError(f"max_cases_by_dataset 的 dataset 名必须是非空小写: {name!r}")
+            if name in seen_caps:
+                raise ValueError(f"max_cases_by_dataset 含重复 dataset: {name}")
+            seen_caps.add(name)
+            if isinstance(cap, bool) or int(cap) <= 0:
+                raise ValueError(f"max_cases_by_dataset[{name}] 必须是正整数")
+        if tuple(sorted(self.max_cases_by_dataset)) != self.max_cases_by_dataset:
+            raise ValueError("max_cases_by_dataset 必须按 dataset 名升序，保证 JSON 确定性")
+
+    @property
+    def resolved_max_cases_by_dataset(self) -> Mapping[str, int]:
+        """便于调用方复算某序列上限的 dict 视图。"""
+
+        return dict(self.max_cases_by_dataset)
 
     @property
     def frame_ids_by_sequence(self) -> Mapping[str, tuple[int, ...]]:
@@ -166,6 +186,11 @@ class TemporalCaseSamplingPlan:
         # 字节级兼容；visual-v5 的固定锚点策略必须显式写入并在重放时校验。
         if self.reference_policy != REFERENCE_POLICY_SAMPLED_PRIOR:
             payload["reference_policy"] = self.reference_policy
+        # 与 reference_policy 同理：为空时省略该键，旧 plan 的 JSON 与 checksum 不变。
+        if self.max_cases_by_dataset:
+            payload["max_cases_by_dataset"] = {
+                name: cap for name, cap in self.max_cases_by_dataset
+            }
         if include_frame_ids:
             payload["sequences"] = [item.to_dict() for item in self.sequences]
         return payload
@@ -199,6 +224,12 @@ class TemporalCaseSamplingPlan:
             sequences=sequences,
             reference_policy=str(
                 payload.get("reference_policy", REFERENCE_POLICY_SAMPLED_PRIOR)
+            ),
+            max_cases_by_dataset=tuple(
+                sorted(
+                    (str(name).strip().lower(), int(cap))
+                    for name, cap in dict(payload.get("max_cases_by_dataset") or {}).items()
+                )
             ),
         )
         if plan.sequence_count != len(sequences):
@@ -395,6 +426,26 @@ def _select_present_pair_currents(
     return sorted(selected)
 
 
+def resolve_max_cases(
+    dataset: str,
+    *,
+    default: int,
+    by_dataset: Mapping[str, int] | None,
+) -> int:
+    """返回某数据源的 case 上限：命中 ``by_dataset`` 则用它，否则用全局默认。
+
+    分数据源上限的动机是长短序列容量差了两个数量级：MGIT 单条 7k-15k 帧，是
+    ``verified_update`` 的唯一来源，抬高上限才能把它在总量里的占比从千分之几拉起来；
+    lasot/tnl2k 只有几百到几千帧，跟着抬只会重复采样同一条短视频。
+    """
+
+    if by_dataset:
+        key = str(dataset).strip().lower()
+        if key in by_dataset:
+            return int(by_dataset[key])
+    return int(default)
+
+
 def _build_pool(
     sequence: Sequence,
     *,
@@ -508,15 +559,31 @@ def plan_temporal_presence_cases(
     sequences: Iterable[Sequence],
     *,
     max_cases_per_sequence: int = 20,
+    max_cases_by_dataset: Mapping[str, int] | None = None,
     absent_ratio: float = 0.3,
     frame_stride: int = 1,
     seed: int = 20260809,
     reference_policy: str = REFERENCE_POLICY_SAMPLED_PRIOR,
 ) -> TemporalCaseSamplingPlan:
-    """生成全局比例受控、按连续状态区间覆盖的确定性帧计划。"""
+    """生成全局比例受控、按连续状态区间覆盖的确定性帧计划。
+
+    ``max_cases_by_dataset`` 按数据源覆盖 ``max_cases_per_sequence``，键为小写
+    dataset 名。absent 配额仍然逐数据源独立强制，因此抬高某一源的上限不会把它的
+    正负比例摊薄到别的源身上。
+    """
 
     if isinstance(max_cases_per_sequence, bool) or max_cases_per_sequence <= 0:
         raise ValueError("max_cases_per_sequence 必须是正整数")
+    normalized_caps: dict[str, int] = {}
+    for raw_key, raw_value in (max_cases_by_dataset or {}).items():
+        key = str(raw_key).strip().lower()
+        if not key:
+            raise ValueError("max_cases_by_dataset 的 dataset 名不能为空")
+        if isinstance(raw_value, bool) or int(raw_value) <= 0:
+            raise ValueError(f"max_cases_by_dataset[{key}] 必须是正整数")
+        if key in normalized_caps:
+            raise ValueError(f"max_cases_by_dataset 含重复 dataset: {key}")
+        normalized_caps[key] = int(raw_value)
     if not 0 <= absent_ratio < 1:
         raise ValueError("absent_ratio 必须位于 [0,1)")
     if isinstance(frame_stride, bool) or frame_stride <= 0:
@@ -529,7 +596,11 @@ def plan_temporal_presence_cases(
         for sequence in sequences
         if (pool := _build_pool(
             sequence,
-            max_cases_per_sequence=max_cases_per_sequence,
+            max_cases_per_sequence=resolve_max_cases(
+                sequence.dataset,
+                default=max_cases_per_sequence,
+                by_dataset=normalized_caps,
+            ),
             frame_stride=frame_stride,
             reference_policy=reference_policy,
         ))
@@ -638,6 +709,7 @@ def plan_temporal_presence_cases(
         requested_absent_ratio=absent_ratio,
         actual_absent_ratio=actual_absent / actual_total,
         max_cases_per_sequence=max_cases_per_sequence,
+        max_cases_by_dataset=tuple(sorted(normalized_caps.items())),
         sequence_count=len(sequence_plans),
         case_count=actual_total,
         present_count=actual_present,
@@ -655,5 +727,6 @@ __all__ = [
     "SequenceCasePlan",
     "TemporalCaseSamplingPlan",
     "plan_temporal_presence_cases",
+    "resolve_max_cases",
     "sequence_sampling_key",
 ]

@@ -11,14 +11,17 @@
 | `stage2_stage3_data.md` | 早期统一混合训练草案 |
 | `qwen_v4_probe.md` | Qwen2.5-VL v4.1 单点能力探针 |
 | `project_status_20260813.md` | 迁移到 VLT-v6 初期的时点快照 |
+| `vlt_v631_teacher_prototype/` | Qwen2.5-VL-32B 逐样本生成原型、Prompt 6.3.0 分析和旧实施草案 |
+| `paper_outline_v1_v631.md` | 仍使用 Core/Memory 分阶段名称与 Prompt 6.3.1 的论文草案 |
+| `superseded_v640_20260817/` | 合并为 `data.md`/`setup.md` 前的拆分数据、环境、摘要、进度和迁移文档 |
 
 当前入口依次为：
 
-1. [`../research_plan.md`](../research_plan.md)：论文主线与实验闭环；
-2. [`../state_annotation.md`](../state_annotation.md)：状态记忆标签冷启动；
-3. [`../grpo.md`](../grpo.md)：轨迹效用 GRPO；
-4. [`../training.md`](../training.md)：分阶段训练；
-5. [`../project_status.md`](../project_status.md)：真实完成度与下一步。
+1. [`../project_status.md`](../project_status.md)：真实完成度与下一步；
+2. [`../data.md`](../data.md)：当前两类 SFT 数据与状态标签；
+3. [`../training.md`](../training.md)：当前冻结 ViT 的混合全参 SFT 训练边界；
+4. [`../research_plan.md`](../research_plan.md)：论文主线与实验闭环；
+5. [`../grpo.md`](../grpo.md)：轨迹效用 GRPO。
 
 归档只移动文档，不删除旧代码、配置、checkpoint 记录或结果。复现实验时必须使用归档
-文档中对应的 prompt/config，不能用当前 VLT-v6.3 协议解释旧指标。
+文档中对应的 prompt/config，不能用当前 VLT-v6.4 协议解释旧指标。

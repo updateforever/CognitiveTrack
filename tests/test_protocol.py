@@ -8,8 +8,8 @@ from cogtrack.vlm import parse_tracking_output
 
 def _valid_payload():
     return {
-        "target_status": "present",
-        "bbox_norm1000_xyxy": [100, 100, 300, 400],
+        "status": "present",
+        "bbox_2d": [100, 100, 300, 400],
         "memory_update": None,
     }
 
@@ -64,18 +64,18 @@ def test_tracking_parser_rejects_only_invalid_memory_branch(memory_update):
     assert "memory_update" in parsed.cognition.memory_update_error
 
 
-def test_absent_prediction_cannot_update_memory():
+def test_absent_prediction_can_propose_disappearance_memory():
     payload = _valid_payload()
     payload.update(
-        target_status="absent",
-        bbox_norm1000_xyxy=None,
+        status="absent",
+        bbox_2d=None,
         memory_update="The target changed appearance.",
     )
     parsed = parse_tracking_output(json.dumps(payload), image_width=200, image_height=100)
 
     assert parsed.prediction.target_presence.value == "absent"
-    assert parsed.cognition.memory_update_proposal is None
-    assert "absent" in parsed.cognition.memory_update_error
+    assert parsed.cognition.memory_update_proposal == payload["memory_update"]
+    assert parsed.cognition.memory_update_error is None
 
 
 def test_missing_optional_memory_field_preserves_core_tracking_result():

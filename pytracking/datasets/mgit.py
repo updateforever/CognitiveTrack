@@ -20,6 +20,40 @@ from pytracking.utils.io import ensure_unique, list_image_files, load_numeric_ta
 _SPLIT_DEFINITION = Path(__file__).with_name("videocube.json")
 
 
+def _normalize_action_start_frame(
+    value: Any,
+    *,
+    path: Path,
+    action_name: str,
+) -> int:
+    """把 MGIT action 的异构帧号规范为非负整数。
+
+    官方描述中少量帧号是带不换行空格的字符串（例如 ``"0\u00a0"``），同一
+    文件的后续帧号则是 JSON 整数。排序前必须统一类型，且不能按字符串排序。
+    """
+
+    if isinstance(value, bool):
+        normalized: int | None = None
+    elif isinstance(value, int):
+        normalized = value
+    elif isinstance(value, float) and np.isfinite(value) and value.is_integer():
+        normalized = int(value)
+    elif isinstance(value, str):
+        try:
+            normalized = int(value.strip())
+        except ValueError:
+            normalized = None
+    else:
+        normalized = None
+
+    if normalized is None or normalized < 0:
+        raise ValueError(
+            f"MGIT 描述文件 {path} 的 action {action_name!r}: "
+            f"start_frame 必须是非负整数，收到 {value!r}"
+        )
+    return normalized
+
+
 def load_split_definition(version: str, split: str) -> list[str]:
     """从随包分发的 videocube.json 读取序列名列表。
 
@@ -105,6 +139,12 @@ class MGITDataset(BaseDataset):
                 # 官方方案：从 action 层读取第一个 action 的 description，
                 # 包含 object_class + appearance + 初始动作，适合作为初始目标描述。
                 "language_scope": "first_action_description",
+                # 逐 case 随机模板帧时，第一段 description 未必还描述模板帧的状态。
+                # 暴露标注路径，让采样层能按实际模板帧所在的 action 段重取身份文本，
+                # 而不是把序列开头的动作硬贴到中段模板上。
+                "description_path": str(
+                    self.base_path / "attribute" / "description" / f"{name}.json"
+                ),
             },
         )
 
@@ -127,8 +167,25 @@ class MGITDataset(BaseDataset):
         if not actions:
             return None
 
-        # 取第一个 action（按 start_frame 排序）
-        first_action = sorted(actions.values(), key=lambda x: x.get("start_frame", 0))[0]
+        # 取第一个 action（按 start_frame 排序）。官方 JSON 中同一文件可能混用
+        # 整数和带 NBSP 的数字字符串，必须先按数值帧号规范化。
+        def action_start_frame(item: tuple[str, Any]) -> int:
+            action_name, action = item
+            if not isinstance(action, dict):
+                raise ValueError(
+                    f"MGIT 描述文件 {path} 的 action {action_name!r} 不是对象: {action!r}"
+                )
+            if "start_frame" not in action:
+                raise ValueError(
+                    f"MGIT 描述文件 {path} 的 action {action_name!r} 缺少 start_frame"
+                )
+            return _normalize_action_start_frame(
+                action["start_frame"],
+                path=path,
+                action_name=action_name,
+            )
+
+        _, first_action = min(actions.items(), key=action_start_frame)
         desc = first_action.get("description", "").strip()
 
         if desc:

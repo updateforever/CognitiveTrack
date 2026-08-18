@@ -3,6 +3,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+import pytest
+import yaml
 
 from cogtrack.vlm import (
     QwenVLBackend,
@@ -63,9 +65,10 @@ def _response(
 ):
     if target_status == "absent":
         bbox = None
+    # 模型可见字段顺序：bbox -> status -> memory_update（必须最后）。
     payload = {
-        "target_status": target_status,
         bbox_key: list(bbox) if bbox is not None else None,
+        "status": target_status,
     }
     if include_memory_update:
         payload["memory_update"] = memory_update
@@ -81,8 +84,11 @@ def _tracker(
     use_init_language=True,
     prompt_profile="visual_v5",
     force_history_image=False,
+    bbox_protocol=None,
 ):
     model_config = Path(__file__).resolve().parents[1] / "configs/models/qwen25vl_7b.yaml"
+    if bbox_protocol is None:
+        bbox_protocol = "norm1000" if prompt_profile == "vlt_v6" else "qwen_abs_pixel"
     tracker = CognitiveVLMTracker(
         TrackerParams(
             {
@@ -91,6 +97,7 @@ def _tracker(
                 "prompt_profile": prompt_profile,
                 "force_history_image": force_history_image,
                 "use_init_language": use_init_language,
+                "bbox_protocol": bbox_protocol,
                 "model_config": str(model_config),
                 "_config_path": str(Path(__file__).resolve()),
                 "memory": {
@@ -309,7 +316,7 @@ def test_model_controlled_semantic_memory_requires_two_proposals_then_is_reused(
     assert third["cognition"]["memory_updated"] is False
 
 
-def test_absent_output_rejects_only_memory_proposal():
+def test_absent_output_preserves_disappearance_memory_proposal():
     tracker = _tracker(
         context_mode="pair",
         responses=[
@@ -329,9 +336,102 @@ def test_absent_output_rejects_only_memory_proposal():
 
     assert output["execution"]["status"] == "ok"
     assert output["prediction"]["target_presence"] == "absent"
-    assert output["cognition"]["memory_update_proposal"] is None
-    assert "absent" in output["cognition"]["memory_update_error"]
-    assert output["memory_decision"]["semantic"]["accepted"] is False
+    assert output["cognition"]["memory_update_proposal"] == "The target changed appearance."
+    assert output["cognition"]["memory_update_error"] is None
+    assert output["memory_decision"]["semantic"]["accepted"] is True
+    assert output["memory"]["records"]["semantic"][0]["metadata"]["temporal_event"] == (
+        "disappearance"
+    )
+
+
+def test_disappearance_and_reappearance_updates_bypass_regular_semantic_cooldown():
+    tracker = _tracker(
+        context_mode="mosaic",
+        reference_mode="visual_box",
+        prompt_profile="vlt_v6",
+        force_history_image=True,
+        responses=[
+            _response(
+                target_status="absent",
+                bbox_key="bbox_2d",
+                memory_update="The initialized target is currently absent from the scene.",
+            ),
+            _response(
+                bbox_key="bbox_2d",
+                bbox=(100, 100, 300, 400),
+                memory_update=(
+                    "The initialized target has reappeared, now showing its rear white stripes."
+                ),
+            ),
+        ],
+    )
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+    tracker.initialize(
+        image,
+        {"init_bbox": [20, 10, 40, 30], "sequence_name": "transition-memory"},
+    )
+
+    disappeared = tracker.track(image, {"frame_num": 1})
+    reappeared = tracker.track(image, {"frame_num": 2})
+
+    assert disappeared["memory_decision"]["semantic"]["accepted"] is True
+    assert reappeared["memory_decision"]["semantic"]["accepted"] is True
+    assert reappeared["memory"]["records"]["semantic"][-1]["metadata"][
+        "temporal_event"
+    ] == "reappearance"
+    assert "has reappeared" in tracker._build_context(image).prompt.user_prompt
+
+
+def test_continued_absence_cannot_rewrite_disappearance_memory():
+    tracker = _tracker(
+        context_mode="mosaic",
+        reference_mode="visual_box",
+        prompt_profile="vlt_v6",
+        force_history_image=True,
+        responses=[
+            _response(
+                target_status="absent",
+                bbox_key="bbox_2d",
+                memory_update="The initialized target is currently absent from the scene.",
+            ),
+            _response(
+                target_status="absent",
+                bbox_key="bbox_2d",
+                memory_update="The target remains absent.",
+            ),
+        ],
+    )
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+    tracker.initialize(image, {"init_bbox": [20, 10, 40, 30], "sequence_name": "absent"})
+
+    first = tracker.track(image, {"frame_num": 1})
+    second = tracker.track(image, {"frame_num": 2})
+
+    assert first["memory_decision"]["semantic"]["accepted"] is True
+    assert second["memory_decision"]["semantic"]["accepted"] is False
+    assert "首次消失" in second["memory_decision"]["semantic"]["reason"]
+    assert len(second["memory"]["records"]["semantic"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"context_mode": "pair"}, "context_mode=mosaic"),
+        ({"force_history_image": False}, "force_history_image=true"),
+        ({"bbox_protocol": "qwen_abs_pixel"}, "bbox_protocol=norm1000"),
+    ],
+)
+def test_vlt_v6_rejects_runtime_protocol_drift(overrides, message):
+    kwargs = {
+        "context_mode": "mosaic",
+        "reference_mode": "visual_box",
+        "prompt_profile": "vlt_v6",
+        "force_history_image": True,
+        "bbox_protocol": "norm1000",
+    }
+    kwargs.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        _tracker(**kwargs)
 
 
 def test_qwen_runtime_cache_is_process_shared_and_thread_safe():
@@ -416,7 +516,7 @@ def test_vlt_v6_runtime_uses_safe_initial_text_latest_memory_and_three_images():
 
     assert len(context.images) == 3
     assert context.prompt.name == "cognitive_vlt_mosaic"
-    assert context.prompt.version == "6.3.0"
+    assert context.prompt.version == "6.4.0"
     assert context.reference_frames == (0, 0, 0, 0)
     assert context.images[1].shape[:2] == (240, 1454)
     assert "a small gray vehicle" in context.prompt.user_prompt
@@ -449,3 +549,63 @@ def test_vlt_v6_rejects_mgit_full_video_story_from_online_input():
     assert "Later in the video" not in prompt
     assert "target marked by the red box" in prompt
     assert tracker.target_text_source == "visual_anchor_fallback"
+
+
+def test_vlt_v6_accepts_mgit_first_action_description_online():
+    """MGIT 官方 action 首段是初始化时刻可得的描述，在线必须使用它。
+
+    这条与训练导出侧共用 ``is_unsafe_init_language_scope``；若两侧判据漂移，同一
+    序列会在训练和推理拿到不同初始文本，因此这里显式锁定在线行为。
+    """
+
+    tracker = _tracker(
+        context_mode="mosaic",
+        reference_mode="visual_box",
+        prompt_profile="vlt_v6",
+        force_history_image=True,
+        use_init_language=True,
+    )
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+    description = "The garfield waks up a orange striped clothes actor in the bedroom"
+    tracker.initialize(
+        image,
+        {
+            "init_bbox": [20, 10, 40, 30],
+            "init_nlp": description,
+            "init_language_scope": "first_action_description",
+            "dataset_name": "mgit",
+            "sequence_name": "002",
+        },
+    )
+
+    prompt = tracker._build_context(image).prompt.user_prompt
+    assert description in prompt
+    assert "target marked by the red box" not in prompt
+    assert tracker.describe_runtime()["target_text_source"] == "dataset_initial_language"
+    assert tracker.target_text_source == "dataset_initial_language"
+
+
+def test_vlt_v640_full_sft_configs_do_not_expect_lora_adapter():
+    project_root = Path(__file__).resolve().parents[1]
+    local_model = yaml.safe_load(
+        (project_root / "configs/models/qwen3vl_4b_vlt_v640_sft.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    local_tracker = yaml.safe_load(
+        (project_root / "configs/trackers/qwen3vl_4b_vlt_v640_sft.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    vllm_tracker = yaml.safe_load(
+        (project_root / "configs/trackers/qwen3vl_4b_vlt_v640_sft_vllm.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert local_model["model_path"] == "${COGTRACK_QWEN3_4B_SFT_MODEL}"
+    assert "adapter_path" not in local_model
+    for tracker in (local_tracker, vllm_tracker):
+        assert tracker["context_mode"] == "mosaic"
+        assert tracker["reference_mode"] == "visual_box"
+        assert tracker["bbox_protocol"] == "norm1000"

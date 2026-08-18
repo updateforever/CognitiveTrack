@@ -21,10 +21,15 @@ from cogtrack.context import (
     REFERENCE_MODE_BBOX_TEXT,
     TrackingContextBuilder,
     history_layout_for_prompt_profile,
+    is_unsafe_init_language_scope,
     validate_prompt_profile,
     validate_reference_mode,
 )
 from cogtrack.memory import (
+    SEMANTIC_EVENT_CONTINUED_ABSENCE,
+    SEMANTIC_EVENT_CONTINUOUS_PRESENT,
+    SEMANTIC_EVENT_DISAPPEARANCE,
+    SEMANTIC_EVENT_REAPPEARANCE,
     GatedMemoryUpdatePolicy,
     IdentityAnchor,
     MemoryBank,
@@ -36,6 +41,7 @@ from cogtrack.memory import (
     MemoryUpdatePolicyConfig,
 )
 from cogtrack.protocol import (
+    BBOX_PROTOCOL_NORM1000,
     BBOX_PROTOCOL_QWEN_ABS_PIXEL,
     CognitionInfo,
     ContextInfo,
@@ -190,6 +196,16 @@ class CognitiveVLMTracker(BaseTracker):
         self._bank_config = bank_config
         self._memory_policy = GatedMemoryUpdatePolicy(policy_config)
 
+        if self.prompt_profile == PROMPT_PROFILE_VLT_V6:
+            if self.context_mode != "mosaic":
+                raise ValueError("vlt_v6 正式协议必须使用 context_mode=mosaic 的固定三图输入")
+            if not self.force_history_image:
+                raise ValueError("vlt_v6 正式协议必须设置 force_history_image=true")
+            if self.bbox_protocol != BBOX_PROTOCOL_NORM1000:
+                raise ValueError("vlt_v6 / Qwen3-VL 必须使用 bbox_protocol=norm1000")
+            if not self.memory_output_enabled:
+                raise ValueError("vlt_v6 三字段协议必须设置 memory.model_output_enabled=true")
+
         model_config_path = self._resolve_model_config_path()
         model_payload = _load_yaml_mapping(model_config_path)
         # backend 由模型配置决定：本地权重走 huggingface_qwen，vLLM/远程服务走
@@ -257,6 +273,8 @@ class CognitiveVLMTracker(BaseTracker):
         self.sequence_name = str(info.get("sequence_name") or info.get("seq_name") or "unknown")
         self.target_text, self.target_text_source = self._resolve_initial_target_text(info)
         frame_path = str(info.get("frame_path") or "")
+        # Image 1 与 init_bbox 共同形成永久 IdentityAnchor。它不进入可淘汰的
+        # MemoryBank，也不会被后续错误预测或 memory_update 覆盖。
         self.anchor = IdentityAnchor(
             frame_id=0,
             bbox_xywh=bbox,
@@ -320,9 +338,7 @@ class CognitiveVLMTracker(BaseTracker):
         dataset_name = str(info.get("dataset_name") or "").strip().lower()
         language_scope = str(info.get("init_language_scope") or "").strip().lower()
         description = str(info.get("init_nlp") or "").strip()
-        unsafe_story = language_scope == "full_video_story" or (
-            dataset_name == "mgit" and language_scope != "initial_target"
-        )
+        unsafe_story = is_unsafe_init_language_scope(language_scope, dataset=dataset_name)
         if description and not unsafe_story:
             return description, "dataset_initial_language"
         object_class = str(info.get("init_object_class") or "").strip()
@@ -339,6 +355,8 @@ class CognitiveVLMTracker(BaseTracker):
 
     def _build_context(self, image: np.ndarray):
         bank, builder = self._require_initialized()
+        # Prompt 只回读最近一次已接受的动态语义状态。模型曾经提出但被门控拒绝的
+        # 文本不会进入下一帧，这里适合检查“错误 memory 为什么仍出现在 Prompt”。
         semantic_records = tuple(
             record
             for record in bank.records(MemoryKind.SEMANTIC)
@@ -350,6 +368,8 @@ class CognitiveVLMTracker(BaseTracker):
             else ""
         )
         if self.context_mode == "mosaic":
+            # Image 2 只从已接受的 POSITIVE 记录选取；原始模型候选、absent 帧和
+            # 当前帧 GT 都不可能直接进入历史轨迹图。
             records = bank.select_positive(self.history_size)
             return builder.build_mosaic(
                 image,
@@ -364,6 +384,28 @@ class CognitiveVLMTracker(BaseTracker):
             latest_semantic,
             self.memory_output_enabled,
         )
+
+    @staticmethod
+    def _semantic_temporal_event(decision: Any) -> str | None:
+        """从在线状态转换派生 memory 门控事件，不读取当前或未来 GT。"""
+
+        transition = decision.transition
+        prediction = decision.frame_result.prediction
+        if transition is None or prediction is None:
+            return None
+        if prediction.target_presence is TargetPresence.ABSENT:
+            return (
+                SEMANTIC_EVENT_DISAPPEARANCE
+                if transition.previous.absent_duration == 0
+                else SEMANTIC_EVENT_CONTINUED_ABSENCE
+            )
+        if prediction.target_presence is TargetPresence.PRESENT:
+            return (
+                SEMANTIC_EVENT_REAPPEARANCE
+                if transition.previous.absent_duration > 0
+                else SEMANTIC_EVENT_CONTINUOUS_PRESENT
+            )
+        return None
 
     def track(self, image: np.ndarray, info: dict[str, Any]) -> dict[str, Any]:
         bank, _ = self._require_initialized()
@@ -383,6 +425,8 @@ class CognitiveVLMTracker(BaseTracker):
             )
             return self._to_tracker_output(frame_result, transition.current, memory_decision=None)
 
+        # 阶段 1：用永久 Image-1 锚点、最多三条可信视觉历史和已接受的动态文本
+        # 构造 Prompt-6.4 三图输入。Image 3 始终是当前无框搜索帧。
         context = self._build_context(image)
         if len(context.images) != context.prompt.expected_image_count:
             raise RuntimeError(
@@ -390,11 +434,15 @@ class CognitiveVLMTracker(BaseTracker):
                 f"上下文实际生成 {len(context.images)} 张"
             )
         try:
+            # 阶段 2：后端完成 resize/processor/generate，只返回新增 token 文本及
+            # processor 实际图像尺寸；tracker 本身不接触模型内部张量。
             response = self.backend.generate(
                 context.images,
                 context.prompt.user_prompt,
                 system_prompt=context.prompt.system_prompt,
             )
+            # 阶段 3：严格解析三字段 JSON，把 norm1000 xyxy 映回当前原图 xywh，
+            # 再仅依据本帧解析结果推进在线状态机。解析失败绝不能伪装成 absent。
             decision = self.decision_engine.from_vlm_response(
                 sequence=self.sequence_name,
                 frame_id=frame_id,
@@ -427,6 +475,9 @@ class CognitiveVLMTracker(BaseTracker):
             )
 
         frame_result = decision.frame_result
+        # disappearance/reappearance 根据状态机 transition 的前后状态推导；这里
+        # 没有数据集标签，因此真实在线推理与离线 debug 走完全相同的逻辑。
+        semantic_temporal_event = self._semantic_temporal_event(decision)
         memory_decisions: dict[str, Any] = {}
         if frame_result.execution.status is ExecutionStatus.OK and frame_result.prediction:
             prediction = frame_result.prediction
@@ -436,6 +487,8 @@ class CognitiveVLMTracker(BaseTracker):
 
         if should_process_memory and frame_result.prediction is not None:
             prediction = frame_result.prediction
+            # 阶段 4a：视觉历史通道。只有 present + same + 合法 bbox 且满足连续
+            # 确认策略的预测，才会携带当前图像进入 Image-2 候选库。
             visual_candidate = MemoryCandidate(
                 kind=MemoryKind.POSITIVE,
                 frame_id=frame_id,
@@ -452,10 +505,13 @@ class CognitiveVLMTracker(BaseTracker):
                     "reference_mode": context.reference_mode,
                     "visual_marker_version": context.visual_marker_version,
                     "history_layout_version": context.history_layout_version,
+                    "temporal_event": semantic_temporal_event,
                 },
             )
             memory_decisions["visual"] = self._memory_policy.process(bank, visual_candidate)
 
+        # 阶段 4b：语义状态通道。模型非空提议只是 candidate；消失/重现、去重、
+        # 两次确认和冷却由本地策略最终裁决，拒绝文本不会污染下一帧 Prompt。
         proposal = frame_result.cognition.memory_update_proposal
         proposal_error = frame_result.cognition.memory_update_error
         if frame_result.execution.status is not ExecutionStatus.OK or frame_result.prediction is None:
@@ -491,6 +547,7 @@ class CognitiveVLMTracker(BaseTracker):
                     "reference_mode": context.reference_mode,
                     "visual_marker_version": context.visual_marker_version,
                     "history_layout_version": context.history_layout_version,
+                    "temporal_event": semantic_temporal_event,
                 },
             )
             semantic_decision = self._memory_policy.process(bank, semantic_candidate)
@@ -515,6 +572,8 @@ class CognitiveVLMTracker(BaseTracker):
             raw_model_response=frame_result.raw_model_response,
         )
 
+        # 阶段 5：将候选预测、最终提交框、状态快照和两条 memory 决策一起返回。
+        # runner 只把 target_bbox 写入传统 TXT，其余审计信息进入 frames.jsonl。
         return self._to_tracker_output(frame_result, self.state_machine.state, memory_decisions)
 
     def _decide_bbox_commit(

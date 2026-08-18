@@ -1,6 +1,7 @@
 # 本机配置与凭据
 configs/env.local.yaml
 .env
+/auth.json
 
 # 运行产物
 outputs/
@@ -11,6 +12,7 @@ debug_vis/
 data/
 wandb/
 *.partial.*
+/cogtrack_state_update_*.tar.gz
 
 # Python 缓存与构建产物
 __pycache__/
@@ -21,7 +23,8 @@ __pycache__/
 build/
 dist/
 
-# IDE 与系统文件
-.vscode/
+# IDE 与系统文件；共享无密钥的调试入口，其余个人设置仍忽略。
+.vscode/*
+!.vscode/launch.json
 .idea/
 .DS_Store

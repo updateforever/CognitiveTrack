@@ -1,0 +1,12 @@
+backend: huggingface_qwen
+model_name: CognitiveTrack-Qwen3-VL-4B-v6.4-SFT
+model_path: ${COGTRACK_QWEN3_4B_SFT_MODEL}
+torch_dtype: bfloat16
+device_map: auto
+attn_implementation: flash_attention_2
+processor_use_fast: false
+
+max_image_side: 648
+max_new_tokens: 128
+temperature: 0.0
+do_sample: false

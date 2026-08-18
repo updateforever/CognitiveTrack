@@ -45,7 +45,8 @@ R(y) = w_fmt   * R_format
 - `R_event`：与人工/银标 update/keep 决策的一致性，只作冷启动辅助；
 - `R_ground`：新状态对 GT target region 的对齐、对干扰物的 margin、与初始身份一致；
 - `Delta-U-H`：接受候选状态相对保留旧状态的未来轨迹效用差；
-- `P_update`：无收益更新、过密更新和 absent 更新；
+- `P_update`：无收益更新、过密更新和持续缺失时的重复 absent 更新；确认的消失转折不
+  因非空 memory 自动受罚；
 - `P_length`：超过简洁状态预算；
 - `P_identity_drift`：类别、颜色/部件等永久身份冲突或更匹配干扰物。
 
@@ -80,7 +81,8 @@ Delta-U-H = U_accept - U_keep
 
 - 同组样本必须来自同一事件；只在组内做优势归一化；
 - 全组 reward 完全相同时跳过该组，避免零方差数值问题；
-- 格式错误、越界框、`absent + 非空 memory` 直接给确定性低分；
+- 格式错误和越界框直接给确定性低分；`absent + 非空 memory` 只有在消失转折语义与
+  时序证据一致时合法，持续缺失的重复更新降分；
 - 空泛文本如 “same object” 不应因短而得高分，必须经过 target/distractor margin；
 - 复制初始描述只有在 keep 真正更优时获益，不能一律奖励或惩罚；
 - 对同一状态的近义改写做语义去重，防止更新 churn；
@@ -91,8 +93,8 @@ Delta-U-H = U_accept - U_keep
 
 不直接从 base 做 GRPO。固定顺序为：
 
-1. Core SFT：稳定存在性、bbox 和格式；
-2. Memory SFT：让模型先学会可接受的 update/null 分布；
+1. 混合 SFT 中的 tracking 数据：稳定存在性、bbox 和格式；
+2. 混合 SFT 中的 state-update 数据：让模型先学会可接受的 update/null 分布；
 3. `format + current` reward smoke；
 4. 加入 `event + ground`，验证没有身份漂移；
 5. 在小型事件集加入缓存 `Delta-U-H`；
@@ -106,7 +108,7 @@ Delta-U-H = U_accept - U_keep
 
 至少比较：
 
-- Memory SFT；
+- tracking/state-update 混合 SFT；
 - `+ current-frame GRPO`；
 - `+ event/ground reward`；
 - `+ cached trajectory reward`；

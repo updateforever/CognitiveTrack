@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from ..protocol.bbox import (
     BBOX_PROTOCOL_NORM1000,
     BBOX_PROTOCOL_QWEN_ABS_PIXEL,
+    MEMORY_UPDATE_JSON_KEY,
+    TARGET_STATUS_JSON_KEY,
     bbox_protocol_json_key,
     validate_bbox_protocol,
 )
@@ -59,15 +61,18 @@ def tracking_output_schema(
 ) -> str:
     """按坐标协议渲染二字段训练或三字段推理输出约束。
 
-    字段名随协议变化：``qwen_abs_pixel`` 用 ``bbox_pixel_xyxy``，避免沿用
-    ``bbox_norm1000_xyxy`` 这个会把模型往归一化方向带的名字。
+    字段名随协议变化：``norm1000`` 使用 Qwen-VL 官方 grounding 约定 ``bbox_2d``；
+    ``qwen_abs_pixel`` 使用 ``bbox_pixel_xyxy``，因为其坐标系是模型输入图的绝对
+    像素，与官方 [0,1000] 相对坐标语义不同，必须在名字上区分。
     """
 
     validate_bbox_protocol(bbox_protocol)
     # 模板本身保持合法 JSON 形态并默认走 null 快路径。需要更新时，模型按下面
     # 的规则把 null 替换为短字符串；不要在 JSON 值位置展示 ``null or ...`` 这
     # 类伪语法，否则零样本模型容易把“不变化”也口头写成字符串。
-    memory_line = ',\n  "memory_update": null' if include_memory_update else ""
+    memory_line = (
+        f',\n  "{MEMORY_UPDATE_JSON_KEY}": null' if include_memory_update else ""
+    )
     memory_rules = (
         """
 - memory_update must be the final key.
@@ -78,7 +83,8 @@ def tracking_output_schema(
   "no change", "unchanged", "none", or "no update".
 - Use a short non-empty string only when the target reveals a materially changed viewpoint,
   configuration, appearance, or a new stable discriminative cue useful for future tracking.
-- Describe only the new observable delta, not the full target and not your reasoning.
+- A non-null value is a complete, self-contained replacement state snapshot. It must remain
+  interpretable without the previous memory; do not emit an appended delta or your reasoning.
 - Keep memory_update within 30 English words."""
         if include_memory_update
         else ""
@@ -86,8 +92,8 @@ def tracking_output_schema(
     key_count = "three" if include_memory_update else "two"
     return f"""Return exactly these {key_count} keys:
 {{
-  "target_status": "present | absent",
-  "{bbox_protocol_json_key(bbox_protocol)}": [x1, y1, x2, y2] or null{memory_line}
+  "{bbox_protocol_json_key(bbox_protocol)}": [x1, y1, x2, y2] or null,
+  "{TARGET_STATUS_JSON_KEY}": "present | absent"{memory_line}
 }}
 
 Protocol rules:

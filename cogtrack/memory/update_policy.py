@@ -18,6 +18,16 @@ _NOOP_MEMORY_PATTERNS = (
     re.compile(r"(?:无需|不用|不需要)更新"),
 )
 
+# 在线状态机根据已经成功解析的 present/absent 序列派生这些事件。它们不是新的模型
+# 输出标签，只用于决定一次非空 replacement snapshot 应当立即生效还是走常规慢门控。
+SEMANTIC_EVENT_CONTINUOUS_PRESENT = "continuous_present"
+SEMANTIC_EVENT_DISAPPEARANCE = "disappearance"
+SEMANTIC_EVENT_CONTINUED_ABSENCE = "continued_absence"
+SEMANTIC_EVENT_REAPPEARANCE = "reappearance"
+SEMANTIC_TRANSITION_EVENTS = frozenset(
+    {SEMANTIC_EVENT_DISAPPEARANCE, SEMANTIC_EVENT_REAPPEARANCE}
+)
+
 
 def _is_noop_semantic_text(text: str) -> bool:
     """识别模型误用字符串表达的“不更新”，防止无信息文本污染记忆。"""
@@ -165,6 +175,7 @@ class GatedMemoryUpdatePolicy:
         self._record_counter += 1
         record_id = f"{candidate.kind.value}-{candidate.frame_id:08d}-{self._record_counter:06d}"
         metadata = dict(candidate.metadata)
+        metadata.setdefault("target_presence", candidate.target_presence.value)
         return MemoryRecord(
             record_id=record_id,
             kind=candidate.kind,
@@ -192,13 +203,25 @@ class GatedMemoryUpdatePolicy:
                     return self._reject("负记忆只接受 identity_match=different 的候选")
                 return MemoryUpdateDecision(True, "模型判定为 different 的干扰物证据", 1, self._new_record(candidate))
 
-            if candidate.target_presence is not TargetPresence.PRESENT:
-                self.reset_pending()
-                return self._reject("只有 present 观测可更新正/语义记忆")
-            if candidate.identity_match is not IdentityMatch.SAME:
-                self.reset_pending()
-                return self._reject("只有 identity_match=same 的观测可更新正/语义记忆")
             if candidate.kind is MemoryKind.SEMANTIC:
+                temporal_event = str(candidate.metadata.get("temporal_event") or "")
+                if (
+                    candidate.target_presence is TargetPresence.PRESENT
+                    and candidate.identity_match is not IdentityMatch.SAME
+                ):
+                    self._reset_semantic_pending_unlocked()
+                    return self._reject("present 语义更新必须来自 identity_match=same 的观测")
+                if candidate.target_presence not in {
+                    TargetPresence.PRESENT,
+                    TargetPresence.ABSENT,
+                }:
+                    self._reset_semantic_pending_unlocked()
+                    return self._reject("语义更新只接受 present/absent 跟踪状态")
+                if candidate.target_presence is TargetPresence.ABSENT and temporal_event != (
+                    SEMANTIC_EVENT_DISAPPEARANCE
+                ):
+                    self._reset_semantic_pending_unlocked()
+                    return self._reject("只有首次消失转折可写入 absent 语义记忆")
                 if not candidate.text.strip():
                     self._reset_semantic_pending_unlocked()
                     return self._reject("语义记忆文本为空")
@@ -223,10 +246,15 @@ class GatedMemoryUpdatePolicy:
                     self._semantic_streak = 1
                 self._pending_semantic_frame = candidate.frame_id
                 self._pending_semantic_text = text
-                if self._semantic_streak < self.config.semantic_confirmations:
+                required_confirmations = (
+                    1
+                    if temporal_event in SEMANTIC_TRANSITION_EVENTS
+                    else self.config.semantic_confirmations
+                )
+                if self._semantic_streak < required_confirmations:
                     return self._reject(
                         "等待跨帧相近 memory_update 提议确认"
-                        f"（{self._semantic_streak}/{self.config.semantic_confirmations}）",
+                        f"（{self._semantic_streak}/{required_confirmations}）",
                         self._semantic_streak,
                     )
                 confirmations = self._semantic_streak
@@ -237,6 +265,13 @@ class GatedMemoryUpdatePolicy:
                     confirmations,
                     self._new_record(candidate),
                 )
+
+            if candidate.target_presence is not TargetPresence.PRESENT:
+                self.reset_pending()
+                return self._reject("只有 present 观测可更新正视觉记忆")
+            if candidate.identity_match is not IdentityMatch.SAME:
+                self.reset_pending()
+                return self._reject("只有 identity_match=same 的观测可更新正视觉记忆")
 
             # 正视觉记忆应包含可定位目标，便于后续正确裁剪和 mosaic。
             if candidate.bbox_xywh is None:
@@ -286,6 +321,13 @@ class GatedMemoryUpdatePolicy:
             raise TypeError("bank 必须是 MemoryBank")
         with self._lock:
             if candidate.kind is MemoryKind.SEMANTIC:
+                temporal_event = str(candidate.metadata.get("temporal_event") or "")
+                if (
+                    candidate.target_presence is TargetPresence.ABSENT
+                    and temporal_event != SEMANTIC_EVENT_DISAPPEARANCE
+                ):
+                    self._reset_semantic_pending_unlocked()
+                    return self._reject("只有首次消失转折可写入 absent 语义记忆")
                 normalized = " ".join(candidate.text.casefold().split())
                 if any(
                     " ".join(record.text.casefold().split()) == normalized
@@ -293,7 +335,8 @@ class GatedMemoryUpdatePolicy:
                 ):
                     return self._reject("语义记忆与已有记录重复")
                 if (
-                    self._last_semantic_update_frame is not None
+                    temporal_event not in SEMANTIC_TRANSITION_EVENTS
+                    and self._last_semantic_update_frame is not None
                     and candidate.frame_id - self._last_semantic_update_frame
                     < self.config.min_semantic_frame_gap
                 ):

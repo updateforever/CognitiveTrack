@@ -31,25 +31,36 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 
-from cogtrack.protocol import ModelOutputParseError
+from cogtrack.protocol import (
+    BBOX_PROTOCOL_NORM1000,
+    BBOX_PROTOCOL_QWEN_ABS_PIXEL,
+    MEMORY_UPDATE_JSON_KEY,
+    TARGET_STATUS_JSON_KEY,
+    ModelOutputParseError,
+    bbox_protocol_json_key,
+)
 from cogtrack.vlm import parse_tracking_output
 
 VALID_ROLES = {"system", "user", "assistant", "tool"}
 VALID_PRESENCE = {"present", "absent"}
+# 模型可见的输出字段名统一由 cogtrack.protocol 定义；这里不再硬编码，避免协议
+# 改名后校验器与导出器不一致。
 TRACKING_OUTPUT_KEYS = frozenset(
     {
-        "target_status",
-        "bbox_norm1000_xyxy",
+        TARGET_STATUS_JSON_KEY,
+        bbox_protocol_json_key(BBOX_PROTOCOL_NORM1000),
     }
 )
-TRACKING_OUTPUT_KEYS_WITH_MEMORY = TRACKING_OUTPUT_KEYS | {"memory_update"}
+TRACKING_OUTPUT_KEYS_WITH_MEMORY = TRACKING_OUTPUT_KEYS | {MEMORY_UPDATE_JSON_KEY}
 TRACKING_PIXEL_OUTPUT_KEYS = frozenset(
     {
-        "target_status",
-        "bbox_pixel_xyxy",
+        TARGET_STATUS_JSON_KEY,
+        bbox_protocol_json_key(BBOX_PROTOCOL_QWEN_ABS_PIXEL),
     }
 )
-TRACKING_PIXEL_OUTPUT_KEYS_WITH_MEMORY = TRACKING_PIXEL_OUTPUT_KEYS | {"memory_update"}
+TRACKING_PIXEL_OUTPUT_KEYS_WITH_MEMORY = TRACKING_PIXEL_OUTPUT_KEYS | {
+    MEMORY_UPDATE_JSON_KEY
+}
 
 
 @dataclass(frozen=True)
@@ -295,14 +306,15 @@ def parse_training_tracking_answer(value: Any) -> dict[str, Any]:
         set(TRACKING_PIXEL_OUTPUT_KEYS_WITH_MEMORY),
     )
     if answer_keys not in valid_key_sets:
-        pixel = "bbox_pixel_xyxy" in answer
+        pixel = bbox_protocol_json_key(BBOX_PROTOCOL_QWEN_ABS_PIXEL) in answer
+        has_memory = MEMORY_UPDATE_JSON_KEY in answer
         expected = (
             TRACKING_PIXEL_OUTPUT_KEYS_WITH_MEMORY
-            if pixel and "memory_update" in answer
+            if pixel and has_memory
             else TRACKING_PIXEL_OUTPUT_KEYS
             if pixel
             else TRACKING_OUTPUT_KEYS_WITH_MEMORY
-            if "memory_update" in answer
+            if has_memory
             else TRACKING_OUTPUT_KEYS
         )
         missing = sorted(expected - answer_keys)
@@ -331,15 +343,19 @@ def parse_training_tracking_answer(value: Any) -> dict[str, Any]:
             )
         )
         bbox_protocol = (
-            "qwen_abs_pixel" if "bbox_pixel_xyxy" in answer else "norm1000"
+            BBOX_PROTOCOL_QWEN_ABS_PIXEL
+            if bbox_protocol_json_key(BBOX_PROTOCOL_QWEN_ABS_PIXEL) in answer
+            else BBOX_PROTOCOL_NORM1000
         )
         parse_tracking_output(
             canonical,
             image_width=1000,
             image_height=1000,
             bbox_protocol=bbox_protocol,
-            model_image_size=(1000, 1000) if bbox_protocol == "qwen_abs_pixel" else None,
-            require_memory_update="memory_update" in answer,
+            model_image_size=(
+                (1000, 1000) if bbox_protocol == BBOX_PROTOCOL_QWEN_ABS_PIXEL else None
+            ),
+            require_memory_update=MEMORY_UPDATE_JSON_KEY in answer,
             strict_memory_update=True,
         )
     except (ModelOutputParseError, OverflowError, TypeError, ValueError) as error:
@@ -587,16 +603,21 @@ def to_grpo_record(record: Mapping[str, Any]) -> dict[str, Any]:
     answer = parse_answer_json(solution)
     if answer:
         for key in (
+            TARGET_STATUS_JSON_KEY,
             "target_status",
             "target_presence",
-            "memory_update",
+            MEMORY_UPDATE_JSON_KEY,
             "bbox",
+            bbox_protocol_json_key(BBOX_PROTOCOL_NORM1000),
+            bbox_protocol_json_key(BBOX_PROTOCOL_QWEN_ABS_PIXEL),
             "bbox_norm1000_xyxy",
-            "bbox_pixel_xyxy",
             "bbox_format",
         ):
             if key in answer and key not in result:
                 result[key] = answer[key]
-        if "target_status" in answer and "target_presence" not in result:
+        # reward 侧统一读 ``target_presence``；模型输出字段名为 ``status``。
+        if TARGET_STATUS_JSON_KEY in answer and "target_presence" not in result:
+            result["target_presence"] = answer[TARGET_STATUS_JSON_KEY]
+        elif "target_status" in answer and "target_presence" not in result:
             result["target_presence"] = answer["target_status"]
     return result

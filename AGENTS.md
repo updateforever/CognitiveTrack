@@ -1,321 +1,137 @@
 # CognitiveTrack Agent Instructions
 
-**Last Updated**: 2026-08-14  
-**Project**: CognitiveTrack - VLM-based Long-term Object Tracking
+**Last updated:** 2026-08-18
+**Current phase:** Both formal v6.4 SFT releases and their processor preflights are complete;
+mixed-package training and online inference alignment are in progress.
 
----
+Read this file with [`docs/README.md`](docs/README.md),
+[`docs/project_status.md`](docs/project_status.md), and [`docs/setup.md`](docs/setup.md).
+Do not ask the user to restate facts recorded there.
 
-## 🎯 Current Status (2026-08-14)
+## Current protocol
 
-### ✅ Phase 1: VLT-v6.3.1 Core SFT Framework - COMPLETED
+CognitiveTrack studies pure-VLM long-term single-object tracking under:
 
-**Achievement**: Complete data generation framework with research-validated innovations
-
-**Key Deliverables**:
-1. ✅ Prompt v6.3.1 optimization (simplified 3-image protocol)
-2. ✅ MGIT action-layer text extraction (official approach)
-3. ✅ Complete data generation framework (6 modules)
-4. ✅ VLM tracking research report (8 major works analyzed)
-5. ✅ Local smoke test (all passed)
-
-**Target**: 50K+ Core SFT samples, 80:20 present/absent ratio
-
-**Next Step**: Deploy to training server → full data generation (10-20 hours)
-
----
-
-## 🔥 Core Innovations (Research-Validated)
-
-### 1. **TU-GRPO (Trajectory-Utility GRPO)** 🔥🔥🔥
-- **Innovation**: Counterfactual future trajectory utility
-- **vs ReasoningTrack**: Current-frame IoU gain
-- **Formula**: `Delta-U-H = U(future | accept) - U(future | keep)`
-
-### 2. **Identity-State Disentanglement** 🔥🔥🔥
-- **Permanent identity anchor**: First frame, never overwritten
-- **Dynamic state complete replacement**: Not incremental, avoid contradiction accumulation
-- **Anti-drift mechanism**: Image 1 always present as identity reference
-
-### 3. **Event-Driven State Annotation** 🔥🔥
-- **Not per-frame captioning**: Event candidate mining
-- **Dual-teacher generation**: Qwen3-VL-32B × 2, consistency acceptance
-- **Multi-dimensional verification**: Region-text alignment, distractor margin, stability
-- **Quality over quantity**: 3-5K high-quality events vs tens of thousands per-frame
-
-### 4. **Presence-Aware Protocol** 🔥🔥
-- **Explicit supervision**: `target_status: present/absent`
-- **20% absent samples**: Gap in existing works
-- **State retention on absent**: Support reappearance recovery
-
----
-
-## 📂 Project Structure
-
-### Core Modules
-```
-cogtrack/
-├── prompts/
-│   └── vlt_tracking.py          # Prompt v6.3.1
-├── training/
-│   ├── sample_builder.py        # Sampling strategy, positive/negative samples
-│   ├── state_generator.py       # VLM-based state description generation
-│   └── ...
-
-tracking/
-├── synthesize_vlt_v631_core_data.py  # Main generation script
-└── ...
-
-scripts/
-├── generate_vlt_v631_core_data.sh    # One-click launcher
-├── visualize_training_samples.py     # Quality check
-└── test_data_generation.py           # Quick validation
-
-pytracking/datasets/
-├── mgit.py                      # MGIT action-layer text extraction
-├── lasot.py
-└── tnl2k.py
+```text
+Sequence -> initialize -> track -> ResultWriter -> Evaluator
 ```
 
-### Documentation
-```
-docs/
-├── executive_summary.md                    # 📖 START HERE
-├── vlt_v631_data_generation_optimized.md  # Research-informed design
-├── smoke_test_report.md                   # Local validation results
-└── implementation_progress.md             # Progress tracking
-```
+The student is `Qwen3-VL-4B-Instruct`. Native Prompt version is `6.4.0` with three images:
 
----
+1. Image 1: an earlier full present frame with a red target box; identity anchor.
+2. Image 2: three boxed trusted observations, chronological left-to-right with white separators.
+3. Image 3: current full search frame without a box.
 
-## 🚀 Quick Start: Training Server Deployment
+The Qwen3-VL response is:
 
-### Step 1: Deploy vLLM (Qwen2.5-VL-32B)
-```bash
-cd /data2/wyp/VLMTrack/CognitiveTrack
-bash scripts/start_vllm_qwen25_vl_32b.sh
-
-# Verify service
-curl http://127.0.0.1:8000/v1/models
+```json
+{"bbox_2d":[100,120,400,520],"status":"present","memory_update":null}
 ```
 
-### Step 2: Quick Test (Single Sequence, 3 Samples)
-```bash
-LOCAL_VLLM_BASE_URL=http://127.0.0.1:8000/v1 \
-LOCAL_VLLM_API_KEY=local-test-key \
-python scripts/test_data_generation.py
+`bbox_2d` is Image-3 `[0,1000] xyxy`. A non-null `memory_update` is a complete replacement
+dynamic referring expression, never an appended delta. Permanent identity and dynamic history must
+be gated so a bad prediction cannot overwrite the identity anchor. Dynamic memory may explicitly
+describe disappearance and reappearance; the permanent visual identity remains separate.
+
+## Data taxonomy and supervision
+
+Use user-facing/data names `tracking_sft` and `state_update_sft`; do not introduce new “Core” or
+“Memory stage” names. Historical `tracking_core` remains a read-only compatibility alias.
+
+`tracking_sft` covers LaSOT, TNL2K, and MGIT tiny/train with 27 legal visual combinations:
+
+- temporal event: continuous present, absent, reappearance;
+- history quality: clean, one jittered box, one stale box;
+- completeness: H0-H3, with H0 clean only, H1 no stale, stale requiring H2/H3.
+
+`tracking_sft` does not provide memory labels: placeholder `memory_update:null` is `masked_unknown`
+for both present and absent rows, and only its value is masked. Bbox, status, field names, JSON
+closure, and suffix remain supervised.
+
+`state_update_sft` combines:
+
+1. all reliable MGIT official action-segment labels;
+2. 2,329 additional LaSOT/TNL2K labels produced by the remote `qwen3-vl-plus` teacher workflow.
+
+The formal MGIT release is
+`data/releases/cogtrack_vlt_v640_state_update_mgit_segments_v1`: 734 labels across 91 sequences,
+350 updates and 384 present hard-nulls, split 645/89, with zero `masked_unknown`. The completed
+combined release is `data/releases/cogtrack_vlt_v640_state_update_sft_combined_3063_v1`: 3,063
+rows across 315 sequences, split 2,861/202, with 2,253 updates, 810 verified hard-nulls, and zero
+`masked_unknown`.
+
+After both primary releases are complete, an optional selective annotation pass may label clearly
+identified disappearance/reappearance cases already present in `tracking_sft`. Store those labels as
+a sample-id overlay or derived release; never mutate the original tracking release, never duplicate
+masked and labelled versions in one training mix, and do not couple this pass to the independent
+`state_update_sft` generation.
+
+## Canonical entrypoints
+
+```text
+scripts/generate_tracking_sft_data.sh
+scripts/generate_state_update_sft_data.sh
+scripts/generate_state_update_api_bundle.sh
+scripts/modelscope_state_update_transfer.sh
+scripts/build_state_update_sft_release.sh
+scripts/build_mixed_sft_release.sh
+scripts/train_qwen3vl_4b_tracking_sft.sh
 ```
 
-### Step 3: Visualize & Validate
-```bash
-python scripts/visualize_training_samples.py \
-  --data_dir /tmp/vlt_v631_test \
-  --num_samples 3
+The only general v6 renderer is `tracking/synthesize_vlt_v6_dataset.py`. Do not reintroduce old
+prototype generation entrypoints.
+
+The current additional-label path packages selected three-image cases and uses
+`tracking/annotate_state_update_openai_api.py` with an OpenAI-compatible endpoint. Each
+present case receives one strong teacher call; `uncertain`, low-confidence, malformed, physically
+identity-drifting, and vacuous responses are dropped. The Image-1 visual box is the permanent
+identity anchor; the supplied initial text is immutable provenance but may be coarse or wrong, so a
+later memory update may substantially correct it without being identity drift. Dataset GT
+deterministically labels disappearance transitions; a present case following an absent memory must
+generate a reappearance referring expression. Prompt 2.2.1 labels each image role in the API
+message, requires evidence to start from Image 3, and suppresses updates for incidental direction
+or background changes. Reports use
+`annotation_policy=single_pass_frontier_api_v1`, `quality_gate_applied=true`, `dry_run=false`, and
+`minimum_output_reached=true`. Do not describe this policy as independent verification.
+
+## Historical release
+
+The completed v6.3.1 release remains available only as a historical baseline:
+
+```text
+data/releases/cogtrack_vlt_v631_core_r80_20_case20_robust15_v1
 ```
 
-### Step 4: Full Generation (10-20 hours, ~50K samples)
-```bash
-bash scripts/generate_vlt_v631_core_data.sh
-```
+It contains 50,220 unique cases and 57,426 views, but uses old Prompt/output keys. Never overwrite,
+rename, or cross-load it as v6.4 data.
 
-### Step 5: Quality Check
-```bash
-# Statistics
-cat /data2/wyp/VLMTrack/CognitiveTrack/data/vlt_v631_core_sft/generation_stats.json
+This server's MGIT mirror has 105 official tiny/train names, 10 missing frame directories and 4
+empty directories; exactly 91 sequences are usable. Do not claim 95 or 105 usable sequences.
 
-# Visualize 50 samples
-python scripts/visualize_training_samples.py --num_samples 50
-```
+## Immediate work
 
----
+1. Finish the running 2×H100 frozen-ViT full SFT and record its validation/checkpoint report.
+2. Load the resulting full checkpoint through both local HF and vLLM Prompt-6.4 configurations.
+3. Finish the Prompt-6.4 online inference alignment and its no-GT-leakage smoke.
+4. Compare Base, old Stage-2, and the new model on the same CognitiveBench-Tiny v6.4 setup.
+5. Keep the optional memory overlay deferred until the SFT comparison justifies its cost.
+6. TU-GRPO comes only after SFT and state-update evaluation.
 
-## 📊 Data Generation Specs
+Do not claim accuracy improvement from data generation, processor replay, or finite loss. Only a
+frozen CognitiveBench comparison establishes tracking improvement.
 
-### Sampling Strategy
-- **Max frame span**: 200 frames
-- **History buffer**: 3 frames, interval 10
-- **Samples per sequence**: 8/15/30 (short/medium/long)
+## Leakage and development constraints
 
-### Sample Type Distribution
-| Type | Ratio | Description |
-|------|-------|-------------|
-| Pure Positive | 70% | Present, all history correct |
-| Current Absent | 15% | Target absent (occluded/out-of-view) |
-| History Noisy | 10% | 1-2 history frames with errors |
-| Mixed Hard | 5% | Current absent + noisy history |
-
-**Result**: Present:Absent = 80:20
-
-### Expected Data Scale
-| Dataset | Sequences | Samples/Seq | Total |
-|---------|-----------|-------------|-------|
-| LaSOT train | ~1,120 | ~18 | ~20,000 |
-| TNL2K train | ~1,300 | ~12 | ~15,600 |
-| MGIT train | ~150 | ~25 | ~3,750 |
-| **Total** | **~2,570** | - | **~39,350** |
-
-Target: **40K-50K Core SFT samples**
-
----
-
-## 🔬 Research Context
-
-### Differentiation from Related Works
-
-| Dimension | DTLLM-VLT | DUTrack | ReasoningTrack | **VLT-v6.3.1** |
-|-----------|-----------|---------|----------------|----------------|
-| Data Generation | SAM + caption | Fixed threshold | Fixed interval | **Event-driven + dual-teacher** |
-| Text Structure | Single description | Dynamic update | CoT + bbox | **Identity-state disentanglement** |
-| Absent Supervision | Not explicit | Not explicit | Not explicit | **Explicit 20% negative samples** |
-| GRPO Reward | N/A | N/A | Current-frame IoU | **Future trajectory Delta-U** |
-| Data Scale | 26K + 214K | Not specified | Not specified | **50K Core + 3-5K Memory** |
-
-### Key Research Findings
-- ❌ **Gap**: Existing works rarely handle absent frames explicitly
-- ❌ **Limitation**: Fixed thresholds/intervals (DUTrack IoU<0.7, ReasoningTrack fixed interval)
-- ❌ **Myopic reward**: Current-frame IoU insufficient (ReasoningTrack)
-- ✅ **Consensus**: Region-based caption preferred
-- ✅ **Discovery**: Concise better than detailed (DUTrack finding)
-
----
-
-## 📅 12-Week Timeline
-
-### Week 1-2: Core SFT Data Generation ⏳ **← CURRENT**
-- Deploy vLLM (Qwen2.5-VL-32B)
-- Quick test & validation
-- Full generation (50K+ samples, 10-20 hours)
-- Quality check (visualization + statistics)
-
-### Week 3-4: Core SFT Training
-- Train Qwen3-VL-4B
-- CognitiveBench-Tiny evaluation
-- Verify presence + bbox baseline capabilities
-
-### Week 5-6: Memory Label Generation
-- Event candidate mining (DINOv2 features)
-- Dual-teacher generation (Qwen3-VL-32B × 2)
-- Human audit 500-1000 for calibration
-- Output 3-5K high-quality events
-
-### Week 7-8: Memory SFT
-- Mixed training: 70% core + 30% memory
-- Causal evaluation: memory-on vs forced-null
-
-### Week 9-10: TU-GRPO Training
-- Reward replay: validate Delta-U distribution
-- GRPO training
-- Full benchmark evaluation
-
-### Week 11-12: Ablation & Paper
-- Complete ablation studies
-- Error analysis
-- Paper writing
-
----
-
-## 📖 Key Documentation
-
-### Must-Read (Priority Order)
-1. **[Executive Summary](docs/executive_summary.md)** - Complete work summary, start here
-2. **[Optimized Data Generation](docs/vlt_v631_data_generation_optimized.md)** - Research-informed design
-3. **[Smoke Test Report](docs/smoke_test_report.md)** - Local validation results
-4. **Research Report**: `/tmp/vlm_tracking_data_generation_research.md` - 8 major works analyzed
-
-### Implementation Details
-- [Implementation Progress](docs/implementation_progress.md)
-- [Data Generation Design](docs/vlt_v631_data_generation.md)
-- [Project Status](docs/project_status.md)
-
----
-
-## 🎯 Working Principles for Agents
-
-### 1. **Understand Current Phase**
-- We are at **Phase 1 completion**: Core SFT framework ready
-- Next action: **Deploy to training server**
-- Do NOT jump to Memory SFT or GRPO yet
-
-### 2. **Respect Research Foundations**
-- All design decisions are research-validated
-- See `/tmp/vlm_tracking_data_generation_research.md` for references
-- Major changes should cite related work comparisons
-
-### 3. **Quality over Speed**
-- Event-driven annotation (3-5K) beats per-frame dense (tens of thousands)
-- Dual-teacher + verification prevents bias
-- Human audit calibrates thresholds
-
-### 4. **Incremental Validation**
-- Quick test first (single sequence)
-- Visualize before full generation
-- Statistics + manual review after generation
-
-### 5. **Documentation Culture**
-- Update [implementation_progress.md](docs/implementation_progress.md) after major milestones
-- Keep [executive_summary.md](docs/executive_summary.md) as single source of truth
-- Archive outdated docs to `docs/archive/`
-
----
-
-## 🔧 Common Tasks
-
-### Add New Dataset
-1. Create loader in `pytracking/datasets/`
-2. Follow MGIT pattern: action-layer text extraction
-3. Update `synthesize_vlt_v631_core_data.py`
-4. Update expected sample counts in docs
-
-### Modify Sampling Strategy
-1. Edit `cogtrack/training/sample_builder.py`
-2. Run smoke test: `python -c "from cogtrack.training.sample_builder import SampleBuilder; ..."`
-3. Update `sample_type_ratios` in main script
-4. Document changes in `vlt_v631_data_generation_optimized.md`
-
-### Change State Description Prompt
-1. Edit `cogtrack/training/state_generator.py`
-2. Test with quick generation script
-3. Visualize 10-20 samples
-4. Document prompt version in commit message
-
-### Debug Data Generation Issues
-1. Check vLLM service: `curl http://127.0.0.1:8000/v1/models`
-2. Run test script: `python scripts/test_data_generation.py`
-3. Check logs in `/workspace/tmp/vllm_*.log`
-4. Visualize failed samples
-
----
-
-## 🚫 What NOT to Do
-
-1. ❌ **Do NOT** modify Prompt v6.3.1 without research justification
-2. ❌ **Do NOT** change 80:20 present/absent ratio arbitrarily
-3. ❌ **Do NOT** skip visualization validation
-4. ❌ **Do NOT** start Memory SFT before Core SFT data is ready
-5. ❌ **Do NOT** implement GRPO before Memory SFT warm-up
-
----
-
-## 📞 Getting Help
-
-### If Data Generation Fails
-1. Check smoke test report: [docs/smoke_test_report.md](docs/smoke_test_report.md)
-2. Verify vLLM deployment
-3. Check dataset paths in environment config
-4. Review error logs
-
-### If Quality Issues Arise
-1. Visualize samples: `python scripts/visualize_training_samples.py`
-2. Check statistics: `generation_stats.json`
-3. Review state description prompt
-4. Compare with research report findings
-
-### For Conceptual Questions
-1. Read executive summary: [docs/executive_summary.md](docs/executive_summary.md)
-2. Check research report: `/tmp/vlm_tracking_data_generation_research.md`
-3. Review differentiation table in this file
-
----
-
-**Last Git Commit**: feat: implement VLT-v6.3.1 Core SFT data generation framework (30e52e5)  
-**Status**: ✅ Local smoke test passed, ready for training server deployment  
-**Next Milestone**: Complete Core SFT data generation (Week 1-2)
+- Training uses Qwen3-VL relative norm1000 boxes and official ms-swift `<bbox> + objects.bbox +
+  image_id` with `QWENVL_BBOX_FORMAT=new`.
+- Qwen2.5 absolute-pixel views never cross-load into Qwen3 training.
+- Reference/history frames are same-sequence present frames strictly earlier than current.
+- Negatives are real same-sequence absent frames. Current is never boxed.
+- Online inference uses GT only at initialization; later current/future GT never enters the tracker.
+- Split by complete sequence.
+- Current docs live at top-level `docs/`; historical designs live in `docs/archive/`.
+- Prompt text lives only in `cogtrack/prompts/`; paths live in config/environment variables.
+- Data, models, outputs, checkpoints, and caches do not enter Git.
+- Preserve user changes; never use destructive reset/checkout to clean a dirty worktree.
+- Formal state-label reports must declare `minimum_output_reached=true` (default minimum 1,200).
+- Before committing, run Ruff, complete active tests, and relevant processor/training preflight.

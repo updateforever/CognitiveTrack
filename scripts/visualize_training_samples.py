@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""可视化 VLT-v6.3.1 训练样本。
+"""可视化 VLT-v6.4 训练样本。
 
 随机抽取样本，渲染三图 + 标注，检查数据质量。
 """
@@ -127,13 +127,13 @@ def visualize_sample(annotation_path: Path, output_path: Path):
 
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
-    except:
+    except OSError:
         font = ImageFont.load_default()
 
     text_lines = [
         f"Sample ID: {data['sample_id']} | Dataset: {data['dataset_name']} | Sequence: {data['sequence_name']}",
         f"Sample Type: {data['sample_type']}",
-        f"",
+        "",
         f"Initial Identity: {data['initial_identity']}",
         f"Previous State: {data['previous_state']}",
         f"Target Status: {data['target_status']}",
@@ -162,7 +162,7 @@ def main():
     """主函数"""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Visualize VLT-v6.3.1 training samples")
+    parser = argparse.ArgumentParser(description="Visualize VLT-v6.4 training samples")
     parser.add_argument(
         "--data_dir",
         type=str,
@@ -207,7 +207,7 @@ def main():
             print(f"❌ Error visualizing {anno_file.name}: {e}")
 
     print()
-    print(f"✅ Visualization complete!")
+    print("✅ Visualization complete!")
     print(f"Output directory: {output_dir}")
 
 

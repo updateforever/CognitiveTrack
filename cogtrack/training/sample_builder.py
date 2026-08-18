@@ -10,7 +10,6 @@ import random
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 from PIL import Image

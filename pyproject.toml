@@ -25,7 +25,8 @@ qwen = [
   "qwen-vl-utils>=0.0.14",
   "accelerate>=0.30",
 ]
-train = ["ms-swift>=4.3,<5"]
+train = ["ms-swift>=4.3,<5", "deepspeed==0.19.5"]
+annotation = ["openai>=1.40"]
 sutrack = [
   "torch>=2.1",
   "torchvision>=0.16",

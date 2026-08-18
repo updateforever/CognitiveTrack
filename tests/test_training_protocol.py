@@ -18,8 +18,8 @@ from cogtrack.training.swift_dataset import (
 
 def _payload() -> dict:
     return {
-        "target_status": "present",
-        "bbox_norm1000_xyxy": [100, 120, 400, 520],
+        "status": "present",
+        "bbox_2d": [100, 120, 400, 520],
     }
 
 
@@ -51,14 +51,14 @@ def test_presence_only_answer_requires_exact_two_fields_and_valid_norm1000_bbox(
     assert _protocol_errors(with_extra)
 
     missing = deepcopy(valid)
-    missing.pop("bbox_norm1000_xyxy")
+    missing.pop("bbox_2d")
     assert _protocol_errors(missing)
 
     legacy_confidence = {**valid, "presence_confidence": 0.9}
     assert _protocol_errors(legacy_confidence)
 
     outside_norm1000 = deepcopy(valid)
-    outside_norm1000["bbox_norm1000_xyxy"] = [-1, 100, 400, 500]
+    outside_norm1000["bbox_2d"] = [-1, 100, 400, 500]
     assert _protocol_errors(outside_norm1000)
 
 
@@ -78,11 +78,11 @@ def test_memory_labeled_answer_accepts_the_versioned_three_field_protocol():
     assert CognitiveConsistencyReward()([json.dumps(with_delta)]) == [1.0]
 
     absent_with_memory = {
-        "target_status": "absent",
-        "bbox_norm1000_xyxy": None,
+        "status": "absent",
+        "bbox_2d": None,
         "memory_update": "The target changed appearance.",
     }
-    assert _protocol_errors(absent_with_memory)
+    assert not _protocol_errors(absent_with_memory)
 
 
 @pytest.mark.parametrize(
@@ -95,8 +95,8 @@ def test_memory_labeled_answer_accepts_the_versioned_three_field_protocol():
 def test_training_accepts_the_same_binary_states_as_inference(status: str, bbox: list[int] | None):
     payload = _payload()
     payload.update(
-        target_status=status,
-        bbox_norm1000_xyxy=bbox,
+        status=status,
+        bbox_2d=bbox,
     )
     assert not _protocol_errors(payload)
     text = json.dumps(payload)
@@ -118,8 +118,8 @@ def test_sft_and_grpo_reject_the_same_inconsistent_states(
 ):
     payload = _payload()
     payload.update(
-        target_status=status,
-        bbox_norm1000_xyxy=bbox,
+        status=status,
+        bbox_2d=bbox,
     )
     assert _protocol_errors(payload)
     text = json.dumps(payload)

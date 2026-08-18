@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""使用本地 Qwen-VL 完成一次真实的双图跟踪推理。
+"""使用本地 Qwen-VL 完成一次真实的 VLT-v6.4 三图跟踪推理。
 
 该脚本从标准数据集 loader 读取首帧和一个后续帧，只把首帧 GT 传给 tracker；
-后续帧 GT 仅用于脚本结束后的人工核对，不进入模型输入或 ``frame_info``。
+尚无动态历史时 Image 2 由首帧可信观测补齐。后续帧 GT 仅用于脚本结束后的
+人工核对，不进入模型输入或 ``frame_info``。
 """
 
 from __future__ import annotations
@@ -184,7 +185,7 @@ def main() -> int:
     if status != "ok":
         print(f"[失败] 本地 Qwen 推理未得到合法结果，execution={status}", file=sys.stderr)
         return 2
-    print("[成功] 本地 Qwen-VL 加载、双图生成、严格解析和坐标转换均已通过。")
+    print("[成功] 本地 Qwen-VL 加载、三图生成、严格解析和坐标转换均已通过。")
     return 0
 
 

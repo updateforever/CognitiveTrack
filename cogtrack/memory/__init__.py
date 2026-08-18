@@ -3,6 +3,10 @@
 from .bank import MemoryBank, MemoryBankConfig
 from .records import IdentityAnchor, MemoryKind, MemoryRecord, MemorySource
 from .update_policy import (
+    SEMANTIC_EVENT_CONTINUED_ABSENCE,
+    SEMANTIC_EVENT_CONTINUOUS_PRESENT,
+    SEMANTIC_EVENT_DISAPPEARANCE,
+    SEMANTIC_EVENT_REAPPEARANCE,
     GatedMemoryUpdatePolicy,
     MemoryCandidate,
     MemoryUpdateDecision,
@@ -20,4 +24,8 @@ __all__ = [
     "MemorySource",
     "MemoryUpdateDecision",
     "MemoryUpdatePolicyConfig",
+    "SEMANTIC_EVENT_CONTINUED_ABSENCE",
+    "SEMANTIC_EVENT_CONTINUOUS_PRESENT",
+    "SEMANTIC_EVENT_DISAPPEARANCE",
+    "SEMANTIC_EVENT_REAPPEARANCE",
 ]

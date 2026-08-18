@@ -69,6 +69,8 @@ class CognitiveDecisionEngine:
             model_image_size=response.current_frame_size(),
         )
         try:
+            # 解析层同时负责协议校验和坐标还原：Qwen3 norm1000 框最终转换为
+            # 原始 Image-3 像素 xywh。不要在 tracker 其他位置重复做坐标缩放。
             parsed = parse_tracking_output(
                 response.text,
                 image_width,
@@ -112,6 +114,8 @@ class CognitiveDecisionEngine:
             context=context,
             raw_model_response=response.text,
         )
+        # 状态机只接收成功解析后的 prediction。模型异常和 parse_error 会走失败
+        # 分支，只增加 error/uncertain 时长，不会增加 absent_duration。
         transition = self._transition(frame_id, ExecutionStatus.OK, parsed.prediction)
         return CognitiveDecisionResult(frame_result, transition)
 

@@ -40,7 +40,8 @@ def _first_present(path: Path) -> dict[str, Any]:
 
 
 def _assistant_json(decoded: str) -> dict[str, Any]:
-    candidates = re.findall(r'\{"target_status":"present"[^\n]*\}', decoded)
+    # 模型可见协议以 bbox 字段开头：{"bbox_2d":[...],"status":"present",...}
+    candidates = re.findall(r'\{"bbox_(?:2d|pixel_xyxy)":[^\n]*\}', decoded)
     for text in reversed(candidates):
         try:
             payload = json.loads(text)
@@ -144,7 +145,7 @@ def _verify_family(
         )
         expected_norm_bbox = "none"
     elif family == "qwen3_vl":
-        field = "bbox_norm1000_xyxy"
+        field = "bbox_2d"
         expected = _expected_qwen3(real_box, original_size=original_size)
         expected_norm_bbox = "norm1000"
     else:  # pragma: no cover - argparse 已限制

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""构造 VLT-v6 三图核心跟踪 SFT 数据。
+"""构造 VLT-v6.4 三图 tracking/state-update SFT 数据。
 
 固定输入为：带框初始化目标图、带框历史轨迹 mosaic、当前无框搜索图；动态文本为
-初始化目标描述与最近一条已接受状态记忆。首轮默认 ``masked_null``：完整输出仍包含
-``memory_update``，但训练脚本只屏蔽该字段值，监督存在性与 bbox。
+初始化目标描述与最近一条已接受状态记忆。tracking SFT 默认 ``masked_null``；
+state-update SFT 使用逐帧显式标签。
 
 示例：
 
@@ -12,7 +12,7 @@
       --mgit-version tiny --allow-missing-mgit-sequences \
       --env-config configs/env.local.yaml \
       --max-samples-per-sequence 20 --absent-ratio 0.3 \
-      --output-dir data/releases/cogtrack_vlt_v6_core
+      --output-dir data/releases/cogtrack_vlt_v640_tracking_sft
 """
 
 from __future__ import annotations

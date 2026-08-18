@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""从公开跟踪训练集合成可重放的 VLM 跟踪数据。
+"""VLT-v6.4 合成器的内部 CLI 实现。
+
+正式用户入口只有 ``tracking/synthesize_vlt_v6_dataset.py``。本文件保留旧文件名是为了
+避免在 8×4090 迁移前进行近千行机械重命名；它不是可独立选择旧 Stage-1 协议的入口。
 
 该入口固定使用 LaSOT、TNL2K、MGIT 的官方 ``train`` 划分，不提供切换到
 test/val 的参数。每条样本只监督：
@@ -7,18 +10,17 @@ test/val 的参数。每条样本只监督：
 1. 根据完整过去参考图中的目标指代，判断同一目标在当前帧中是否存在；
 2. 目标存在时在当前帧中的官方 Qwen grounding 框。
 
-默认 profile 保留旧 Stage-1 坐标文本/二字段行为，用于复现实验。视觉指代实验通过
-独立 wrapper 调用同一构建引擎：visual-v5 保留历史协议；VLT-v6 固定“带框初始化图 +
-历史轨迹 mosaic + 当前搜索图”，并加入初始化文本和最近状态记忆。VLT-v6 的首轮核心
-SFT 保留三字段输出，但只监督存在性与 bbox，``memory_update`` 值由 ms-swift mask。
-所有 profile 均不构造 reasoning、置信度或旧六分类标签。
+实现内部仍保留少量 legacy profile 供归档测试重放，但当前命令只能通过 v6.4 wrapper
+进入。VLT-v6.4 固定“带框初始化图 + 历史轨迹 mosaic + 当前搜索图”，加入初始化文本
+和最近状态记忆，并使用三字段输出；``tracking_sft`` 只 mask 未知的
+``memory_update`` 值。当前 profile 不构造 reasoning、置信度或旧六分类标签。
 present/absent 均来自同一训练视频的真实逐帧标注；默认以 case 为单位保持约 7:3。
 生成结果包含自包含图片资产、可审计源 JSONL，以及已经按完整序列划分并校验通过
 的 ms-swift train/val JSONL。
 
 小规模检查：
 
-    python tracking/synthesize_stage1_dataset.py \
+    python tracking/synthesize_vlt_v6_dataset.py \
         --datasets tnl2k --limit-sequences-per-dataset 50 \
         --max-samples-per-sequence 4 --absent-ratio 0.3 --context-mode pair \
         --output-dir data/stage1_debug
@@ -57,13 +59,16 @@ from cogtrack.context import (  # noqa: E402
 from cogtrack.training import (  # noqa: E402
     MEMORY_SUPERVISION_DISABLED,
     MEMORY_SUPERVISION_EXPLICIT,
+    MEMORY_SUPERVISION_LABELLED_MODES,
     MEMORY_SUPERVISION_MASKED_NULL,
     MEMORY_SUPERVISION_MODES,
+    MEMORY_SUPERVISION_THREE_STATE,
     QWEN_MODEL_FAMILIES,
     REFERENCE_POLICY_FIXED_ANCHOR,
     REFERENCE_POLICY_SAMPLED_PRIOR,
     SFT_SUPERVISION_FULL,
-    SFT_SUPERVISION_TRACKING_CORE,
+    SFT_SUPERVISION_PROFILES,
+    SFT_SUPERVISION_TRACKING_SFT,
     TemporalCaseSamplingPlan,
     TrackingSampleConfig,
     build_tracking_samples,
@@ -83,7 +88,7 @@ from pytracking.evaluation.environment import EnvironmentSettings, load_environm
 STAGE1_DATASETS = ("lasot", "tnl2k", "mgit")
 DATASET_VERSION = "cogtrack.stage1_tracking_presence.v1"
 VISUAL_V5_DATASET_VERSION = "cogtrack.visual_tracking_probe.v5"
-VLT_V6_DATASET_VERSION = "cogtrack.vlt_tracking_core.v6.3"
+VLT_V6_DATASET_VERSION = "cogtrack.vlt_tracking_sft.v6.4"
 SYNTHESIS_PROFILES = ("legacy_stage1", "visual_v5", "vlt_v6")
 
 
@@ -95,7 +100,7 @@ def _parser(profile: str = "legacy_stage1") -> argparse.ArgumentParser:
     is_visual_reference = is_visual_v5 or is_vlt_v6
     parser = argparse.ArgumentParser(
         description=(
-            "从 LaSOT/TNL2K/MGIT 官方训练集构造 VLT-v6 核心跟踪数据。"
+            "从 LaSOT/TNL2K/MGIT 官方训练集构造 VLT-v6 tracking SFT 数据。"
             if is_vlt_v6
             else "从 LaSOT/TNL2K/MGIT 官方训练集构造 visual-v5 三字段跟踪数据。"
             if is_visual_v5
@@ -140,12 +145,27 @@ def _parser(profile: str = "legacy_stage1") -> argparse.ArgumentParser:
             else MEMORY_SUPERVISION_DISABLED
         ),
         help=(
-            "visual_v5 正式构建使用 explicit；vlt_v6 首轮使用 masked_null，仅屏蔽记忆值 loss。"
+            "visual_v5 正式构建使用 explicit；vlt_v6 state_update_sft 使用 three_state（标签允许"
+            "部分覆盖：absent -> hard_null，present+标签 -> verified_update，其余 -> "
+            "masked_unknown）；大规模 tracking_sft 固定使用 masked_null。"
         ),
     )
     parser.add_argument(
         "--memory-labels",
-        help="explicit 模式逐帧标签 JSONL；需包含 dataset/sequence/frame_id/memory_update/source。",
+        help=(
+            "explicit/three_state 模式逐帧标签 JSONL；需包含 dataset/sequence/frame_id/"
+            "memory_update/source。three_state 下允许部分覆盖，由 "
+            "MGIT 分段状态标签工具生成。"
+        ),
+    )
+    parser.add_argument(
+        "--sft-supervision-profile",
+        choices=("auto", *sorted(SFT_SUPERVISION_PROFILES)),
+        default="auto",
+        help=(
+            "训练视图监督档位；auto 按 memory_supervision 推断。"
+            "state_update_sft 只允许全部标签已验证的状态更新数据。"
+        ),
     )
     parser.add_argument("--frame-stride", type=int, default=1, help="候选当前帧步长。")
     parser.add_argument(
@@ -153,6 +173,28 @@ def _parser(profile: str = "legacy_stage1") -> argparse.ArgumentParser:
         type=int,
         default=20,
         help="每序列最多抽取的候选帧数；both 最多产生约两倍训练样本。",
+    )
+    parser.add_argument(
+        "--max-samples-per-dataset",
+        action="append",
+        default=None,
+        metavar="DATASET=N",
+        help=(
+            "按数据源覆盖每序列上限，可重复，例如 --max-samples-per-dataset mgit=200。"
+            "长序列数据源（MGIT 单条 7k-15k 帧）是 verified_update 的唯一来源，需要更高"
+            "上限；短序列跟着抬只会重复采同一条视频。absent 配额仍逐源独立强制。"
+        ),
+    )
+    parser.add_argument(
+        "--reference-policy",
+        choices=("auto", REFERENCE_POLICY_SAMPLED_PRIOR, REFERENCE_POLICY_FIXED_ANCHOR),
+        default="auto",
+        help=(
+            "模板（Image 1）帧的选取策略。auto 按 profile 取默认值；"
+            f"{REFERENCE_POLICY_FIXED_ANCHOR} 把所有 case 的模板锁死在序列首个 present 帧，"
+            f"{REFERENCE_POLICY_SAMPLED_PRIOR} 为每个 case 在更早的 present 帧里确定性随机取。"
+            "重放已发布 plan 时必须显式指定与该 plan 相同的策略。"
+        ),
     )
     parser.add_argument(
         "--all-frames",
@@ -366,6 +408,30 @@ def _load_sampling_plan(path: str | Path) -> TemporalCaseSamplingPlan:
     return TemporalCaseSamplingPlan.from_dict(payload)
 
 
+def _parse_dataset_caps(raw_values: list[str] | None) -> dict[str, int]:
+    """把 ``DATASET=N`` 形式的重复参数解析成小写键 dict。"""
+
+    caps: dict[str, int] = {}
+    for raw in raw_values or []:
+        text = str(raw).strip()
+        if text.count("=") != 1:
+            raise ValueError(f"--max-samples-per-dataset 必须是 DATASET=N 形式，实际为 {raw!r}")
+        name, _, value = text.partition("=")
+        key = name.strip().lower()
+        if not key:
+            raise ValueError(f"--max-samples-per-dataset 的 dataset 名不能为空: {raw!r}")
+        try:
+            cap = int(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"--max-samples-per-dataset 的 N 必须是整数: {raw!r}") from exc
+        if cap <= 0:
+            raise ValueError(f"--max-samples-per-dataset[{key}] 必须是正整数，实际为 {cap}")
+        if key in caps:
+            raise ValueError(f"--max-samples-per-dataset 重复指定了 {key}")
+        caps[key] = cap
+    return caps
+
+
 def _validate_replayed_plan(
     plan: TemporalCaseSamplingPlan,
     *,
@@ -373,6 +439,7 @@ def _validate_replayed_plan(
     seed: int,
     absent_ratio: float,
     max_samples_per_sequence: int,
+    max_cases_by_dataset: dict[str, int],
     reference_policy: str,
 ) -> None:
     plan_datasets = {item.dataset for item in plan.sequences}
@@ -396,7 +463,14 @@ def _validate_replayed_plan(
     if plan.reference_policy != reference_policy:
         raise ValueError(
             "sampling plan reference_policy="
-            f"{plan.reference_policy!r}，与当前 profile 要求的 {reference_policy!r} 不一致"
+            f"{plan.reference_policy!r}，与当前请求的 {reference_policy!r} 不一致"
+        )
+    # 分数据源上限直接决定每条序列采几个 case，重放时不一致就会静默产出另一份数据。
+    if plan.resolved_max_cases_by_dataset != max_cases_by_dataset:
+        raise ValueError(
+            "sampling plan max_cases_by_dataset="
+            f"{plan.resolved_max_cases_by_dataset}，与 CLI --max-samples-per-dataset="
+            f"{max_cases_by_dataset} 不一致"
         )
 
 
@@ -594,24 +668,49 @@ def main(*, profile: str = "legacy_stage1") -> int:
             if args.memory_supervision not in {
                 MEMORY_SUPERVISION_MASKED_NULL,
                 MEMORY_SUPERVISION_EXPLICIT,
+                MEMORY_SUPERVISION_THREE_STATE,
             }:
-                raise ValueError("vlt_v6 只允许 masked_null 核心 SFT 或 explicit 记忆监督")
+                raise ValueError(
+                    "vlt_v6 只允许 masked_null / three_state 核心 SFT 或 explicit 记忆监督"
+                )
             if args.history_size != 3:
                 raise ValueError("vlt_v6 正式协议固定 --history-size 3")
-        if args.memory_supervision == MEMORY_SUPERVISION_EXPLICIT and not args.memory_labels:
+        labelled = args.memory_supervision in MEMORY_SUPERVISION_LABELLED_MODES
+        if labelled and not args.memory_labels:
             if not args.plan_only:
-                raise ValueError("--memory-supervision explicit 必须同时提供 --memory-labels")
-        elif args.memory_supervision != MEMORY_SUPERVISION_EXPLICIT and args.memory_labels:
-            raise ValueError("--memory-labels 只能与 --memory-supervision explicit 同时使用")
+                raise ValueError(
+                    f"--memory-supervision {args.memory_supervision} 必须同时提供 --memory-labels"
+                )
+        elif not labelled and args.memory_labels:
+            raise ValueError(
+                "--memory-labels 只能与 --memory-supervision explicit/three_state 同时使用"
+            )
         memory_labels = (
             load_memory_labels_jsonl(args.memory_labels) if args.memory_labels else None
         )
+        if args.sft_supervision_profile == "auto":
+            sft_supervision_profile = (
+                SFT_SUPERVISION_TRACKING_SFT
+                if args.memory_supervision
+                in {MEMORY_SUPERVISION_MASKED_NULL, MEMORY_SUPERVISION_THREE_STATE}
+                else SFT_SUPERVISION_FULL
+            )
+        else:
+            sft_supervision_profile = args.sft_supervision_profile
         dataset_names = list(dict.fromkeys(args.datasets))
-        reference_policy = (
-            REFERENCE_POLICY_FIXED_ANCHOR
-            if profile in {"visual_v5", "vlt_v6"}
-            else REFERENCE_POLICY_SAMPLED_PRIOR
-        )
+        dataset_caps = _parse_dataset_caps(args.max_samples_per_dataset)
+        if args.reference_policy != "auto":
+            reference_policy = args.reference_policy
+        else:
+            # visual_v5 是已发布 release，默认必须保持固定锚点才能字节级重放。
+            # vlt_v6 默认改为逐 case 随机模板：固定锚点让全部 case 的 Image 1 都是第 0
+            # 帧，模型只见过"从视频开头初始化"这一种情形，而真实使用可以从任意帧起跟。
+            # 随机模板同时把 (reference, current) 间隔从单一值摊成短中长分布。
+            reference_policy = (
+                REFERENCE_POLICY_FIXED_ANCHOR
+                if profile == "visual_v5"
+                else REFERENCE_POLICY_SAMPLED_PRIOR
+            )
         environment = load_environment(args.env_config)
         output_root = Path(args.output_dir).expanduser().resolve()
         sampling_plan = None
@@ -619,8 +718,6 @@ def main(*, profile: str = "legacy_stage1") -> int:
         anchor_frame_ids_by_sequence = None
         reference_frame_ids_by_sequence = None
         if args.sampling_plan:
-            if args.absent_ratio <= 0:
-                raise ValueError("--sampling-plan 只适用于包含 presence/absence 规划的数据")
             sampling_plan = _load_sampling_plan(args.sampling_plan)
             _validate_replayed_plan(
                 sampling_plan,
@@ -628,6 +725,7 @@ def main(*, profile: str = "legacy_stage1") -> int:
                 seed=args.seed,
                 absent_ratio=args.absent_ratio,
                 max_samples_per_sequence=args.max_samples_per_sequence,
+                max_cases_by_dataset=dataset_caps,
                 reference_policy=reference_policy,
             )
             frame_ids_by_sequence = sampling_plan.frame_ids_by_sequence
@@ -643,6 +741,7 @@ def main(*, profile: str = "legacy_stage1") -> int:
                     allow_missing_mgit_sequences=args.allow_missing_mgit_sequences,
                 ),
                 max_cases_per_sequence=args.max_samples_per_sequence,
+                max_cases_by_dataset=dataset_caps,
                 absent_ratio=args.absent_ratio,
                 frame_stride=args.frame_stride,
                 seed=args.seed,
@@ -697,6 +796,7 @@ def main(*, profile: str = "legacy_stage1") -> int:
                 else PROMPT_PROFILE_VISUAL_V5
             ),
             force_history_image=profile == "vlt_v6",
+            sft_supervision_profile=sft_supervision_profile,
         )
         build_report = build_tracking_samples(
             sequences,
@@ -758,11 +858,10 @@ def main(*, profile: str = "legacy_stage1") -> int:
             model_families=list(dict.fromkeys(args.qwen_model_families)),
             profile=profile,
         )
-        sft_supervision_profile = (
-            SFT_SUPERVISION_TRACKING_CORE
-            if args.memory_supervision == MEMORY_SUPERVISION_MASKED_NULL
-            else SFT_SUPERVISION_FULL
-        )
+        # tracking_sft 表示"数据集里存在需要 loss mask 的 masked_unknown 行"，因此
+        # 训练必须挂上 --loss_scale cogtrack_tracking_sft 插件。three_state 里
+        # hard_null 与 verified_update 行通过 per-message loss_scale=1.0 旁路插件，
+        # 两者在同一 batch 内共存。
         dataset_info = {
             "schema_version": (
                 VLT_V6_DATASET_VERSION
@@ -772,7 +871,7 @@ def main(*, profile: str = "legacy_stage1") -> int:
                 else DATASET_VERSION
             ),
             "task": (
-                "vlt_v6_tracking_core"
+                "vlt_v6_tracking_sft"
                 if profile == "vlt_v6"
                 else "visual_tracking_v5_probe"
                 if profile == "visual_v5"
@@ -801,14 +900,20 @@ def main(*, profile: str = "legacy_stage1") -> int:
             "uses_dataset_language_where_online_safe": profile == "vlt_v6",
             "uses_semantic_memory_input": build_report.semantic_memory_input_count > 0,
             "memory_supervision": args.memory_supervision,
-            "supervises_memory": args.memory_supervision == MEMORY_SUPERVISION_EXPLICIT,
-            "memory_loss_masked": args.memory_supervision == MEMORY_SUPERVISION_MASKED_NULL,
+            # three_state 同样监督记忆，只是逐行决定该行的记忆值是否参与 loss。
+            "supervises_memory": args.memory_supervision in MEMORY_SUPERVISION_LABELLED_MODES,
+            # 数据集级"是否存在被 mask 的记忆值"。逐行的真值在
+            # metadata.memory_supervision_state 与 messages[assistant].loss_scale。
+            "memory_loss_masked": args.memory_supervision
+            in {MEMORY_SUPERVISION_MASKED_NULL, MEMORY_SUPERVISION_THREE_STATE},
             "sft_supervision_profile": sft_supervision_profile,
             "data_tier": (
                 "legacy_baseline"
                 if profile == "legacy_stage1"
-                else "core_sft_probe"
-                if args.memory_supervision == MEMORY_SUPERVISION_MASKED_NULL
+                else "state_update_sft"
+                if sft_supervision_profile == "state_update_sft"
+                else "tracking_sft"
+                if sft_supervision_profile == SFT_SUPERVISION_TRACKING_SFT
                 else (
                     "sft_probe"
                     if args.memory_supervision == MEMORY_SUPERVISION_EXPLICIT
@@ -818,7 +923,11 @@ def main(*, profile: str = "legacy_stage1") -> int:
             "sft_eligible": (
                 profile == "legacy_stage1"
                 or args.memory_supervision
-                in {MEMORY_SUPERVISION_EXPLICIT, MEMORY_SUPERVISION_MASKED_NULL}
+                in {
+                    MEMORY_SUPERVISION_EXPLICIT,
+                    MEMORY_SUPERVISION_MASKED_NULL,
+                    MEMORY_SUPERVISION_THREE_STATE,
+                }
             ),
             "paper_full_eligible": profile == "legacy_stage1",
             "supervises_confidence": False,
