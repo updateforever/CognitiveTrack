@@ -83,7 +83,7 @@
       "id": "sftCheckpoint",
       "type": "promptString",
       "description": "请输入训练完成后的 Qwen3-VL-4B 全参 checkpoint 绝对路径",
-      "default": "${workspaceFolder}/outputs/sft/qwen3vl4b_full_v640_mixed_2xh100_bs16_v2"
+      "default": "${workspaceFolder}/outputs/sft/qwen3vl4b_full_v640_mixed_2xh100_bs16_v2/v0-20260818-111247/checkpoint-2473.modelscope_inference"
     }
   ]
 }

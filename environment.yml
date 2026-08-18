@@ -12,6 +12,11 @@ dependencies:
       - qwen-vl-utils>=0.0.14
       - ms-swift>=4.3,<5
       - deepspeed==0.19.5
+      # vLLM 0.11 与更新版 FastAPI/Starlette 的路由对象不兼容；固定这组
+      # 已验证版本，避免所有 OpenAI API endpoint 被 metrics 中间件变成 500。
+      - vllm==0.11.0
+      - fastapi==0.116.1
+      - starlette==0.47.3
       - numpy>=1.24
       - opencv-python>=4.8
       - Pillow>=10.0
